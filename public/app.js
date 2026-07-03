@@ -10,7 +10,6 @@ import { DialogHandler } from './dialogs.js';
 import { SessionSidebar } from './session-sidebar.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
-import { Launcher } from './launcher.js';
 
 
 // Initialize components
@@ -51,10 +50,6 @@ const branchDropdown = document.getElementById('branch-dropdown');
 const branchDropdownBtn = document.getElementById('branch-dropdown-btn');
 const branchDropdownLabel = document.getElementById('branch-dropdown-label');
 const branchDropdownMenu = document.getElementById('branch-dropdown-menu');
-const projectSwitcher = document.getElementById('project-switcher');
-const projectSwitcherBtn = document.getElementById('project-switcher-btn');
-const projectSwitcherLabel = document.getElementById('project-switcher-label');
-const projectSwitcherMenu = document.getElementById('project-switcher-menu');
 const slashMenu = document.getElementById('slash-menu');
 const extensionWidgetsAbove = document.getElementById('extension-widgets-above');
 const extensionWidgetsBelow = document.getElementById('extension-widgets-below');
@@ -77,6 +72,7 @@ let mirrorActiveSessionFile = null; // The live session file path from the TUI
 let viewingActiveSession = true; // Whether we're viewing the live session or a historical one
 let isMirrorMode = false; // Set when mirror_sync received
 let liveInstances = []; // All running Tau instances [{port, sessionFile, cwd}]
+let currentProjectPath = '';
 
 // File browser
 const fileSidebar = document.getElementById('file-sidebar');
@@ -773,6 +769,8 @@ function sendMessage() {
     return;
   }
 
+  if (isNewSessionMode) exitNewSessionMode();
+
   messageInput.value = '';
   messageInput.style.height = 'auto';
   hideSlashMenu();
@@ -1211,8 +1209,11 @@ function updateThinkingBtn() {
   thinkingBtn.classList.toggle('off', currentThinkingLevel === 'off');
 }
 let currentModelId = '';
+let currentModelProvider = '';
 let availableModels = [];
+let scopedModels = [];
 let currentThinkingLevel = 'off';
+let availableThinkingLevels = ['off'];
 
 async function fetchModelInfo() {
   try {
@@ -1225,9 +1226,11 @@ async function fetchModelInfo() {
 
     if (modelsData.success && modelsData.data?.models) {
       availableModels = modelsData.data.models;
+      scopedModels = modelsData.data.scopedModels || [];
     }
     if (stateData.success && stateData.data?.model) {
       currentModelId = stateData.data.model.id || '';
+      currentModelProvider = stateData.data.model.provider || '';
       updateModelLabel();
 
       const model = availableModels.find(m => m.id === currentModelId);
@@ -1238,7 +1241,11 @@ async function fetchModelInfo() {
     }
     if (stateData.success && stateData.data?.thinkingLevel) {
       currentThinkingLevel = stateData.data.thinkingLevel;
+      availableThinkingLevels = stateData.data.availableThinkingLevels || ['off'];
       updateThinkingBtn();
+    }
+    if (stateData.success && stateData.data?.cwd) {
+      currentProjectPath = stateData.data.cwd;
     }
   } catch (e) {
     // ignore
@@ -1248,6 +1255,10 @@ async function fetchModelInfo() {
 function updateModelLabel() {
   const shortName = currentModelId.replace(/^claude-/, '').replace(/-\d{8}$/, '');
   modelDropdownLabel.textContent = shortName || 'model';
+}
+
+function modelIsCurrent(model) {
+  return model.id === currentModelId && (!currentModelProvider || model.provider === currentModelProvider);
 }
 
 function toggleModelDropdown() {
@@ -1261,6 +1272,7 @@ function toggleModelDropdown() {
 
 function openModelDropdown() {
   modelDropdownMenu.innerHTML = '';
+  let showAllModels = scopedModels.length === 0;
 
   // Search input
   const search = document.createElement('input');
@@ -1277,22 +1289,33 @@ function openModelDropdown() {
   function renderItems(filter) {
     itemsContainer.innerHTML = '';
     const query = (filter || '').toLowerCase();
-    availableModels.forEach(m => {
+    const scopedIds = new Set(scopedModels.map(m => `${m.provider}/${m.id}`));
+    const current = availableModels.find(modelIsCurrent);
+    const scopedWithCurrent = current && !scopedIds.has(`${current.provider}/${current.id}`)
+      ? [current, ...scopedModels]
+      : scopedModels;
+    const activeModels = showAllModels ? availableModels : scopedWithCurrent;
+
+    activeModels.forEach(m => {
       const shortName = m.id.replace(/-\d{8}$/, '');
       const providerStr = m.provider || '';
       if (query && !shortName.toLowerCase().includes(query) && !providerStr.toLowerCase().includes(query)) return;
 
       const el = document.createElement('div');
-      el.className = `model-dropdown-item${m.id === currentModelId ? ' active' : ''}`;
+      el.className = `model-dropdown-item${modelIsCurrent(m) ? ' active' : ''}`;
       const ctxK = m.contextWindow ? `${(m.contextWindow / 1000).toFixed(0)}k` : '';
       const providerLabel = m.provider && m.provider !== 'anthropic' ? `<span class="model-dropdown-item-provider">${m.provider}</span>` : '';
       el.innerHTML = `<span>${shortName}${providerLabel}</span><span class="model-dropdown-item-ctx">${ctxK}</span>`;
       el.addEventListener('click', async () => {
         closeModelDropdown();
         const display = m.id.replace(/^claude-/, '').replace(/-\d{8}$/, '');
-        await rpcCommand({ type: 'set_model', provider: m.provider, modelId: m.id }, `Switching to ${display}...`);
-        currentModelId = m.id;
+        const data = await rpcCommand({ type: 'set_model', provider: m.provider, modelId: m.id }, `Switching to ${display}...`);
+        currentModelId = data?.data?.model?.id || m.id;
+        currentModelProvider = data?.data?.model?.provider || m.provider || '';
+        currentThinkingLevel = data?.data?.thinkingLevel || currentThinkingLevel;
+        availableThinkingLevels = data?.data?.availableThinkingLevels || availableThinkingLevels;
         updateModelLabel();
+        updateThinkingBtn();
         if (m.contextWindow) {
           contextWindowSize = m.contextWindow;
           updateTokenUsage();
@@ -1300,6 +1323,18 @@ function openModelDropdown() {
       });
       itemsContainer.appendChild(el);
     });
+
+    if (scopedModels.length > 0) {
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'model-dropdown-scope-btn';
+      toggle.textContent = showAllModels ? 'Show scoped models' : `Show other models (${availableModels.length - scopedModels.length})`;
+      toggle.addEventListener('click', () => {
+        showAllModels = !showAllModels;
+        renderItems(search.value);
+      });
+      itemsContainer.appendChild(toggle);
+    }
   }
 
   renderItems('');
@@ -1325,6 +1360,39 @@ function closeModelDropdown() {
 
 modelDropdownBtn.addEventListener('click', toggleModelDropdown);
 
+let thinkingMenu = null;
+
+function closeThinkingDropdown() {
+  thinkingMenu?.remove();
+  thinkingMenu = null;
+}
+
+function openThinkingDropdown() {
+  closeThinkingDropdown();
+  const levels = Array.from(new Set([...availableThinkingLevels, currentThinkingLevel])).filter(Boolean);
+  thinkingMenu = document.createElement('div');
+  thinkingMenu.className = 'model-dropdown-menu thinking-dropdown-menu';
+  for (const level of levels) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = `model-dropdown-item${level === currentThinkingLevel ? ' active' : ''}`;
+    item.textContent = level;
+    item.addEventListener('click', async () => {
+      const data = await rpcCommand({ type: 'set_thinking_level', level }, `Switching to ${level}...`);
+      if (data?.success && data.data?.level) {
+        currentThinkingLevel = data.data.level;
+        updateThinkingBtn();
+      }
+      closeThinkingDropdown();
+    });
+    thinkingMenu.appendChild(item);
+  }
+  document.body.appendChild(thinkingMenu);
+  const rect = thinkingBtn.getBoundingClientRect();
+  thinkingMenu.style.left = `${rect.left}px`;
+  thinkingMenu.style.top = `${rect.bottom + 4}px`;
+}
+
 // Close dropdown on outside click
 document.addEventListener('click', (e) => {
   if (!modelDropdown.contains(e.target)) {
@@ -1333,18 +1401,14 @@ document.addEventListener('click', (e) => {
   if (!branchDropdown.contains(e.target)) {
     closeBranchDropdown();
   }
-  if (!projectSwitcher.contains(e.target)) {
-    closeProjectSwitcher();
+  if (!thinkingBtn.contains(e.target) && !thinkingMenu?.contains(e.target)) {
+    closeThinkingDropdown();
   }
 });
 
-// Thinking level button — cycles through levels
-thinkingBtn.addEventListener('click', async () => {
-  const data = await rpcCommand({ type: 'cycle_thinking_level' }, 'Cycling thinking...');
-  if (data?.success && data.data?.level) {
-    currentThinkingLevel = data.data.level;
-    updateThinkingBtn();
-  }
+thinkingBtn.addEventListener('click', (event) => {
+  event.stopPropagation();
+  thinkingMenu ? closeThinkingDropdown() : openThinkingDropdown();
 });
 
 // ═══════════════════════════════════════
@@ -1418,109 +1482,6 @@ settingsCurrentBranch.addEventListener('click', () => {
   if (!currentGitState.isRepo) return;
   openBranchDropdown();
 });
-
-// ═══════════════════════════════════════
-// Project switcher
-// ═══════════════════════════════════════
-
-let projectSwitcherProjects = [];
-let archivedProjectsOpen = localStorage.getItem('tau-project-switcher-archived') === 'true';
-
-function projectName(projectPath) {
-  if (!projectPath) return 'No Project';
-  const parts = projectPath.split(/[\\/]/).filter(Boolean);
-  return parts.at(-1) || projectPath;
-}
-
-async function loadProjectSwitcher() {
-  const response = await fetch('/api/projects');
-  const data = await response.json();
-  projectSwitcherProjects = data.projects || [];
-  renderProjectSwitcher();
-}
-
-function renderProjectSwitcher() {
-  const selectedPath = localStorage.getItem('tau-selected-project') || '';
-  projectSwitcherLabel.textContent = projectName(selectedPath);
-  projectSwitcherMenu.innerHTML = '';
-
-  const noProject = document.createElement('button');
-  noProject.type = 'button';
-  noProject.className = `project-switcher-item${!selectedPath ? ' active' : ''}`;
-  noProject.textContent = 'No Project';
-  noProject.addEventListener('click', () => selectProject(null));
-  projectSwitcherMenu.appendChild(noProject);
-
-  const scoped = projectSwitcherProjects.slice(0, 6);
-  const archived = projectSwitcherProjects.slice(6);
-  appendProjectSection('Scoped Projects', scoped, true);
-  appendProjectSection('Archived Projects', archived, archivedProjectsOpen);
-}
-
-function appendProjectSection(title, projects, open) {
-  const header = document.createElement('button');
-  header.type = 'button';
-  header.className = `project-switcher-section${open ? '' : ' collapsed'}`;
-  header.innerHTML = `<span>${escapeHtml(title)}</span><span>${projects.length}</span>`;
-  header.addEventListener('click', () => {
-    if (title !== 'Archived Projects') return;
-    archivedProjectsOpen = !archivedProjectsOpen;
-    localStorage.setItem('tau-project-switcher-archived', String(archivedProjectsOpen));
-    renderProjectSwitcher();
-  });
-  projectSwitcherMenu.appendChild(header);
-
-  if (!open) return;
-  for (const project of projects) {
-    const item = document.createElement('button');
-    item.type = 'button';
-    item.className = `project-switcher-item${project.active ? ' active' : ''}`;
-    item.innerHTML = `
-      <span class="project-switcher-name">${escapeHtml(project.name || projectName(project.path))}</span>
-      <span class="project-switcher-path">${escapeHtml(project.path || '')}</span>
-    `;
-    item.addEventListener('click', () => selectProject(project));
-    projectSwitcherMenu.appendChild(item);
-  }
-}
-
-async function selectProject(project) {
-  closeProjectSwitcher();
-  if (!project) {
-    localStorage.removeItem('tau-selected-project');
-    projectSwitcherLabel.textContent = 'No Project';
-    return;
-  }
-
-  localStorage.setItem('tau-selected-project', project.path);
-  projectSwitcherLabel.textContent = project.name || projectName(project.path);
-  if (!project.active) {
-    const response = await fetch('/api/projects/launch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: project.path }),
-    });
-    const data = await response.json();
-    if (!response.ok || !data.ok) {
-      messageRenderer.renderError(data.error || 'Failed to launch project');
-    }
-  }
-}
-
-function toggleProjectSwitcher() {
-  if (projectSwitcherMenu.classList.contains('hidden')) {
-    loadProjectSwitcher().catch((error) => messageRenderer.renderError(error.message));
-    projectSwitcherMenu.classList.remove('hidden');
-  } else {
-    closeProjectSwitcher();
-  }
-}
-
-function closeProjectSwitcher() {
-  projectSwitcherMenu.classList.add('hidden');
-}
-
-projectSwitcherBtn.addEventListener('click', toggleProjectSwitcher);
 
 // ═══════════════════════════════════════
 // Keyboard shortcuts
@@ -1601,19 +1562,7 @@ sidebarOverlay.addEventListener('click', () => {
 
 
 const newSessionBtn = document.getElementById('new-session-btn');
-newSessionBtn.addEventListener('click', () => {
-  sessionTotalCost = 0;
-  lastInputTokens = 0;
-  updateCostDisplay();
-  updateTokenUsage();
-  state.reset();
-  messageRenderer.clear();
-  toolCardRenderer.clear();
-  messageRenderer.renderWelcome();
-  sidebar.clearActive();
-  viewingActiveSession = true;
-  updateMirrorInputState();
-});
+newSessionBtn.addEventListener('click', () => newSession());
 
 refreshSessionsBtn.addEventListener('click', () => {
   if (isMobile()) {
@@ -1676,16 +1625,22 @@ async function newSession() {
   lastInputTokens = 0;
   updateCostDisplay();
   updateTokenUsage();
-  await switchSession(null);
+  state.reset();
+  messageRenderer.clear();
+  toolCardRenderer.clear();
+  messageRenderer.renderWelcome();
   sidebar.clearActive();
+  viewingActiveSession = true;
+  updateMirrorInputState();
+  enterNewSessionMode();
   if (isMobile()) {
     sidebarEl.classList.add('collapsed');
     sidebarOverlay.classList.remove('visible');
   }
-  if (!isMobile()) messageInput.focus();
 }
 
 async function handleSessionSelect(session, project) {
+  exitNewSessionMode();
   sidebar.setActive(session.filePath);
   sessionTotalCost = 0;
   lastInputTokens = 0;
@@ -1791,6 +1746,7 @@ function handleMirrorSync(data) {
 
   // Track the active session
   mirrorActiveSessionFile = data.sessionFile || null;
+  currentProjectPath = data.cwd || currentProjectPath;
   viewingActiveSession = true;
   updateMirrorInputState();
   updateMirrorLiveIndicator();
@@ -1798,6 +1754,7 @@ function handleMirrorSync(data) {
   // Update model display
   if (data.model) {
     currentModelId = data.model.id || '';
+    currentModelProvider = data.model.provider || '';
     updateModelLabel();
     if (data.model.contextWindow) {
       contextWindowSize = data.model.contextWindow;
@@ -1807,6 +1764,7 @@ function handleMirrorSync(data) {
   // Update thinking level
   if (data.thinkingLevel) {
     currentThinkingLevel = data.thinkingLevel;
+    availableThinkingLevels = data.availableThinkingLevels || availableThinkingLevels;
     updateThinkingBtn();
   }
 
@@ -2237,6 +2195,7 @@ async function openSettings() {
       // Thinking level
       btnThinkingLevel.textContent = s.thinkingLevel || 'off';
       currentThinkingLevel = s.thinkingLevel || 'off';
+      availableThinkingLevels = s.availableThinkingLevels || availableThinkingLevels;
       updateThinkingBtn();
     }
   } catch (e) {
@@ -2512,79 +2471,187 @@ if (isMobile()) {
   });
 }
 
-// Launcher
-const launcherEl = document.getElementById('launcher');
-const launcher = new Launcher(launcherEl, async (projectPath) => {
-  try {
-    const res = await fetch('/api/projects/launch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: projectPath }),
-    });
-    const data = await res.json();
-    if (data.ok) {
-      // Refresh the launcher to show the new active instance
-      setTimeout(() => launcher.load(), 2000);
+// New session project picker
+const newSessionTools = document.getElementById('new-session-tools');
+const newProjectBtn = document.getElementById('new-project-btn');
+const newProjectLabel = document.getElementById('new-project-label');
+const newProjectMenu = document.getElementById('new-project-menu');
+let isNewSessionMode = false;
+let newSessionProjects = [];
+let selectedNewProject = null;
+
+function projectShortName(project) {
+  if (!project?.path) return '不使用项目';
+  return project.name || project.path.split(/[\\/]/).filter(Boolean).at(-1) || project.path;
+}
+
+function renderNewSessionWelcome() {
+  const title = messagesContainer.querySelector('.welcome p');
+  if (title) title.textContent = `我们应该在 ${projectShortName(selectedNewProject)} 中构建什么？`;
+}
+
+function renderNewProjectLabel() {
+  newProjectLabel.textContent = projectShortName(selectedNewProject);
+  renderNewSessionWelcome();
+}
+
+async function loadNewSessionProjects() {
+  const response = await fetch('/api/projects');
+  const data = await response.json();
+  newSessionProjects = data.projects || [];
+  selectedNewProject =
+    newSessionProjects.find(p => p.path === currentProjectPath) ||
+    newSessionProjects.find(p => p.active) ||
+    newSessionProjects[0] ||
+    null;
+  renderNewProjectLabel();
+}
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function navigateToInstance(instance) {
+  const url = new URL(location.href);
+  url.port = String(instance.port);
+  location.href = url.toString();
+}
+
+async function switchToNewProject(project) {
+  if (!project?.path || project.path === currentProjectPath) return;
+
+  await pollInstances();
+  const existing = liveInstances.find(instance => instance.cwd === project.path);
+  if (existing) {
+    navigateToInstance(existing);
+    return;
+  }
+
+  statusText.textContent = 'Opening project...';
+  const response = await fetch('/api/projects/launch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: project.path }),
+  });
+  const data = await response.json();
+  if (!response.ok || !data.ok) {
+    messageRenderer.renderError(data.error || 'Failed to open project');
+    statusText.textContent = 'Connected';
+    return;
+  }
+
+  for (let i = 0; i < 20; i += 1) {
+    await wait(500);
+    await pollInstances();
+    const launched = liveInstances.find(instance => instance.cwd === project.path);
+    if (launched) {
+      navigateToInstance(launched);
+      return;
     }
-  } catch (e) {
-    console.error('[Launcher] Failed to launch:', e);
+  }
+  statusText.textContent = 'Project opened';
+}
+
+function renderNewProjectMenu(filter = '') {
+  const query = filter.toLowerCase();
+  newProjectMenu.innerHTML = '';
+
+  const search = document.createElement('input');
+  search.className = 'new-project-search';
+  search.placeholder = 'Search projects';
+  search.type = 'text';
+  search.value = filter;
+  newProjectMenu.appendChild(search);
+
+  const list = document.createElement('div');
+  list.className = 'new-project-list';
+  newProjectMenu.appendChild(list);
+
+  const projects = newSessionProjects.filter(project => {
+    const text = `${project.name || ''} ${project.path || ''}`.toLowerCase();
+    return !query || text.includes(query);
+  });
+
+  for (const project of projects) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = `new-project-item${project.path === selectedNewProject?.path ? ' active' : ''}`;
+    item.innerHTML = `
+      <span class="new-project-icon">▣</span>
+      <span class="new-project-name">${escapeHtml(projectShortName(project))}</span>
+      ${project.path === selectedNewProject?.path ? '<span class="new-project-check">✓</span>' : ''}
+    `;
+    item.addEventListener('click', async () => {
+      selectedNewProject = project;
+      renderNewProjectLabel();
+      closeNewProjectMenu();
+      await switchToNewProject(project);
+    });
+    list.appendChild(item);
+  }
+
+  const noProject = document.createElement('button');
+  noProject.type = 'button';
+  noProject.className = `new-project-item${selectedNewProject ? '' : ' active'}`;
+  noProject.innerHTML = '<span class="new-project-icon">×</span><span class="new-project-name">不使用项目</span>';
+  noProject.addEventListener('click', () => {
+    selectedNewProject = null;
+    renderNewProjectLabel();
+    closeNewProjectMenu();
+  });
+  list.appendChild(noProject);
+
+  search.addEventListener('input', () => {
+    const value = search.value;
+    renderNewProjectMenu(value);
+    newProjectMenu.querySelector('.new-project-search')?.focus();
+  });
+  requestAnimationFrame(() => search.focus());
+}
+
+async function openNewProjectMenu() {
+  if (newSessionProjects.length === 0) await loadNewSessionProjects();
+  renderNewProjectMenu();
+  newProjectMenu.classList.remove('hidden');
+}
+
+function closeNewProjectMenu() {
+  newProjectMenu.classList.add('hidden');
+}
+
+function enterNewSessionMode() {
+  isNewSessionMode = true;
+  document.body.classList.add('new-session-mode');
+  newSessionTools.classList.remove('hidden');
+  renderNewSessionWelcome();
+  loadNewSessionProjects().catch(() => {});
+  if (!isMobile()) messageInput.focus();
+}
+
+function exitNewSessionMode() {
+  isNewSessionMode = false;
+  document.body.classList.remove('new-session-mode');
+  newSessionTools.classList.add('hidden');
+  closeNewProjectMenu();
+}
+
+newProjectBtn.addEventListener('click', (event) => {
+  event.stopPropagation();
+  if (newProjectMenu.classList.contains('hidden')) {
+    openNewProjectMenu();
+  } else {
+    closeNewProjectMenu();
   }
 });
 
-// Check if launcher should show (projects configured)
-async function initLauncher() {
-  try {
-    const res = await fetch('/api/projects');
-    const data = await res.json();
-    if (data.projects && data.projects.length > 0) {
-      launcher.projects = data.projects;
-      launcher.render();
-      // Show launcher by default, add a nav link in the sidebar
-      addLauncherNav();
-    }
-  } catch {}
-}
+document.addEventListener('click', (event) => {
+  if (!newProjectMenu.contains(event.target) && !newProjectBtn.contains(event.target)) {
+    closeNewProjectMenu();
+  }
+});
 
-function addLauncherNav() {
-  const modeToggle = document.getElementById('mode-toggle');
-  if (!modeToggle || modeToggle.querySelector('.mode-link-launcher')) return;
-
-  const launcherLink = document.createElement('span');
-  launcherLink.className = 'mode-link mode-link-launcher';
-  launcherLink.title = 'Projects';
-  launcherLink.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>';
-  launcherLink.addEventListener('click', () => {
-    showLauncher();
-  });
-  modeToggle.appendChild(launcherLink);
-}
-
-function showLauncher() {
-  launcherEl.classList.remove('hidden');
-  messagesContainer.style.display = 'none';
-  document.querySelector('.input-area').style.display = 'none';
-  document.querySelector('.welcome')?.remove();
-
-  // Update nav state
-  document.querySelectorAll('.mode-link').forEach(l => l.classList.remove('active'));
-  document.querySelector('.mode-link-launcher')?.classList.add('active');
-
-  launcher.load();
-}
-
-function hideLauncher() {
-  launcherEl.classList.add('hidden');
-  messagesContainer.style.display = '';
-  document.querySelector('.input-area').style.display = '';
-
-  // Update nav state
-  document.querySelectorAll('.mode-link').forEach(l => l.classList.remove('active'));
-  document.querySelector('.mode-link:first-child')?.classList.add('active');
-}
-
-// Make the tau icon in sidebar switch back to chat
 document.querySelector('.mode-link:first-child')?.addEventListener('click', () => {
-  hideLauncher();
+  exitNewSessionMode();
 });
 
 wsClient.connect();
@@ -2592,9 +2659,7 @@ messageRenderer.renderWelcome();
 sidebar.loadSessions().then(() => {
   if (isMirrorMode) updateMirrorLiveIndicator();
 });
-initLauncher();
 fetchGitState().catch(() => {});
-loadProjectSwitcher().catch(() => {});
 
 // Register service worker for PWA
 if ('serviceWorker' in navigator) {

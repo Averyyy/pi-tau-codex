@@ -97,6 +97,7 @@ const SESSIONS_DIR = process.env.PI_CODING_AGENT_SESSION_DIR || path.join(PI_AGE
 const INSTANCES_DIR = path.join(USER_HOME, ".pi", "tau-instances");
 const PI_SETTINGS_PATH = path.join(PI_AGENT_DIR, "settings.json");
 const PI_AGENTS_PATH = path.join(PI_AGENT_DIR, "AGENTS.md");
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
 
 const BUILTIN_COMMANDS = [
   { name: "settings", description: "Open settings", source: "builtin" },
@@ -258,6 +259,95 @@ function sendAuthRequired(res: http.ServerResponse) {
     "Content-Type": "application/json",
   });
   res.end(JSON.stringify({ error: "Unauthorized" }));
+}
+
+function isTempProjectPath(projectPath: string | null | undefined): boolean {
+  if (!projectPath) return true;
+  const resolved = path.resolve(projectPath);
+  const tmp = path.resolve(os.tmpdir());
+  return resolved === tmp ||
+    resolved.startsWith(tmp + path.sep) ||
+    resolved === "/tmp" ||
+    resolved.startsWith("/tmp/") ||
+    resolved === "/private/tmp" ||
+    resolved.startsWith("/private/tmp/");
+}
+
+function getSupportedThinkingLevels(model: any): string[] {
+  if (!model?.reasoning) return ["off"];
+  return THINKING_LEVELS.filter((level) => {
+    const mapped = model.thinkingLevelMap?.[level];
+    return mapped !== null && (level !== "xhigh" || mapped !== undefined);
+  });
+}
+
+function modelRef(model: any): string {
+  return `${model.provider}/${model.id}`;
+}
+
+function stripThinkingLevel(pattern: string): string {
+  const idx = pattern.lastIndexOf(":");
+  if (idx === -1) return pattern;
+  const suffix = pattern.slice(idx + 1);
+  return THINKING_LEVELS.includes(suffix) ? pattern.slice(0, idx) : pattern;
+}
+
+function wildcardPattern(pattern: string): RegExp {
+  const escaped = pattern
+    .replace(/[|\\{}()[\]^$+?.]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  return new RegExp(`^${escaped}$`, "i");
+}
+
+function matchesModelPattern(model: any, rawPattern: string): boolean {
+  const pattern = stripThinkingLevel(rawPattern);
+  if (!pattern) return false;
+  if (pattern.includes("*") || pattern.includes("?")) {
+    const regex = wildcardPattern(pattern);
+    return regex.test(modelRef(model)) || regex.test(model.id);
+  }
+  return modelRef(model) === pattern || model.id === pattern;
+}
+
+function uniqueModels(models: any[]): any[] {
+  const seen = new Set<string>();
+  return models.filter((model) => {
+    const key = modelRef(model);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function getScopedModels(ctx: ExtensionContext, availableModels: any[]): any[] {
+  const settings = readAgentSettings();
+  const patterns = Array.isArray(settings.enabledModels)
+    ? settings.enabledModels.filter((pattern): pattern is string => typeof pattern === "string")
+    : [];
+  if (patterns.length === 0) return [];
+
+  const registry: any = ctx.modelRegistry;
+  const allModels = typeof registry.getAll === "function" ? registry.getAll() : availableModels;
+  const currentModel = ctx.model ? [ctx.model] : [];
+  const candidates = uniqueModels([...allModels, ...availableModels, ...currentModel]);
+  const scoped: any[] = [];
+
+  for (const pattern of patterns) {
+    for (const model of candidates) {
+      if (matchesModelPattern(model, pattern)) scoped.push(model);
+    }
+  }
+  return uniqueModels(scoped);
+}
+
+function getModelChoices(ctx: ExtensionContext): { models: any[]; scopedModels: any[] } {
+  const availableModels = ctx.modelRegistry.getAvailable();
+  const scopedModels = getScopedModels(ctx, availableModels);
+  return {
+    models: uniqueModels([...scopedModels, ...availableModels]),
+    scopedModels,
+  };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -539,8 +629,10 @@ export default function (pi: ExtensionAPI) {
       entries,
       model,
       thinkingLevel,
+      availableThinkingLevels: getSupportedThinkingLevels(model),
       sessionName,
       sessionFile,
+      cwd: getCurrentCwd(),
       isStreaming: !ctx.isIdle(),
       contextUsage,
     };
@@ -643,9 +735,11 @@ export default function (pi: ExtensionAPI) {
           const state = {
             model,
             thinkingLevel: pi.getThinkingLevel(),
+            availableThinkingLevels: getSupportedThinkingLevels(model),
             isStreaming: !ctx.isIdle(),
             sessionFile: ctx.sessionManager.getSessionFile(),
             sessionName: pi.getSessionName(),
+            cwd: getCurrentCwd(),
             autoCompactionEnabled: true, // Extension can't easily check this
           };
           sendTo(ws, success("get_state", state));
@@ -668,8 +762,7 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, error("get_available_models", "No context available"));
             break;
           }
-          const models = await ctx.modelRegistry.getAvailable();
-          sendTo(ws, success("get_available_models", { models }));
+          sendTo(ws, success("get_available_models", getModelChoices(ctx)));
           break;
         }
 
@@ -678,10 +771,10 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, error("set_model", "No context available"));
             break;
           }
-          const models = await ctx.modelRegistry.getAvailable();
-          const model = models.find(
+          const choices = getModelChoices(ctx);
+          const model = choices.models.find(
             (m: any) => m.provider === command.provider && m.id === command.modelId
-          );
+          ) || (ctx.modelRegistry as any).find?.(command.provider, command.modelId);
           if (!model) {
             sendTo(ws, error("set_model", `Model not found: ${command.provider}/${command.modelId}`));
             break;
@@ -691,7 +784,11 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, error("set_model", "No API key for this model"));
             break;
           }
-          sendTo(ws, success("set_model", model));
+          sendTo(ws, success("set_model", {
+            model,
+            thinkingLevel: pi.getThinkingLevel(),
+            availableThinkingLevels: getSupportedThinkingLevels(model),
+          }));
           break;
         }
 
@@ -702,7 +799,8 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, success("cycle_model", null));
             break;
           }
-          const availModels = await ctx.modelRegistry.getAvailable();
+          const choices = getModelChoices(ctx);
+          const availModels = choices.scopedModels.length > 0 ? choices.scopedModels : choices.models;
           const currentModel = ctx.model;
           if (!currentModel || availModels.length <= 1) {
             sendTo(ws, success("cycle_model", null));
@@ -716,13 +814,14 @@ export default function (pi: ExtensionAPI) {
           sendTo(ws, success("cycle_model", {
             model: nextModel,
             thinkingLevel: pi.getThinkingLevel(),
+            availableThinkingLevels: getSupportedThinkingLevels(nextModel),
           }));
           break;
         }
 
         // ─── Thinking ───
         case "cycle_thinking_level": {
-          const levels = ["off", "minimal", "low", "medium", "high"];
+          const levels = getSupportedThinkingLevels(ctx?.model);
           const current = pi.getThinkingLevel();
           const idx = levels.indexOf(current);
           const next = levels[(idx + 1) % levels.length];
@@ -734,7 +833,7 @@ export default function (pi: ExtensionAPI) {
 
         case "set_thinking_level": {
           pi.setThinkingLevel(command.level);
-          sendTo(ws, success("set_thinking_level"));
+          sendTo(ws, success("set_thinking_level", { level: pi.getThinkingLevel() }));
           break;
         }
 
@@ -1376,7 +1475,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     }
   }
 
-  function serveProjectsList(res: http.ServerResponse) {
+  async function serveProjectsList(res: http.ServerResponse) {
     const projectsDir = TAU_SETTINGS.projectsDir;
     try {
       const instances = getRunningInstances();
@@ -1384,19 +1483,24 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
       const sessionInfo = new Map<string, { count: number; lastActive: number }>();
       if (fs.existsSync(SESSIONS_DIR)) {
+        const readline = await import("node:readline");
         for (const dir of fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })) {
           if (!dir.isDirectory()) continue;
-          const decodedPath = dir.name.replace(/^--/, "/").replace(/--$/, "").replace(/-/g, "/");
           const sessionDir = path.join(SESSIONS_DIR, dir.name);
           const files = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jsonl"));
-          let lastMtime = 0;
           for (const f of files) {
             try {
-              const stat = fs.statSync(path.join(sessionDir, f));
-              if (stat.mtimeMs > lastMtime) lastMtime = stat.mtimeMs;
+              const filePath = path.join(sessionDir, f);
+              const parsed = await parseSessionFile(filePath, readline);
+              if (!parsed?.cwd || isTempProjectPath(parsed.cwd)) continue;
+              const cwd = parsed.cwd;
+              const stat = fs.statSync(filePath);
+              const info = sessionInfo.get(cwd) || { count: 0, lastActive: 0 };
+              info.count += 1;
+              info.lastActive = Math.max(info.lastActive, stat.mtimeMs);
+              sessionInfo.set(cwd, info);
             } catch {}
           }
-          sessionInfo.set(decodedPath, { count: files.length, lastActive: lastMtime });
         }
       }
 
@@ -1428,7 +1532,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         }
       }
 
-      addProject(getCurrentCwd());
+      const currentCwd = getCurrentCwd();
+      if (!isTempProjectPath(currentCwd)) addProject(currentCwd);
       for (const projectPath of sessionInfo.keys()) {
         addProject(projectPath);
       }
@@ -1464,15 +1569,16 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
         const projectDir = path.join(SESSIONS_DIR, dir.name);
         const files = fs.readdirSync(projectDir).filter(f => f.endsWith(".jsonl"));
-        const decodedPath = dir.name.replace(/^--/, "/").replace(/--$/, "").replace(/-/g, "/");
 
         const sessions: any[] = [];
+        let projectPath = "";
 
         for (const file of files) {
           try {
             const filePath = path.join(projectDir, file);
             const parsed = await parseSessionFile(filePath, readline);
-            if (parsed) {
+            if (parsed?.cwd && !isTempProjectPath(parsed.cwd)) {
+              projectPath ||= parsed.cwd;
               const stat = fs.statSync(filePath);
               const isTmux = tmuxFiles.has(filePath);
               sessions.push({ ...parsed, file, filePath, mtime: stat.mtimeMs, ...(isTmux && { tmux: true }) });
@@ -1483,7 +1589,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         sessions.sort((a, b) => b.mtime - a.mtime);
 
         if (sessions.length > 0) {
-          projects.push({ path: decodedPath, dirName: dir.name, sessions });
+          projects.push({ path: projectPath, dirName: dir.name, sessions });
         }
       }
 
@@ -1678,7 +1784,6 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         if (results.length >= MAX_RESULTS) break;
 
         const projectDir = path.join(SESSIONS_DIR, dir.name);
-        const decodedPath = dir.name.replace(/^--/, "/").replace(/--$/, "").replace(/-/g, "/");
         const files = fs.readdirSync(projectDir).filter(f => f.endsWith(".jsonl"));
 
         for (const file of files) {
@@ -1692,6 +1797,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             let sessionId = "";
             let sessionName = "";
             let sessionTimestamp = "";
+            let sessionCwd = "";
+            let skipSession = false;
             let firstMessage = "";
             const matches: any[] = [];
 
@@ -1703,6 +1810,11 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
                 if (entry.type === "session") {
                   sessionId = entry.id;
                   sessionTimestamp = entry.timestamp || "";
+                  sessionCwd = entry.cwd || "";
+                  if (isTempProjectPath(sessionCwd)) {
+                    skipSession = true;
+                    break;
+                  }
                 }
                 if (entry.type === "session_info" && entry.name) {
                   sessionName = entry.name;
@@ -1740,10 +1852,12 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             rl.close();
             stream.destroy();
 
+            if (skipSession) continue;
+
             if (matches.length > 0) {
               results.push({
                 filePath,
-                project: decodedPath,
+                project: sessionCwd,
                 sessionId,
                 sessionName,
                 sessionTimestamp,

@@ -60,7 +60,7 @@
             </button>
             <div class="model-dropdown-menu hidden" id="model-dropdown-menu"></div>
           </div>
-          <button class="thinking-tag" id="thinking-btn" title="Cycle thinking level">off</button>
+          <button class="thinking-tag" id="thinking-btn" title="Set thinking level">off</button>
         </div>
         <div class="header-right">
           <div class="pill session-cost" id="session-cost" title="Session cost"></div>
@@ -88,9 +88,6 @@
           </button>
         </div>
       </div>
-
-      <!-- Launcher (project picker) -->
-      <div class="launcher hidden" id="launcher"></div>
 
       <!-- Messages Container -->
       <div class="messages" id="messages">
@@ -123,14 +120,6 @@
         <div class="mobile-model-bar" id="mobile-model-bar"></div>
         <div class="queued-messages hidden" id="queued-messages"></div>
         <div class="image-previews hidden" id="image-previews"></div>
-        <div class="project-switcher" id="project-switcher">
-          <button type="button" class="project-switcher-btn" id="project-switcher-btn" title="Switch project">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
-            <span id="project-switcher-label">No Project</span>
-            <svg width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </button>
-          <div class="project-switcher-menu hidden" id="project-switcher-menu"></div>
-        </div>
         <form id="chat-form">
           <div class="input-left-actions">
             <button type="button" class="input-icon-btn" id="command-btn" title="Commands" aria-label="Open commands" tabindex="-1">
@@ -162,6 +151,14 @@
             <button type="button" id="abort-btn" class="hidden" title="Abort (Esc)" tabindex="-1"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg></button>
           </div>
         </form>
+        <div class="new-session-tools hidden" id="new-session-tools">
+          <button type="button" class="new-project-btn" id="new-project-btn">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
+            <span id="new-project-label">项目</span>
+            <svg width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div class="new-project-menu hidden" id="new-project-menu"></div>
+        </div>
         <div class="extension-widgets below" id="extension-widgets-below"></div>
       </div>
     </div>
