@@ -16,6 +16,9 @@
     "type": "git",
     "url": "git+https://github.com/Averyyy/pi-tau-codex.git"
   },
+  "scripts": {
+    "dev": "TAU_DEV=1 TAU_STATIC_DIR=$PWD/public pi --approve"
+  },
   "publishConfig": {
     "access": "public"
   },

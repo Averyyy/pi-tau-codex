@@ -47,9 +47,11 @@ const TAU_AUTO_START = TAU_SETTINGS.autoStart;
 const AUTH_USER = TAU_SETTINGS.user;
 const AUTH_PASS = TAU_SETTINGS.pass;
 const AUTH_CONFIGURED = !!(AUTH_USER && AUTH_PASS);
+const TAU_DEV = process.env.TAU_DEV === "1" || process.env.TAU_DEV === "true";
 let authEnabled = AUTH_CONFIGURED && TAU_SETTINGS.authEnabled !== false;
 // @ts-ignore — __dirname is provided by jiti at runtime
 const STATIC_DIR = process.env.TAU_STATIC_DIR || findPublicDir();
+const DEV_RELOAD_SCRIPT = `\n<script>(() => { const s = new EventSource("/__tau_dev/events"); s.onmessage = () => location.reload(); })();</script>`;
 
 function findPublicDir(): string {
     const candidates: string[] = [];
@@ -262,7 +264,10 @@ export default function (pi: ExtensionAPI) {
   let server: http.Server | null = null;
   let wss: WebSocketServer | null = null;
   let heartbeatTimer: NodeJS.Timeout | null = null;
+  let devWatcher: fs.FSWatcher | null = null;
+  let devReloadTimer: ReturnType<typeof setTimeout> | null = null;
   const clients = new Set<WebSocket>();
+  const devClients = new Set<http.ServerResponse>();
 
   // Store latest context reference for use in command handlers
   let latestCtx: ExtensionContext | null = null;
@@ -314,6 +319,16 @@ export default function (pi: ExtensionAPI) {
       server.close();
       server = null;
     }
+    if (devWatcher) {
+      devWatcher.close();
+      devWatcher = null;
+    }
+    if (devReloadTimer) {
+      clearTimeout(devReloadTimer);
+      devReloadTimer = null;
+    }
+    for (const client of devClients) client.end();
+    devClients.clear();
     unregisterInstance();
     mirrorUrl = "";
     tailscaleUrl = "";
@@ -856,6 +871,28 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // Static file server
   // ═══════════════════════════════════════
+  function startDevWatcher() {
+    if (!TAU_DEV || devWatcher) return;
+    devWatcher = fs.watch(STATIC_DIR, { recursive: true }, () => {
+      if (devReloadTimer) clearTimeout(devReloadTimer);
+      devReloadTimer = setTimeout(() => {
+        for (const client of devClients) client.write("data: reload\n\n");
+      }, 50);
+    });
+  }
+
+  function serveDevEvents(req: http.IncomingMessage, res: http.ServerResponse) {
+    startDevWatcher();
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    });
+    res.write(": connected\n\n");
+    devClients.add(res);
+    req.on("close", () => devClients.delete(res));
+  }
+
   function serveStaticFile(req: http.IncomingMessage, res: http.ServerResponse) {
     let urlPath = req.url || "/";
 
@@ -868,6 +905,10 @@ export default function (pi: ExtensionAPI) {
     // Handle API routes
     if (urlPath.startsWith("/api/")) {
       handleApiRoute(req, res, urlPath);
+      return;
+    }
+    if (TAU_DEV && urlPath === "/__tau_dev/events") {
+      serveDevEvents(req, res);
       return;
     }
 
@@ -897,7 +938,14 @@ export default function (pi: ExtensionAPI) {
       const ext = path.extname(filePath).toLowerCase();
       const contentType = MIME_TYPES[ext] || "application/octet-stream";
 
-      res.writeHead(200, { "Content-Type": contentType });
+      res.writeHead(200, {
+        "Content-Type": contentType,
+        ...(TAU_DEV ? { "Cache-Control": "no-store" } : {}),
+      });
+      if (TAU_DEV && filePath === path.join(STATIC_DIR, "index.html")) {
+        res.end(fs.readFileSync(filePath, "utf8").replace("</body>", `${DEV_RELOAD_SCRIPT}\n</body>`));
+        return;
+      }
       fs.createReadStream(filePath).pipe(res);
     });
   }
