@@ -1,6 +1,7 @@
 .git
 .pi
 .DS_Store
+.github/
 docs
 *.html
 !public/index.html

@@ -19,6 +19,13 @@
   "publishConfig": {
     "access": "public"
   },
+  "files": [
+    "public",
+    "extensions",
+    "extras",
+    "README.md",
+    "CLAUDE.md"
+  ],
   "pi": {
     "extensions": [
       "./extensions/mirror-server.ts"
