@@ -11,8 +11,11 @@ export class SessionSidebar {
     this.collapsedProjects = new Set();
     this.searchQuery = '';
     this.favourites = JSON.parse(localStorage.getItem('tau-favourites') || '[]');
+    this.hiddenProjects = JSON.parse(localStorage.getItem('tau-hidden-projects') || '[]');
+    this.projectNames = JSON.parse(localStorage.getItem('tau-project-names') || '{}');
     this.contextMenu = null;
     this.archivedProjectsOpen = localStorage.getItem('tau-sidebar-archived-open') === 'true';
+    this.hiddenProjectsOpen = localStorage.getItem('tau-sidebar-hidden-open') === 'true';
 
     // Close context menu on click anywhere
     document.addEventListener('click', () => this.closeContextMenu());
@@ -39,6 +42,21 @@ export class SessionSidebar {
     }
     this.saveFavourites();
     this.render();
+  }
+
+  saveProjectPrefs() {
+    localStorage.setItem('tau-hidden-projects', JSON.stringify(this.hiddenProjects));
+    localStorage.setItem('tau-project-names', JSON.stringify(this.projectNames));
+  }
+
+  projectDisplayName(project) {
+    if (this.projectNames[project.path]) return this.projectNames[project.path];
+    const pathParts = project.path.split('/').filter(Boolean);
+    return pathParts.length > 0 ? pathParts[pathParts.length - 1] : project.path;
+  }
+
+  isProjectHidden(project) {
+    return this.hiddenProjects.includes(project.path);
   }
 
   async loadSessions() {
@@ -241,16 +259,45 @@ export class SessionSidebar {
       menu.appendChild(row);
     }
 
-    // Position
+    this.positionContextMenu(menu, e.clientX, e.clientY);
+  }
+
+  showProjectMenu(e, project) {
+    e.preventDefault();
+    e.stopPropagation();
+    this.closeContextMenu();
+
+    const hidden = this.isProjectHidden(project);
+    const items = [
+      { icon: hidden ? '☑' : '☐', label: hidden ? '取消隐藏' : '隐藏项目', action: () => this.toggleProjectHidden(project) },
+      { icon: '✎', label: '重命名项目', action: () => this.renameProject(project) },
+      { icon: '↗', label: '在 Finder / Explorer 中打开', action: () => this.openProjectFolder(project) },
+    ];
+
+    const menu = document.createElement('div');
+    menu.className = 'session-context-menu';
+    for (const item of items) {
+      const row = document.createElement('div');
+      row.className = 'context-menu-item';
+      row.innerHTML = `<span class="context-menu-icon">${item.icon}</span>${item.label}`;
+      row.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        this.closeContextMenu();
+        item.action();
+      });
+      menu.appendChild(row);
+    }
+
+    this.positionContextMenu(menu, e.clientX, e.clientY);
+  }
+
+  positionContextMenu(menu, x, y) {
     document.body.appendChild(menu);
     const rect = menu.getBoundingClientRect();
-    let x = e.clientX;
-    let y = e.clientY;
     if (x + rect.width > window.innerWidth) x = window.innerWidth - rect.width - 8;
     if (y + rect.height > window.innerHeight) y = window.innerHeight - rect.height - 8;
     menu.style.left = `${x}px`;
     menu.style.top = `${y}px`;
-
     this.contextMenu = menu;
   }
 
@@ -338,6 +385,39 @@ export class SessionSidebar {
     } catch { /* silent */ }
   }
 
+  toggleProjectHidden(project) {
+    const idx = this.hiddenProjects.indexOf(project.path);
+    if (idx >= 0) {
+      this.hiddenProjects.splice(idx, 1);
+    } else {
+      this.hiddenProjects.push(project.path);
+    }
+    this.saveProjectPrefs();
+    this.render();
+  }
+
+  renameProject(project) {
+    const name = prompt('重命名项目', this.projectDisplayName(project));
+    if (name === null) return;
+    const trimmed = name.trim();
+    if (trimmed) {
+      this.projectNames[project.path] = trimmed;
+    } else {
+      delete this.projectNames[project.path];
+    }
+    this.saveProjectPrefs();
+    this.render();
+  }
+
+  async openProjectFolder(project) {
+    const res = await fetch('/api/open', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filePath: project.path }),
+    });
+    if (!res.ok) alert('Failed to open project folder');
+  }
+
   // ═══════════════════════════════════════
   // Render
   // ═══════════════════════════════════════
@@ -379,9 +459,12 @@ export class SessionSidebar {
 
     this.container.innerHTML = '';
 
-    // Favourites section — collect from all projects
+    const visibleProjects = this.projects.filter(project => !this.isProjectHidden(project));
+    const hiddenProjects = this.projects.filter(project => this.isProjectHidden(project));
+
+    // Favourites section — collect from visible projects
     const favSessions = [];
-    for (const project of this.projects) {
+    for (const project of visibleProjects) {
       for (const session of project.sessions) {
         if (this.isFavourite(session.filePath)) {
           favSessions.push({ session, project });
@@ -407,8 +490,8 @@ export class SessionSidebar {
       this.container.appendChild(favGroup);
     }
 
-    const scopedProjects = this.projects.slice(0, 6);
-    const archivedProjects = this.projects.slice(6);
+    const scopedProjects = visibleProjects.slice(0, 6);
+    const archivedProjects = visibleProjects.slice(6);
 
     this.appendProjectSection('Scoped Projects', scopedProjects, true);
 
@@ -428,6 +511,25 @@ export class SessionSidebar {
       this.container.appendChild(header);
       if (this.archivedProjectsOpen) {
         this.appendProjectSection('', archivedProjects, true);
+      }
+    }
+
+    if (hiddenProjects.length > 0) {
+      const header = document.createElement('button');
+      header.type = 'button';
+      header.className = `sidebar-section-header${this.hiddenProjectsOpen ? '' : ' collapsed'}`;
+      header.innerHTML = `
+        <span>Hidden Projects</span>
+        <span class="project-count">${hiddenProjects.length}</span>
+      `;
+      header.addEventListener('click', () => {
+        this.hiddenProjectsOpen = !this.hiddenProjectsOpen;
+        localStorage.setItem('tau-sidebar-hidden-open', String(this.hiddenProjectsOpen));
+        this.render();
+      });
+      this.container.appendChild(header);
+      if (this.hiddenProjectsOpen) {
+        this.appendProjectSection('', hiddenProjects, true);
       }
     }
 
@@ -453,13 +555,13 @@ export class SessionSidebar {
       const header = document.createElement('div');
       header.className = `project-header${isCollapsed ? ' collapsed' : ''}`;
 
-      const pathParts = project.path.split('/').filter(Boolean);
-      const shortPath = pathParts.length > 0 ? pathParts[pathParts.length - 1] : project.path;
+      const shortPath = this.projectDisplayName(project);
 
       header.innerHTML = `
         <span class="chevron">▼</span>
-        <span title="${this.escapeHtml(project.path)}">${this.escapeHtml(shortPath)}</span>
+        <span class="project-title" title="${this.escapeHtml(project.path)}">${this.escapeHtml(shortPath)}</span>
         <span class="project-count">${project.sessions.length}</span>
+        <button type="button" class="project-menu-btn" aria-label="Project actions">•••</button>
       `;
 
       header.addEventListener('click', () => {
@@ -472,6 +574,7 @@ export class SessionSidebar {
         sessionsDiv.classList.toggle('collapsed');
       });
 
+      header.querySelector('.project-menu-btn')?.addEventListener('click', (e) => this.showProjectMenu(e, project));
       group.appendChild(header);
 
       const sessionsDiv = document.createElement('div');
