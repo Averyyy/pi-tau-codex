@@ -51,6 +51,7 @@ const TAU_DEV = process.env.TAU_DEV === "1" || process.env.TAU_DEV === "true";
 let authEnabled = AUTH_CONFIGURED && TAU_SETTINGS.authEnabled !== false;
 // @ts-ignore — __dirname is provided by jiti at runtime
 const STATIC_DIR = process.env.TAU_STATIC_DIR || findPublicDir();
+const DEV_BOOT_SCRIPT = `<script>window.__TAU_DEV__ = true; if ("serviceWorker" in navigator) navigator.serviceWorker.getRegistrations().then(rs => Promise.all(rs.map(r => r.unregister()))).then(() => { if (navigator.serviceWorker.controller) location.reload(); });</script>`;
 const DEV_RELOAD_SCRIPT = `\n<script>(() => { const s = new EventSource("/__tau_dev/events"); s.onmessage = () => location.reload(); })();</script>`;
 
 function findPublicDir(): string {
@@ -241,6 +242,24 @@ function saveTauSetting(key: string, value: any) {
     settings.tau[key] = value;
     fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
   } catch {}
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function launchPi(projectPath: string, options: { sessionFile?: string; message?: string } = {}) {
+  const args = ["--approve"];
+  if (options.sessionFile) args.push("--session", options.sessionFile);
+  if (options.message) args.push(options.message);
+  const command = `cd ${shellQuote(projectPath)} && pi ${args.map(shellQuote).join(" ")}`;
+  if (process.platform === "darwin") {
+    execFileSync("osascript", ["-e", `tell app "iTerm2" to create window with default profile command ${JSON.stringify(command)}`]);
+    return;
+  }
+  const { spawn } = require("node:child_process");
+  const child = spawn("pi", args, { cwd: projectPath, detached: true, stdio: "ignore" });
+  child.unref();
 }
 
 function checkBasicAuth(req: http.IncomingMessage): boolean {
@@ -1042,7 +1061,9 @@ export default function (pi: ExtensionAPI) {
         ...(TAU_DEV ? { "Cache-Control": "no-store" } : {}),
       });
       if (TAU_DEV && filePath === path.join(STATIC_DIR, "index.html")) {
-        res.end(fs.readFileSync(filePath, "utf8").replace("</body>", `${DEV_RELOAD_SCRIPT}\n</body>`));
+        res.end(fs.readFileSync(filePath, "utf8")
+          .replace('<script type="module" src="app.js"></script>', `${DEV_BOOT_SCRIPT}\n  <script type="module" src="app.js"></script>`)
+          .replace("</body>", `${DEV_RELOAD_SCRIPT}\n</body>`));
         return;
       }
       fs.createReadStream(filePath).pipe(res);
@@ -1270,10 +1291,15 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
       req.on("end", () => {
         try {
-          const { path: projectPath } = JSON.parse(body);
+          const { path: projectPath, sessionFile, message } = JSON.parse(body);
           if (!projectPath || typeof projectPath !== "string") {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "path required" }));
+            return;
+          }
+          if (sessionFile !== undefined && (typeof sessionFile !== "string" || !fs.existsSync(sessionFile))) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "valid sessionFile required" }));
             return;
           }
           // Resolve ~ in path
@@ -1285,9 +1311,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             res.end(JSON.stringify({ error: "Directory not found" }));
             return;
           }
-          const { execSync } = require("node:child_process");
-          const escaped = resolved.replace(/'/g, "'\\''");
-          execSync(`osascript -e 'tell app "iTerm2" to create window with default profile command "cd '"'"'${escaped}'"'"' && pi"'`);
+          launchPi(resolved, { sessionFile, message });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true }));
         } catch (e: any) {

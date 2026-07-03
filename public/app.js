@@ -769,8 +769,6 @@ function sendMessage() {
     return;
   }
 
-  if (isNewSessionMode) exitNewSessionMode();
-
   messageInput.value = '';
   messageInput.style.height = 'auto';
   hideSlashMenu();
@@ -787,6 +785,12 @@ function sendMessage() {
 
   pendingFilePaths = [];
   renderAttachmentPreviews();
+
+  if (isNewSessionMode && isMirrorMode) {
+    launchNewSessionWithPendingMessage(cmd);
+    return;
+  }
+  if (isNewSessionMode) exitNewSessionMode();
 
   if (state.isStreaming) {
     // Queue it — show as bubble above input
@@ -1717,6 +1721,8 @@ async function switchSession(sessionFile, session = null, project = null) {
       if (viewingActiveSession) {
         // Re-request live state from the extension
         wsClient.send({ type: 'mirror_sync_request' });
+      } else {
+        await launchSessionInstance(sessionFile, project?.path);
       }
     } else {
       const res = await fetch('/api/sessions/switch', {
@@ -1781,6 +1787,7 @@ function handleMirrorSync(data) {
 
   updateCostDisplay();
   updateTokenUsage();
+  flushPendingNewMessage();
 }
 
 // Mark all live sessions in the sidebar with a green dot
@@ -1824,6 +1831,104 @@ function updateMirrorInputState() {
     messageInput.placeholder = 'Viewing historical session (read-only)';
     inputArea?.classList.add('mirror-readonly');
   }
+}
+
+async function launchSessionInstance(sessionFile, projectPath) {
+  if (!projectPath) {
+    messageRenderer.renderError('Cannot resume session: missing project path');
+    return false;
+  }
+  await pollInstances();
+  const beforePids = new Set(liveInstances.map(instance => instance.pid));
+  document.querySelector('.input-area')?.classList.remove('mirror-readonly');
+  messageInput.disabled = true;
+  messageInput.placeholder = 'Opening session...';
+  statusText.textContent = 'Opening session...';
+
+  const response = await fetch('/api/projects/launch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: projectPath, sessionFile }),
+  });
+  const data = await response.json();
+  if (!response.ok || !data.ok) {
+    messageRenderer.renderError(data.error || 'Failed to open session');
+    statusText.textContent = 'Connected';
+    updateMirrorInputState();
+    return false;
+  }
+
+  for (let i = 0; i < 20; i += 1) {
+    await wait(500);
+    await pollInstances();
+    const instance = liveInstances.find(item => item.sessionFile === sessionFile && !beforePids.has(item.pid));
+    if (instance) {
+      navigateToInstance(instance);
+      return true;
+    }
+  }
+
+  messageRenderer.renderError('Session opened, but Tau did not see its mirror yet');
+  statusText.textContent = 'Connected';
+  updateMirrorInputState();
+  return false;
+}
+
+function currentPort() {
+  return Number(new URL(wsClient.url).port || location.port || 80);
+}
+
+async function launchNewSessionWithPendingMessage(cmd) {
+  const projectPath = selectedNewProject?.path || currentProjectPath;
+  if (!projectPath) {
+    messageRenderer.renderError('Cannot start new session: missing project path');
+    return;
+  }
+
+  await pollInstances();
+  const beforePids = new Set(liveInstances.map(instance => instance.pid));
+  localStorage.setItem('tau-pending-new-message', JSON.stringify({ sourcePort: currentPort(), cmd }));
+  statusText.textContent = 'Opening new session...';
+
+  const response = await fetch('/api/projects/launch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: projectPath }),
+  });
+  const data = await response.json();
+  if (!response.ok || !data.ok) {
+    localStorage.removeItem('tau-pending-new-message');
+    messageRenderer.renderError(data.error || 'Failed to open new session');
+    statusText.textContent = 'Connected';
+    return;
+  }
+
+  for (let i = 0; i < 20; i += 1) {
+    await wait(500);
+    await pollInstances();
+    const instance = liveInstances.find(item => item.cwd === projectPath && !beforePids.has(item.pid));
+    if (instance) {
+      navigateToInstance(instance);
+      return;
+    }
+  }
+
+  localStorage.removeItem('tau-pending-new-message');
+  messageRenderer.renderError('New session opened, but Tau did not see its mirror yet');
+  statusText.textContent = 'Connected';
+}
+
+function flushPendingNewMessage() {
+  const raw = localStorage.getItem('tau-pending-new-message');
+  if (!raw) return;
+  const pending = JSON.parse(raw);
+  if (currentPort() === pending.sourcePort) return;
+  const { cmd } = pending;
+  localStorage.removeItem('tau-pending-new-message');
+  exitNewSessionMode();
+  lastSentMessage = cmd.message;
+  messageRenderer.renderUserMessage({ content: cmd.message, images: cmd.images });
+  wsClient.send(cmd);
 }
 
 // ═══════════════════════════════════════
@@ -2517,41 +2622,6 @@ function navigateToInstance(instance) {
   location.href = url.toString();
 }
 
-async function switchToNewProject(project) {
-  if (!project?.path || project.path === currentProjectPath) return;
-
-  await pollInstances();
-  const existing = liveInstances.find(instance => instance.cwd === project.path);
-  if (existing) {
-    navigateToInstance(existing);
-    return;
-  }
-
-  statusText.textContent = 'Opening project...';
-  const response = await fetch('/api/projects/launch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: project.path }),
-  });
-  const data = await response.json();
-  if (!response.ok || !data.ok) {
-    messageRenderer.renderError(data.error || 'Failed to open project');
-    statusText.textContent = 'Connected';
-    return;
-  }
-
-  for (let i = 0; i < 20; i += 1) {
-    await wait(500);
-    await pollInstances();
-    const launched = liveInstances.find(instance => instance.cwd === project.path);
-    if (launched) {
-      navigateToInstance(launched);
-      return;
-    }
-  }
-  statusText.textContent = 'Project opened';
-}
-
 function renderNewProjectMenu(filter = '') {
   const query = filter.toLowerCase();
   newProjectMenu.innerHTML = '';
@@ -2585,7 +2655,6 @@ function renderNewProjectMenu(filter = '') {
       selectedNewProject = project;
       renderNewProjectLabel();
       closeNewProjectMenu();
-      await switchToNewProject(project);
     });
     list.appendChild(item);
   }
@@ -2650,9 +2719,7 @@ document.addEventListener('click', (event) => {
   }
 });
 
-document.querySelector('.mode-link:first-child')?.addEventListener('click', () => {
-  exitNewSessionMode();
-});
+document.getElementById('tau-new-session-btn')?.addEventListener('click', () => newSession());
 
 wsClient.connect();
 messageRenderer.renderWelcome();
@@ -2662,7 +2729,11 @@ sidebar.loadSessions().then(() => {
 fetchGitState().catch(() => {});
 
 // Register service worker for PWA
-if ('serviceWorker' in navigator) {
+if (window.__TAU_DEV__ && 'serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations().then(registrations => {
+    for (const registration of registrations) registration.unregister();
+  }).catch(() => {});
+} else if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
 

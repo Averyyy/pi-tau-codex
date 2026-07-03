@@ -386,29 +386,23 @@ body {
   -webkit-app-region: drag;
 }
 
-/* Mode toggle pills */
-.mode-toggle {
-  display: flex;
-  gap: 2px;
-  background: var(--bg-glass);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  padding: 2px;
-  flex-shrink: 0;
-  -webkit-app-region: no-drag;
-}
-
 .mode-link {
   display: flex;
   align-items: center;
   justify-content: center;
   width: 30px;
   height: 26px;
+  padding: 0;
+  border: none;
   border-radius: var(--radius-md);
+  background: transparent;
   text-decoration: none;
   font-size: 13px;
   color: var(--text-dim);
+  cursor: pointer;
   transition: all var(--duration) var(--ease);
+  flex-shrink: 0;
+  -webkit-app-region: no-drag;
 }
 
 .tau-icon {
