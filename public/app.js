@@ -571,7 +571,10 @@ chatForm.addEventListener('submit', (e) => {
 });
 
 messageInput.addEventListener('keydown', (e) => {
-  if (handleSlashMenuKeydown(e)) return;
+  if (handleSlashMenuKeydown(e)) {
+    e.stopPropagation();
+    return;
+  }
 
   // Enter sends, Shift+Enter inserts newline
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
@@ -886,6 +889,7 @@ const fallbackSlashCommands = [
 let slashCommands = fallbackSlashCommands;
 let slashCommandsLoaded = false;
 let slashSelectedIndex = 0;
+let lastSlashQuery = null;
 
 function openCommandPalette() {
   commandList.innerHTML = '';
@@ -915,11 +919,15 @@ function closeCommandPalette() {
 }
 
 commandBtn.addEventListener('click', () => {
+  openSlashMenu();
+});
+commandPaletteOverlay.addEventListener('click', closeCommandPalette);
+
+function openSlashMenu() {
   messageInput.focus();
   ensureSlashAtCursor();
   updateSlashMenu(true);
-});
-commandPaletteOverlay.addEventListener('click', closeCommandPalette);
+}
 
 async function fetchSlashCommands() {
   if (slashCommandsLoaded) return slashCommands;
@@ -970,6 +978,11 @@ async function updateSlashMenu(force = false) {
     return;
   }
 
+  if (fragment.query !== lastSlashQuery) {
+    slashSelectedIndex = 0;
+    lastSlashQuery = fragment.query;
+  }
+
   const commands = await fetchSlashCommands();
   const filtered = commands
     .filter((command) => {
@@ -990,10 +1003,15 @@ async function updateSlashMenu(force = false) {
 
 function renderSlashMenu(items, fragment) {
   slashMenu.innerHTML = '';
+  slashMenu.setAttribute('role', 'listbox');
+  slashMenu.setAttribute('aria-label', 'Slash commands');
   items.forEach((command, index) => {
     const item = document.createElement('button');
     item.type = 'button';
     item.className = `slash-item${index === slashSelectedIndex ? ' active' : ''}`;
+    item.id = `slash-command-${index}`;
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', String(index === slashSelectedIndex));
     item.dataset.commandName = command.name;
     item.innerHTML = `
       <span class="slash-name">/${escapeHtml(command.name)}</span>
@@ -1006,6 +1024,11 @@ function renderSlashMenu(items, fragment) {
     });
     slashMenu.appendChild(item);
   });
+  const active = slashMenu.querySelector('.slash-item.active');
+  if (active) {
+    messageInput.setAttribute('aria-activedescendant', active.id);
+    active.scrollIntoView({ block: 'nearest' });
+  }
   slashMenu.classList.remove('hidden');
 }
 
@@ -1013,6 +1036,8 @@ function hideSlashMenu() {
   slashMenu.classList.add('hidden');
   slashMenu.innerHTML = '';
   slashSelectedIndex = 0;
+  lastSlashQuery = null;
+  messageInput.removeAttribute('aria-activedescendant');
 }
 
 function selectSlashCommand(command, fragment = getSlashFragment()) {
@@ -1502,6 +1527,10 @@ projectSwitcherBtn.addEventListener('click', toggleProjectSwitcher);
 // ═══════════════════════════════════════
 
 document.addEventListener('keydown', (e) => {
+  if (!slashMenu.classList.contains('hidden') && handleSlashMenuKeydown(e)) {
+    return;
+  }
+
   // Escape — Abort streaming, or close sidebar on mobile
   if (e.key === 'Escape') {
     // Close palettes/panels first
@@ -1534,7 +1563,7 @@ document.addEventListener('keydown', (e) => {
   // / — Focus message input (when not already in an input)
   if (e.key === '/' && !isInInput()) {
     e.preventDefault();
-    messageInput.focus();
+    openSlashMenu();
   }
 });
 

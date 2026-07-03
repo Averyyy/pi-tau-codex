@@ -1,6 +1,6 @@
 {
   "name": "@averyyy/pi-tau-codex",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Codex-like web UI that mirrors your Pi terminal session in the browser",
   "keywords": [
     "pi",
