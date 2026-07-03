@@ -47,6 +47,18 @@ const tokenUsageEl = document.getElementById('token-usage');
 const scrollBottomBtn = document.getElementById('scroll-bottom-btn');
 const scrollBottomBadge = document.getElementById('scroll-bottom-badge');
 const messagesContainer = document.getElementById('messages');
+const branchDropdown = document.getElementById('branch-dropdown');
+const branchDropdownBtn = document.getElementById('branch-dropdown-btn');
+const branchDropdownLabel = document.getElementById('branch-dropdown-label');
+const branchDropdownMenu = document.getElementById('branch-dropdown-menu');
+const projectSwitcher = document.getElementById('project-switcher');
+const projectSwitcherBtn = document.getElementById('project-switcher-btn');
+const projectSwitcherLabel = document.getElementById('project-switcher-label');
+const projectSwitcherMenu = document.getElementById('project-switcher-menu');
+const slashMenu = document.getElementById('slash-menu');
+const extensionWidgetsAbove = document.getElementById('extension-widgets-above');
+const extensionWidgetsBelow = document.getElementById('extension-widgets-below');
+const settingsCurrentBranch = document.getElementById('settings-current-branch');
 
 // State tracking
 let currentStreamingElement = null;
@@ -434,9 +446,104 @@ function handleExtensionUIRequest(event) {
     case 'notify':
       dialogHandler.showNotification(event);
       break;
+    case 'setStatus':
+      renderExtensionStatus(event);
+      break;
+    case 'setWidget':
+      renderExtensionWidget(event);
+      break;
+    case 'setTitle':
+      setExtensionTitle(event);
+      break;
+    case 'set_editor_text':
+      setEditorTextFromExtension(event);
+      break;
     default:
       console.warn('[App] Unknown extension UI method:', event.method);
   }
+}
+
+const extensionStatuses = new Map();
+const extensionWidgets = new Map();
+
+function getEventArgs(event) {
+  return Array.isArray(event.args) ? event.args : [];
+}
+
+function renderExtensionStatus(event) {
+  const args = getEventArgs(event);
+  const key = String(args[0] || event.statusKey || event.key || event.id || 'status');
+  const value = args[1] ?? event.statusText ?? event.status ?? event.value ?? '';
+  if (!value) {
+    extensionStatuses.delete(key);
+  } else {
+    extensionStatuses.set(key, String(value));
+  }
+  renderExtensionChrome();
+}
+
+function renderExtensionWidget(event) {
+  const args = getEventArgs(event);
+  const key = String(args[0] || event.widgetKey || event.key || event.id || 'widget');
+  const value = args[1] ?? event.widgetLines ?? event.lines ?? event.value ?? '';
+  const lines = Array.isArray(value) ? value.map(String) : String(value).split('\n');
+  const position = event.widgetPlacement === 'aboveEditor' || event.position === 'above' || args[2] === 'above' ? 'above' : 'below';
+  if (lines.every((line) => line.trim() === '')) {
+    extensionWidgets.delete(key);
+  } else {
+    extensionWidgets.set(key, { lines, position });
+  }
+  renderExtensionChrome();
+}
+
+function setExtensionTitle(event) {
+  const args = getEventArgs(event);
+  const title = args[0] ?? event.title;
+  if (title) {
+    document.title = String(title);
+    originalTitle = document.title;
+  }
+}
+
+function setEditorTextFromExtension(event) {
+  const args = getEventArgs(event);
+  const text = args[0] ?? event.text ?? '';
+  messageInput.value = String(text);
+  messageInput.dispatchEvent(new Event('input'));
+  messageInput.focus();
+}
+
+function renderExtensionChrome() {
+  extensionWidgetsAbove.innerHTML = '';
+  extensionWidgetsBelow.innerHTML = '';
+
+  if (extensionStatuses.size > 0) {
+    const row = document.createElement('div');
+    row.className = 'extension-status-row';
+    for (const [key, value] of extensionStatuses) {
+      const item = document.createElement('div');
+      item.className = 'extension-status-pill';
+      item.textContent = `${key}: ${value}`;
+      row.appendChild(item);
+    }
+    extensionWidgetsAbove.appendChild(row);
+  }
+
+  for (const [key, widget] of extensionWidgets) {
+    const el = document.createElement('div');
+    el.className = 'extension-widget';
+    el.dataset.widgetKey = key;
+    for (const line of widget.lines) {
+      const row = document.createElement('div');
+      row.className = 'extension-widget-line';
+      row.textContent = line;
+      el.appendChild(row);
+    }
+    (widget.position === 'above' ? extensionWidgetsAbove : extensionWidgetsBelow).appendChild(el);
+  }
+
+  extensionWidgetsAbove.classList.toggle('empty', extensionWidgetsAbove.children.length === 0);
+  extensionWidgetsBelow.classList.toggle('empty', extensionWidgetsBelow.children.length === 0);
 }
 
 function formatToolOutput(result) {
@@ -464,6 +571,8 @@ chatForm.addEventListener('submit', (e) => {
 });
 
 messageInput.addEventListener('keydown', (e) => {
+  if (handleSlashMenuKeydown(e)) return;
+
   // Enter sends, Shift+Enter inserts newline
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
@@ -475,6 +584,7 @@ messageInput.addEventListener('keydown', (e) => {
 messageInput.addEventListener('input', () => {
   messageInput.style.height = 'auto';
   messageInput.style.height = Math.min(messageInput.scrollHeight, 200) + 'px';
+  updateSlashMenu();
 });
 
 // ═══════════════════════════════════════
@@ -653,8 +763,16 @@ function sendMessage() {
   const message = messageInput.value.trim();
   if (!message && pendingImages.length === 0) return;
 
+  if (pendingImages.length === 0 && runSlashCommand(message)) {
+    messageInput.value = '';
+    messageInput.style.height = 'auto';
+    hideSlashMenu();
+    return;
+  }
+
   messageInput.value = '';
   messageInput.style.height = 'auto';
+  hideSlashMenu();
 
   const cmd = { type: 'prompt', message: message || '(see attached image)' };
 
@@ -738,13 +856,36 @@ const commandPaletteOverlay = document.getElementById('command-palette-overlay')
 const commandList = document.getElementById('command-list');
 
 const commands = [
-  { icon: '🗜️', label: 'Compact', desc: 'Compact context to save tokens', action: () => rpcCommand({ type: 'compact' }, 'Compacting...') },
-  { icon: '📋', label: 'Export HTML', desc: 'Export session as HTML file', action: () => rpcExportHtml() },
-  { icon: '📊', label: 'Session Stats', desc: 'Show session statistics', action: () => showSessionStats() },
-  { icon: '⬇️', label: 'Expand All Tools', desc: 'Expand all tool cards', action: () => toolCardRenderer.expandAll() },
-  { icon: '⬆️', label: 'Collapse All Tools', desc: 'Collapse all tool cards', action: () => toolCardRenderer.collapseAll() },
+  { icon: '/', label: 'Compact', desc: 'Compact context to save tokens', action: () => rpcCommand({ type: 'compact' }, 'Compacting...') },
+  { icon: '<>', label: 'Export HTML', desc: 'Export session as HTML file', action: () => rpcExportHtml() },
+  { icon: '#', label: 'Session Stats', desc: 'Show session statistics', action: () => showSessionStats() },
+  { icon: '+', label: 'Expand All Tools', desc: 'Expand all tool cards', action: () => toolCardRenderer.expandAll() },
+  { icon: '-', label: 'Collapse All Tools', desc: 'Collapse all tool cards', action: () => toolCardRenderer.collapseAll() },
 
 ];
+
+const fallbackSlashCommands = [
+  { name: 'settings', description: 'Open settings', source: 'builtin' },
+  { name: 'model', description: 'Open model picker', source: 'builtin' },
+  { name: 'compact', description: 'Compact context', source: 'builtin' },
+  { name: 'export', description: 'Export the current session as HTML', source: 'builtin' },
+  { name: 'session', description: 'Show current session stats', source: 'builtin' },
+  { name: 'name', description: 'Rename this session', source: 'builtin' },
+  { name: 'new', description: 'Start a new session', source: 'builtin' },
+  { name: 'copy', description: 'Copy the latest assistant message', source: 'builtin' },
+  { name: 'reload', description: 'Reload the web UI', source: 'builtin' },
+  { name: 'tree', description: 'Show conversation tree in the terminal', source: 'builtin' },
+  { name: 'fork', description: 'Fork the session in the terminal', source: 'builtin' },
+  { name: 'clone', description: 'Clone the current branch in the terminal', source: 'builtin' },
+  { name: 'trust', description: 'Manage project trust in the terminal', source: 'builtin' },
+  { name: 'login', description: 'Sign in from the terminal', source: 'builtin' },
+  { name: 'logout', description: 'Sign out from the terminal', source: 'builtin' },
+  { name: 'quit', description: 'Quit the terminal session', source: 'builtin' },
+];
+
+let slashCommands = fallbackSlashCommands;
+let slashCommandsLoaded = false;
+let slashSelectedIndex = 0;
 
 function openCommandPalette() {
   commandList.innerHTML = '';
@@ -773,8 +914,216 @@ function closeCommandPalette() {
   commandPaletteOverlay.classList.add('hidden');
 }
 
-commandBtn.addEventListener('click', openCommandPalette);
+commandBtn.addEventListener('click', () => {
+  messageInput.focus();
+  ensureSlashAtCursor();
+  updateSlashMenu(true);
+});
 commandPaletteOverlay.addEventListener('click', closeCommandPalette);
+
+async function fetchSlashCommands() {
+  if (slashCommandsLoaded) return slashCommands;
+  const resp = await fetch('/api/rpc', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'get_commands' }),
+  });
+  const data = await resp.json();
+  if (data.success && Array.isArray(data.data?.commands)) {
+    const byName = new Map();
+    for (const command of [...fallbackSlashCommands, ...data.data.commands]) {
+      if (command?.name) byName.set(command.name, command);
+    }
+    slashCommands = Array.from(byName.values());
+  }
+  slashCommandsLoaded = true;
+  return slashCommands;
+}
+
+function ensureSlashAtCursor() {
+  if (getSlashFragment()) return;
+  const start = messageInput.selectionStart ?? messageInput.value.length;
+  const end = messageInput.selectionEnd ?? start;
+  const prefix = start > 0 && !/\s$/.test(messageInput.value.slice(0, start)) ? ' /' : '/';
+  messageInput.value = messageInput.value.slice(0, start) + prefix + messageInput.value.slice(end);
+  const cursor = start + prefix.length;
+  messageInput.setSelectionRange(cursor, cursor);
+  messageInput.dispatchEvent(new Event('input'));
+}
+
+function getSlashFragment() {
+  const cursor = messageInput.selectionStart ?? messageInput.value.length;
+  const beforeCursor = messageInput.value.slice(0, cursor);
+  const match = beforeCursor.match(/(^|\s)\/([^\s/]*)$/);
+  if (!match) return null;
+  return {
+    start: beforeCursor.length - match[2].length - 1,
+    end: cursor,
+    query: match[2].toLowerCase(),
+  };
+}
+
+async function updateSlashMenu(force = false) {
+  const fragment = getSlashFragment();
+  if (!fragment) {
+    if (!force) hideSlashMenu();
+    return;
+  }
+
+  const commands = await fetchSlashCommands();
+  const filtered = commands
+    .filter((command) => {
+      const name = String(command.name || '').toLowerCase();
+      const desc = String(command.description || '').toLowerCase();
+      return !fragment.query || name.includes(fragment.query) || desc.includes(fragment.query);
+    })
+    .slice(0, 18);
+
+  if (filtered.length === 0) {
+    hideSlashMenu();
+    return;
+  }
+
+  slashSelectedIndex = Math.min(slashSelectedIndex, filtered.length - 1);
+  renderSlashMenu(filtered, fragment);
+}
+
+function renderSlashMenu(items, fragment) {
+  slashMenu.innerHTML = '';
+  items.forEach((command, index) => {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = `slash-item${index === slashSelectedIndex ? ' active' : ''}`;
+    item.dataset.commandName = command.name;
+    item.innerHTML = `
+      <span class="slash-name">/${escapeHtml(command.name)}</span>
+      <span class="slash-desc">${escapeHtml(command.description || '')}</span>
+      <span class="slash-source">${escapeHtml(command.source || 'command')}</span>
+    `;
+    item.addEventListener('mousedown', (event) => {
+      event.preventDefault();
+      selectSlashCommand(command, fragment);
+    });
+    slashMenu.appendChild(item);
+  });
+  slashMenu.classList.remove('hidden');
+}
+
+function hideSlashMenu() {
+  slashMenu.classList.add('hidden');
+  slashMenu.innerHTML = '';
+  slashSelectedIndex = 0;
+}
+
+function selectSlashCommand(command, fragment = getSlashFragment()) {
+  if (!fragment) return;
+  const before = messageInput.value.slice(0, fragment.start);
+  const after = messageInput.value.slice(fragment.end);
+  const insert = `/${command.name} `;
+  messageInput.value = before + insert + after;
+  const cursor = before.length + insert.length;
+  messageInput.setSelectionRange(cursor, cursor);
+  messageInput.dispatchEvent(new Event('input'));
+  hideSlashMenu();
+  messageInput.focus();
+}
+
+function handleSlashMenuKeydown(event) {
+  if (slashMenu.classList.contains('hidden')) return false;
+  const items = Array.from(slashMenu.querySelectorAll('.slash-item'));
+  if (items.length === 0) return false;
+
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault();
+    const delta = event.key === 'ArrowDown' ? 1 : -1;
+    slashSelectedIndex = (slashSelectedIndex + delta + items.length) % items.length;
+    updateSlashMenu();
+    return true;
+  }
+
+  if (event.key === 'Enter' || event.key === 'Tab') {
+    event.preventDefault();
+    const commandName = items[slashSelectedIndex]?.dataset.commandName;
+    const command = slashCommands.find((item) => item.name === commandName);
+    if (command) selectSlashCommand(command);
+    return true;
+  }
+
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    hideSlashMenu();
+    return true;
+  }
+
+  return false;
+}
+
+document.addEventListener('click', (event) => {
+  if (!slashMenu.contains(event.target) && event.target !== messageInput && !commandBtn.contains(event.target)) {
+    hideSlashMenu();
+  }
+});
+
+function runSlashCommand(text) {
+  if (!text.startsWith('/')) return false;
+  const [rawName, ...rest] = text.slice(1).split(/\s+/);
+  const name = rawName.toLowerCase();
+  const args = rest.join(' ').trim();
+
+  if (name === 'settings') {
+    openSettings();
+    return true;
+  }
+  if (name === 'model') {
+    openModelDropdown();
+    return true;
+  }
+  if (name === 'compact') {
+    rpcCommand({ type: 'compact' }, 'Compacting...');
+    return true;
+  }
+  if (name === 'export') {
+    rpcExportHtml();
+    return true;
+  }
+  if (name === 'session') {
+    showSessionStats();
+    return true;
+  }
+  if (name === 'name') {
+    if (args) {
+      rpcCommand({ type: 'set_session_name', name: args }, 'Renaming...');
+    } else {
+      messageRenderer.renderSystemMessage('Usage: /name New session name');
+    }
+    return true;
+  }
+  if (name === 'new') {
+    newSession();
+    return true;
+  }
+  if (name === 'copy') {
+    copyLatestAssistantMessage();
+    return true;
+  }
+  if (name === 'reload') {
+    location.reload();
+    return true;
+  }
+
+  return false;
+}
+
+function copyLatestAssistantMessage() {
+  const messages = Array.from(document.querySelectorAll('.message.assistant .message-content'));
+  const latest = messages.at(-1);
+  if (!latest) {
+    messageRenderer.renderSystemMessage('No assistant message to copy');
+    return;
+  }
+  navigator.clipboard?.writeText(latest.textContent || '');
+  messageRenderer.renderSystemMessage('Copied latest assistant message');
+}
 
 async function rpcCommand(cmd, statusMsg) {
   try {
@@ -956,6 +1305,12 @@ document.addEventListener('click', (e) => {
   if (!modelDropdown.contains(e.target)) {
     closeModelDropdown();
   }
+  if (!branchDropdown.contains(e.target)) {
+    closeBranchDropdown();
+  }
+  if (!projectSwitcher.contains(e.target)) {
+    closeProjectSwitcher();
+  }
 });
 
 // Thinking level button — cycles through levels
@@ -966,6 +1321,181 @@ thinkingBtn.addEventListener('click', async () => {
     updateThinkingBtn();
   }
 });
+
+// ═══════════════════════════════════════
+// Git branch switcher
+// ═══════════════════════════════════════
+
+let currentGitState = { isRepo: false, currentBranch: '', branches: [] };
+
+async function fetchGitState() {
+  const response = await fetch('/api/git');
+  const data = await response.json();
+  currentGitState = data;
+  renderGitState();
+}
+
+function renderGitState() {
+  const isRepo = !!currentGitState.isRepo;
+  branchDropdown.classList.toggle('hidden', !isRepo);
+  const label = currentGitState.currentBranch || 'detached';
+  branchDropdownLabel.textContent = label;
+  settingsCurrentBranch.textContent = isRepo ? label : 'none';
+}
+
+function toggleBranchDropdown() {
+  if (branchDropdownMenu.classList.contains('hidden')) {
+    openBranchDropdown();
+  } else {
+    closeBranchDropdown();
+  }
+}
+
+function openBranchDropdown() {
+  branchDropdownMenu.innerHTML = '';
+  for (const branch of currentGitState.branches || []) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = `branch-dropdown-item${branch === currentGitState.currentBranch ? ' active' : ''}`;
+    item.textContent = branch;
+    item.addEventListener('click', async () => {
+      closeBranchDropdown();
+      await checkoutBranch(branch);
+    });
+    branchDropdownMenu.appendChild(item);
+  }
+  branchDropdownMenu.classList.remove('hidden');
+  branchDropdown.classList.add('open');
+}
+
+function closeBranchDropdown() {
+  branchDropdownMenu.classList.add('hidden');
+  branchDropdown.classList.remove('open');
+}
+
+async function checkoutBranch(branch) {
+  const response = await fetch('/api/git/checkout', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ branch }),
+  });
+  const data = await response.json();
+  if (!response.ok || !data.ok) {
+    messageRenderer.renderError(data.error || 'Failed to switch branch');
+    return;
+  }
+  currentGitState = data;
+  renderGitState();
+}
+
+branchDropdownBtn.addEventListener('click', toggleBranchDropdown);
+settingsCurrentBranch.addEventListener('click', () => {
+  if (!currentGitState.isRepo) return;
+  openBranchDropdown();
+});
+
+// ═══════════════════════════════════════
+// Project switcher
+// ═══════════════════════════════════════
+
+let projectSwitcherProjects = [];
+let archivedProjectsOpen = localStorage.getItem('tau-project-switcher-archived') === 'true';
+
+function projectName(projectPath) {
+  if (!projectPath) return 'No Project';
+  const parts = projectPath.split(/[\\/]/).filter(Boolean);
+  return parts.at(-1) || projectPath;
+}
+
+async function loadProjectSwitcher() {
+  const response = await fetch('/api/projects');
+  const data = await response.json();
+  projectSwitcherProjects = data.projects || [];
+  renderProjectSwitcher();
+}
+
+function renderProjectSwitcher() {
+  const selectedPath = localStorage.getItem('tau-selected-project') || '';
+  projectSwitcherLabel.textContent = projectName(selectedPath);
+  projectSwitcherMenu.innerHTML = '';
+
+  const noProject = document.createElement('button');
+  noProject.type = 'button';
+  noProject.className = `project-switcher-item${!selectedPath ? ' active' : ''}`;
+  noProject.textContent = 'No Project';
+  noProject.addEventListener('click', () => selectProject(null));
+  projectSwitcherMenu.appendChild(noProject);
+
+  const scoped = projectSwitcherProjects.slice(0, 6);
+  const archived = projectSwitcherProjects.slice(6);
+  appendProjectSection('Scoped Projects', scoped, true);
+  appendProjectSection('Archived Projects', archived, archivedProjectsOpen);
+}
+
+function appendProjectSection(title, projects, open) {
+  const header = document.createElement('button');
+  header.type = 'button';
+  header.className = `project-switcher-section${open ? '' : ' collapsed'}`;
+  header.innerHTML = `<span>${escapeHtml(title)}</span><span>${projects.length}</span>`;
+  header.addEventListener('click', () => {
+    if (title !== 'Archived Projects') return;
+    archivedProjectsOpen = !archivedProjectsOpen;
+    localStorage.setItem('tau-project-switcher-archived', String(archivedProjectsOpen));
+    renderProjectSwitcher();
+  });
+  projectSwitcherMenu.appendChild(header);
+
+  if (!open) return;
+  for (const project of projects) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = `project-switcher-item${project.active ? ' active' : ''}`;
+    item.innerHTML = `
+      <span class="project-switcher-name">${escapeHtml(project.name || projectName(project.path))}</span>
+      <span class="project-switcher-path">${escapeHtml(project.path || '')}</span>
+    `;
+    item.addEventListener('click', () => selectProject(project));
+    projectSwitcherMenu.appendChild(item);
+  }
+}
+
+async function selectProject(project) {
+  closeProjectSwitcher();
+  if (!project) {
+    localStorage.removeItem('tau-selected-project');
+    projectSwitcherLabel.textContent = 'No Project';
+    return;
+  }
+
+  localStorage.setItem('tau-selected-project', project.path);
+  projectSwitcherLabel.textContent = project.name || projectName(project.path);
+  if (!project.active) {
+    const response = await fetch('/api/projects/launch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: project.path }),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) {
+      messageRenderer.renderError(data.error || 'Failed to launch project');
+    }
+  }
+}
+
+function toggleProjectSwitcher() {
+  if (projectSwitcherMenu.classList.contains('hidden')) {
+    loadProjectSwitcher().catch((error) => messageRenderer.renderError(error.message));
+    projectSwitcherMenu.classList.remove('hidden');
+  } else {
+    closeProjectSwitcher();
+  }
+}
+
+function closeProjectSwitcher() {
+  projectSwitcherMenu.classList.add('hidden');
+}
+
+projectSwitcherBtn.addEventListener('click', toggleProjectSwitcher);
 
 // ═══════════════════════════════════════
 // Keyboard shortcuts
@@ -985,6 +1515,10 @@ document.addEventListener('keydown', (e) => {
     }
     if (!modelDropdownMenu.classList.contains('hidden')) {
       closeModelDropdown();
+      return;
+    }
+    if (!slashMenu.classList.contains('hidden')) {
+      hideSlashMenu();
       return;
     }
 
@@ -1314,6 +1848,11 @@ function renderSessionHistory(entries) {
   let userCount = 0, assistantCount = 0, toolCardCount = 0, toolResultCount = 0;
 
   for (const entry of entries) {
+    if (entry.type === 'custom_message') {
+      messageRenderer.renderCustomMessage(entry, true);
+      continue;
+    }
+
     if (entry.type !== 'message') continue;
 
     const msg = entry.message;
@@ -1548,12 +2087,21 @@ const settingsPanel = document.getElementById('settings-panel');
 const settingsOverlay = document.getElementById('settings-overlay');
 const settingsClose = document.getElementById('settings-close');
 const themeGrid = document.getElementById('theme-grid');
-
-
 const toggleAutoCompact = document.getElementById('toggle-auto-compact');
 const btnThinkingLevel = document.getElementById('btn-thinking-level');
 const toggleShowThinking = document.getElementById('toggle-show-thinking');
+const settingsTabs = document.getElementById('settings-tabs');
+const settingsTabPanels = Array.from(document.querySelectorAll('.settings-tab-panel'));
+const settingsDefaultProvider = document.getElementById('settings-default-provider');
+const settingsDefaultModel = document.getElementById('settings-default-model');
+const settingsExternalEditor = document.getElementById('settings-external-editor');
+const settingsAgentsMd = document.getElementById('settings-agents-md');
+const settingsMcpJson = document.getElementById('settings-mcp-json');
+const settingsPackagesJson = document.getElementById('settings-packages-json');
+const settingsReload = document.getElementById('settings-reload');
+const settingsSave = document.getElementById('settings-save');
 
+let webSettings = null;
 
 function buildThemeGrid() {
   themeGrid.innerHTML = '';
@@ -1575,10 +2123,75 @@ function buildThemeGrid() {
   }
 }
 
+settingsTabs.addEventListener('click', (event) => {
+  const tab = event.target instanceof Element ? event.target.closest('.settings-tab') : null;
+  if (!tab) return;
+  const tabId = tab.dataset.tab;
+  settingsTabs.querySelectorAll('.settings-tab').forEach((item) => {
+    item.classList.toggle('active', item === tab);
+  });
+  settingsTabPanels.forEach((panel) => {
+    panel.classList.toggle('active', panel.dataset.panel === tabId);
+  });
+});
+
+async function loadWebSettings() {
+  const response = await fetch('/api/web-settings');
+  if (!response.ok) throw new Error('Failed to load settings');
+  webSettings = await response.json();
+  const settings = webSettings.settings || {};
+  settingsDefaultProvider.value = settings.defaultProvider || '';
+  settingsDefaultModel.value = settings.defaultModel || '';
+  settingsExternalEditor.value = settings.externalEditor || '';
+  settingsAgentsMd.value = webSettings.agentsMd || '';
+  settingsMcpJson.value = JSON.stringify(settings.mcpServers || {}, null, 2);
+  settingsPackagesJson.value = JSON.stringify(settings.packages || [], null, 2);
+}
+
+async function saveWebSettings() {
+  const settings = {
+    defaultProvider: settingsDefaultProvider.value.trim() || null,
+    defaultModel: settingsDefaultModel.value.trim() || null,
+    externalEditor: settingsExternalEditor.value.trim() || null,
+    mcpServers: JSON.parse(settingsMcpJson.value || '{}'),
+    packages: JSON.parse(settingsPackagesJson.value || '[]'),
+  };
+
+  const response = await fetch('/api/web-settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      settings,
+      agentsMd: settingsAgentsMd.value,
+    }),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Failed to save settings');
+  webSettings = data;
+  statusText.textContent = 'Settings saved';
+  setTimeout(() => { statusText.textContent = 'Connected'; }, 2000);
+}
+
+settingsReload.addEventListener('click', () => {
+  loadWebSettings().catch((error) => {
+    messageRenderer.renderError(error.message);
+  });
+});
+
+settingsSave.addEventListener('click', () => {
+  saveWebSettings().catch((error) => {
+    messageRenderer.renderError(error.message);
+  });
+});
+
 async function openSettings() {
   buildThemeGrid();
   settingsPanel.classList.remove('hidden');
   settingsOverlay.classList.remove('hidden');
+  loadWebSettings().catch((error) => {
+    messageRenderer.renderError(error.message);
+  });
+  fetchGitState();
 
   // Fetch current state for toggles
   try {
@@ -1596,8 +2209,6 @@ async function openSettings() {
       btnThinkingLevel.textContent = s.thinkingLevel || 'off';
       currentThinkingLevel = s.thinkingLevel || 'off';
       updateThinkingBtn();
-      // Session name
-      inputSessionName.value = s.sessionName || '';
     }
   } catch (e) {
     // Silent
@@ -1953,6 +2564,8 @@ sidebar.loadSessions().then(() => {
   if (isMirrorMode) updateMirrorLiveIndicator();
 });
 initLauncher();
+fetchGitState().catch(() => {});
+loadProjectSwitcher().catch(() => {});
 
 // Register service worker for PWA
 if ('serviceWorker' in navigator) {
@@ -1968,4 +2581,4 @@ if (splash) {
   });
 }
 
-console.log('🚀 Tau initialized');
+console.log('Tau initialized');

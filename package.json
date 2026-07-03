@@ -1,19 +1,23 @@
 {
-  "name": "tau-mirror",
-  "version": "1.0.9",
-  "description": "Web UI that mirrors your Pi terminal session in the browser",
+  "name": "@averyyy/pi-tau-codex",
+  "version": "0.1.0",
+  "description": "Codex-like web UI that mirrors your Pi terminal session in the browser",
   "keywords": [
     "pi",
     "pi-package",
     "coding-agent",
     "web-ui",
-    "mirror"
+    "mirror",
+    "codex"
   ],
-  "author": "deflating",
+  "author": "Averyyy",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/deflating/tau.git"
+    "url": "git+https://github.com/Averyyy/pi-tau-codex.git"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "pi": {
     "extensions": [

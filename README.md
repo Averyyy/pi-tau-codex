@@ -1,6 +1,6 @@
-# Tau
+# Pi Tau Codex
 
-A web UI that mirrors your [Pi](https://github.com/badlogic/pi-mono) terminal session in the browser. No separate server — it runs as a Pi extension inside your existing process.
+A Codex-like web UI for [Pi](https://github.com/badlogic/pi-mono). It mirrors the running terminal session in the browser as a standalone Pi extension, so `pi-client web` can stay a thin launcher instead of bundling web UI code.
 
 ![Tau dark mode](docs/images/dark.png)
 
@@ -15,6 +15,8 @@ A web UI that mirrors your [Pi](https://github.com/badlogic/pi-mono) terminal se
 Tau connects to your running Pi TUI and gives you a second view in the browser. Same session, same messages, same tools — just a different screen. Type in the terminal or the browser, both stay in sync.
 
 - **Live mirroring** — streams messages, tool calls, and thinking blocks in real-time
+- **Codex-style controls** — tabbed settings, slash command menu, branch switcher, project switcher
+- **Pi extension UI** — renders RPC-style extension dialogs, status, widgets, titles, editor text, and custom messages
 - **Works on any device** — open it on your phone, tablet, or another monitor
 - **Session browser** — view history from any past session
 - **No extra process** — the Pi extension *is* the server
@@ -22,14 +24,16 @@ Tau connects to your running Pi TUI and gives you a second view in the browser. 
 ## Install
 
 ```bash
-pi install npm:tau-mirror
+pi install npm:@averyyy/pi-tau-codex
 ```
 
 Or from git:
 
 ```bash
-pi install git:github.com/deflating/tau
+pi install git:github.com/Averyyy/pi-tau-codex
 ```
+
+`pi-client web` checks the shared `~/.pi/agent/settings.json` extension list and prints the install command above when this package is not installed.
 
 ## Usage
 
@@ -49,9 +53,12 @@ Type `/qr` in the terminal to show a QR code and scan it to access via your phon
 - Inline diff viewer for edit tool calls (red/green lines)
 - Scroll-to-bottom button with new message indicator
 - Message queuing — type while the agent is working, messages queue and auto-send
+- Slash command autocomplete when `/` is typed in any empty position inside the composer
 
 ### Session Management
 - Browse all past sessions grouped by project
+- Scoped Projects plus a collapsed Archived Projects section
+- Bottom-left project switcher with a No Project option
 - Full-text search across all session history with highlighted snippets
 - Sorted by last modified (most recent first)
 - Live session marked with a green dot
@@ -62,6 +69,7 @@ Type `/qr` in the terminal to show a QR code and scan it to access via your phon
 ### Model & Thinking
 - Model picker with search/filter and keyboard support
 - Thinking level toggle (off/low/medium/high)
+- Local git branch picker when the active project is a git repository
 - Token usage percentage with context window visualiser
 - Cost tracking per session
 
@@ -155,8 +163,8 @@ There's no separate server to run. The extension auto-loads when Pi starts and s
 Clone and point the extension at the local static files:
 
 ```bash
-git clone https://github.com/deflating/tau.git
-cd tau
+git clone https://github.com/Averyyy/pi-tau-codex.git
+cd pi-tau-codex
 TAU_STATIC_DIR=$(pwd)/public pi
 ```
 

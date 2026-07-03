@@ -3,13 +3,13 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Tau</title>
+  <title>Pi Tau Codex</title>
   <link rel="icon" type="image/png" href="icons/tau-192.png">
   <link rel="manifest" href="manifest.json">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Tau">
+  <meta name="apple-mobile-web-app-title" content="Pi Tau">
   <meta name="theme-color" content="#f5f3ef">
   <link rel="stylesheet" href="style.css">
   <!-- KaTeX for math rendering -->
@@ -45,6 +45,14 @@
       <div class="header">
         <div class="header-left">
           <button class="sidebar-toggle" id="sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg></button>
+          <div class="branch-dropdown hidden" id="branch-dropdown">
+            <button class="branch-dropdown-btn" id="branch-dropdown-btn" title="Switch branch">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+              <span class="branch-dropdown-label" id="branch-dropdown-label">branch</span>
+              <svg class="model-dropdown-chevron" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <div class="branch-dropdown-menu hidden" id="branch-dropdown-menu"></div>
+          </div>
           <div class="model-dropdown" id="model-dropdown">
             <button class="model-dropdown-btn" id="model-dropdown-btn" title="Switch model">
               <span class="model-dropdown-label" id="model-dropdown-label">model</span>
@@ -88,7 +96,7 @@
       <div class="messages" id="messages">
         <div class="welcome">
           <div class="welcome-icon"><img src="icons/tau-192.png" alt="τ" class="tau-icon-welcome"></div>
-          <p>Welcome to Tau</p>
+          <p>Welcome to Pi Tau</p>
           <p class="hint">Type a message below to start chatting with Pi, or select a session from the sidebar.</p>
           <div class="shortcuts-hint">
             <span>/ Focus input</span>
@@ -108,12 +116,21 @@
 
       <!-- Input Area -->
       <div class="input-area">
+        <div class="extension-widgets above" id="extension-widgets-above"></div>
         <button class="mobile-context-toggle" id="mobile-context-toggle">
           <svg width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 5L5 1L9 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
         <div class="mobile-model-bar" id="mobile-model-bar"></div>
         <div class="queued-messages hidden" id="queued-messages"></div>
         <div class="image-previews hidden" id="image-previews"></div>
+        <div class="project-switcher" id="project-switcher">
+          <button type="button" class="project-switcher-btn" id="project-switcher-btn" title="Switch project">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
+            <span id="project-switcher-label">No Project</span>
+            <svg width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div class="project-switcher-menu hidden" id="project-switcher-menu"></div>
+        </div>
         <form id="chat-form">
           <div class="input-left-actions">
             <button type="button" class="input-icon-btn" id="command-btn" title="Commands" aria-label="Open commands" tabindex="-1">
@@ -133,6 +150,7 @@
               rows="2"
 
             ></textarea>
+            <div class="slash-menu hidden" id="slash-menu"></div>
             <button type="button" class="input-mic-btn" id="mic-btn" title="Voice input" tabindex="-1">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
             </button>
@@ -144,6 +162,7 @@
             <button type="button" id="abort-btn" class="hidden" title="Abort (Esc)" tabindex="-1"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg></button>
           </div>
         </form>
+        <div class="extension-widgets below" id="extension-widgets-below"></div>
       </div>
     </div>
 
@@ -174,34 +193,88 @@
       <button class="settings-close" id="settings-close"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
     </div>
     <div class="settings-body">
-      <div class="settings-section">
-        <div class="settings-section-title">Appearance</div>
-        <div class="theme-grid" id="theme-grid"></div>
+      <div class="settings-tabs" id="settings-tabs">
+        <button class="settings-tab active" data-tab="general">General</button>
+        <button class="settings-tab" data-tab="interface">Interface</button>
+        <button class="settings-tab" data-tab="instructions">Custom Instructions</button>
+        <button class="settings-tab" data-tab="mcp">MCP</button>
+        <button class="settings-tab" data-tab="extensions">Extensions</button>
       </div>
-      <div class="settings-section">
-        <div class="settings-section-title">Agent</div>
-        <div class="settings-row" id="setting-auto-compact">
-          <span class="settings-label">Auto-compaction</span>
-          <button class="settings-toggle" id="toggle-auto-compact"></button>
+      <div class="settings-content">
+        <div class="settings-tab-panel active" data-panel="general">
+          <div class="settings-section">
+            <div class="settings-section-title">Agent</div>
+            <div class="settings-row" id="setting-auto-compact">
+              <span class="settings-label">Auto-compaction</span>
+              <button class="settings-toggle" id="toggle-auto-compact"></button>
+            </div>
+            <div class="settings-row" id="setting-thinking">
+              <span class="settings-label">Thinking level</span>
+              <button class="settings-value-btn" id="btn-thinking-level"></button>
+            </div>
+            <label class="settings-field">
+              <span class="settings-label">Default provider</span>
+              <input class="settings-input wide" id="settings-default-provider" type="text">
+            </label>
+            <label class="settings-field">
+              <span class="settings-label">Default model</span>
+              <input class="settings-input wide" id="settings-default-model" type="text">
+            </label>
+          </div>
+          <div class="settings-section">
+            <div class="settings-section-title">Git</div>
+            <div class="settings-row">
+              <span class="settings-label">Current branch</span>
+              <button class="settings-value-btn" id="settings-current-branch">none</button>
+            </div>
+          </div>
         </div>
-        <div class="settings-row" id="setting-thinking">
-          <span class="settings-label">Thinking level</span>
-          <button class="settings-value-btn" id="btn-thinking-level"></button>
+        <div class="settings-tab-panel" data-panel="interface">
+          <div class="settings-section">
+            <div class="settings-section-title">Appearance</div>
+            <div class="theme-grid" id="theme-grid"></div>
+          </div>
+          <div class="settings-section">
+            <div class="settings-section-title">Display</div>
+            <div class="settings-row">
+              <span class="settings-label">Show thinking</span>
+              <button class="settings-toggle on" id="toggle-show-thinking"></button>
+            </div>
+            <label class="settings-field">
+              <span class="settings-label">External editor</span>
+              <input class="settings-input wide" id="settings-external-editor" type="text">
+            </label>
+          </div>
+        </div>
+        <div class="settings-tab-panel" data-panel="instructions">
+          <div class="settings-section fill">
+            <div class="settings-section-title">Global AGENTS.md</div>
+            <textarea class="settings-textarea" id="settings-agents-md" spellcheck="false"></textarea>
+          </div>
+        </div>
+        <div class="settings-tab-panel" data-panel="mcp">
+          <div class="settings-section fill">
+            <div class="settings-section-title">MCP servers JSON</div>
+            <textarea class="settings-textarea" id="settings-mcp-json" spellcheck="false"></textarea>
+          </div>
+        </div>
+        <div class="settings-tab-panel" data-panel="extensions">
+          <div class="settings-section fill">
+            <div class="settings-section-title">Packages</div>
+            <textarea class="settings-textarea" id="settings-packages-json" spellcheck="false"></textarea>
+          </div>
+          <div class="settings-section" id="settings-auth-section" style="display:none">
+            <div class="settings-section-title">Authentication</div>
+            <div class="settings-row">
+              <span class="settings-label">Require login</span>
+              <button class="settings-toggle" id="toggle-auth"></button>
+            </div>
+          </div>
         </div>
       </div>
-      <div class="settings-section">
-        <div class="settings-section-title">Display</div>
-        <div class="settings-row">
-          <span class="settings-label">Show thinking</span>
-          <button class="settings-toggle on" id="toggle-show-thinking"></button>
-        </div>
-      </div>
-      <div class="settings-section" id="settings-auth-section" style="display:none">
-        <div class="settings-section-title">Authentication</div>
-        <div class="settings-row">
-          <span class="settings-label">Require login</span>
-          <button class="settings-toggle" id="toggle-auth"></button>
-        </div>
+      <div class="settings-footer">
+        <button class="settings-secondary" id="settings-reload">Reload</button>
+        <button class="settings-primary" id="settings-save">Save</button>
       </div>
     </div>
   </div>

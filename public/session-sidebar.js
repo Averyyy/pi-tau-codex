@@ -12,6 +12,7 @@ export class SessionSidebar {
     this.searchQuery = '';
     this.favourites = JSON.parse(localStorage.getItem('tau-favourites') || '[]');
     this.contextMenu = null;
+    this.archivedProjectsOpen = localStorage.getItem('tau-sidebar-archived-open') === 'true';
 
     // Close context menu on click anywhere
     document.addEventListener('click', () => this.closeContextMenu());
@@ -406,8 +407,45 @@ export class SessionSidebar {
       this.container.appendChild(favGroup);
     }
 
-    // Regular project groups
-    for (const project of this.projects) {
+    const scopedProjects = this.projects.slice(0, 6);
+    const archivedProjects = this.projects.slice(6);
+
+    this.appendProjectSection('Scoped Projects', scopedProjects, true);
+
+    if (archivedProjects.length > 0) {
+      const header = document.createElement('button');
+      header.type = 'button';
+      header.className = `sidebar-section-header${this.archivedProjectsOpen ? '' : ' collapsed'}`;
+      header.innerHTML = `
+        <span>Archived Projects</span>
+        <span class="project-count">${archivedProjects.length}</span>
+      `;
+      header.addEventListener('click', () => {
+        this.archivedProjectsOpen = !this.archivedProjectsOpen;
+        localStorage.setItem('tau-sidebar-archived-open', String(this.archivedProjectsOpen));
+        this.render();
+      });
+      this.container.appendChild(header);
+      if (this.archivedProjectsOpen) {
+        this.appendProjectSection('', archivedProjects, true);
+      }
+    }
+
+    if (this.searchQuery) this.applySearch();
+  }
+
+  appendProjectSection(title, projects, showHeader) {
+    if (showHeader && title) {
+      const sectionHeader = document.createElement('div');
+      sectionHeader.className = 'sidebar-section-header static';
+      sectionHeader.innerHTML = `
+        <span>${this.escapeHtml(title)}</span>
+        <span class="project-count">${projects.length}</span>
+      `;
+      this.container.appendChild(sectionHeader);
+    }
+
+    for (const project of projects) {
       const group = document.createElement('div');
       group.className = 'project-group';
       const isCollapsed = this.collapsedProjects.has(project.dirName);
@@ -446,8 +484,6 @@ export class SessionSidebar {
       group.appendChild(sessionsDiv);
       this.container.appendChild(group);
     }
-
-    if (this.searchQuery) this.applySearch();
   }
 
   formatTime(isoTimestamp) {

@@ -45,7 +45,7 @@ export class MessageRenderer {
     this.container.innerHTML = `
       <div class="welcome">
         <div class="welcome-icon"><img src="icons/tau-192.png" alt="τ" class="tau-icon-welcome"></div>
-        <p>Welcome to Tau</p>
+        <p>Welcome to Pi Tau</p>
         <p class="hint">Type a message below to start chatting with Pi, or select a session from the sidebar.</p>
         <div class="shortcuts-hint">
           <span>/ Focus input</span>
@@ -235,10 +235,30 @@ export class MessageRenderer {
     this.scrollToBottom();
   }
 
+  renderCustomMessage(entry, isHistory = false) {
+    const welcome = this.container.querySelector('.welcome');
+    if (welcome) welcome.remove();
+
+    const message = entry.message || entry;
+    const div = document.createElement('div');
+    div.className = `custom-message${isHistory ? ' history' : ''}`;
+
+    const title = message.display?.title || message.customType || entry.customType || 'Extension';
+    const body = message.display?.body || message.display?.text || message.content;
+    const text = typeof body === 'string' ? body : JSON.stringify(body, null, 2);
+
+    div.innerHTML = `
+      <div class="custom-message-title">${this.escapeHtml(title)}</div>
+      <pre class="custom-message-body">${this.escapeHtml(text || '')}</pre>
+    `;
+    this.container.appendChild(div);
+    if (!isHistory) this.scrollToBottom();
+  }
+
   renderError(errorMessage) {
     const div = document.createElement('div');
     div.className = 'error-message';
-    div.textContent = `⚠️ ${errorMessage}`;
+    div.textContent = `Error: ${errorMessage}`;
     this.container.appendChild(div);
     this.scrollToBottom();
   }

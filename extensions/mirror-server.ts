@@ -16,6 +16,7 @@ import * as http from "node:http";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { execFileSync } from "node:child_process";
 import QRCode from "qrcode";
 
 // Load tau settings from ~/.pi/agent/settings.json (falls back to env vars)
@@ -67,12 +68,18 @@ function findPublicDir(): string {
     // 2) Installed package path (for npm-installed extension execution)
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const pkgPath = require.resolve("@averyyy/pi-tau-codex/package.json");
+      addCandidate(path.join(path.dirname(pkgPath), "public"));
+    } catch {}
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
       const pkgPath = require.resolve("tau-mirror/package.json");
       addCandidate(path.join(path.dirname(pkgPath), "public"));
     } catch {}
 
     // 3) Development fallback from current working directory
     addCandidate(path.resolve(process.cwd(), "public"));
+    addCandidate(path.resolve(process.cwd(), "node_modules/@averyyy/pi-tau-codex/public"));
     addCandidate(path.resolve(process.cwd(), "node_modules/tau-mirror/public"));
 
     for (const candidate of candidates) {
@@ -86,6 +93,43 @@ const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const PI_AGENT_DIR = process.env.PI_CODING_AGENT_DIR || path.join(USER_HOME, ".pi", "agent");
 const SESSIONS_DIR = process.env.PI_CODING_AGENT_SESSION_DIR || path.join(PI_AGENT_DIR, "sessions");
 const INSTANCES_DIR = path.join(USER_HOME, ".pi", "tau-instances");
+const PI_SETTINGS_PATH = path.join(PI_AGENT_DIR, "settings.json");
+const PI_AGENTS_PATH = path.join(PI_AGENT_DIR, "AGENTS.md");
+
+const BUILTIN_COMMANDS = [
+  { name: "settings", description: "Open settings", source: "builtin" },
+  { name: "model", description: "Select or search models", source: "builtin" },
+  { name: "scoped-models", description: "Configure scoped models", source: "builtin" },
+  { name: "export", description: "Export the current session", source: "builtin" },
+  { name: "import", description: "Import a session", source: "builtin" },
+  { name: "share", description: "Share the current session", source: "builtin" },
+  { name: "copy", description: "Copy the latest assistant message", source: "builtin" },
+  { name: "name", description: "Rename this session", source: "builtin" },
+  { name: "session", description: "Show current session details", source: "builtin" },
+  { name: "changelog", description: "Show changelog", source: "builtin" },
+  { name: "hotkeys", description: "Show keyboard shortcuts", source: "builtin" },
+  { name: "fork", description: "Fork this session", source: "builtin" },
+  { name: "clone", description: "Clone the current branch", source: "builtin" },
+  { name: "tree", description: "Open the conversation tree", source: "builtin" },
+  { name: "trust", description: "Manage project trust", source: "builtin" },
+  { name: "login", description: "Sign in", source: "builtin" },
+  { name: "logout", description: "Sign out", source: "builtin" },
+  { name: "new", description: "Start a new session", source: "builtin" },
+  { name: "compact", description: "Compact context", source: "builtin" },
+  { name: "resume", description: "Resume a previous session", source: "builtin" },
+  { name: "reload", description: "Reload configuration", source: "builtin" },
+  { name: "quit", description: "Quit Pi", source: "builtin" },
+];
+
+function readAgentSettings(): Record<string, unknown> {
+  if (!fs.existsSync(PI_SETTINGS_PATH)) return {};
+  return JSON.parse(fs.readFileSync(PI_SETTINGS_PATH, "utf8"));
+}
+
+function writeAgentSettings(settings: Record<string, unknown>) {
+  fs.mkdirSync(PI_AGENT_DIR, { recursive: true });
+  fs.writeFileSync(PI_SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
+}
 
 // Instance registry — tracks all running Tau servers
 function registerInstance(port: number, sessionFile: string, cwd: string) {
@@ -765,6 +809,12 @@ export default function (pi: ExtensionAPI) {
         }
 
         // ─── Commands & Files ───
+        case "get_commands": {
+          const commands = [...BUILTIN_COMMANDS, ...pi.getCommands()];
+          sendTo(ws, success("get_commands", { commands }));
+          break;
+        }
+
         // ─── Sync ───
         case "mirror_sync_request": {
           if (ctx) {
@@ -855,6 +905,113 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // API routes (sessions list, etc.)
   // ═══════════════════════════════════════
+  function getCurrentCwd(): string {
+    if (latestCtx) {
+      const sessionEntry = latestCtx.sessionManager.getEntries().find((entry: any) => entry.type === "session");
+      if (sessionEntry?.cwd) return sessionEntry.cwd;
+    }
+    return process.cwd();
+  }
+
+  function serveWebSettings(res: http.ServerResponse) {
+    const settings = readAgentSettings();
+    const agentsMd = fs.existsSync(PI_AGENTS_PATH) ? fs.readFileSync(PI_AGENTS_PATH, "utf8") : "";
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      settings,
+      agentsMd,
+      settingsPath: PI_SETTINGS_PATH,
+      agentsPath: PI_AGENTS_PATH,
+    }));
+  }
+
+  function saveWebSettings(req: http.IncomingMessage, res: http.ServerResponse) {
+    let body = "";
+    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+    req.on("end", () => {
+      try {
+        const payload = JSON.parse(body);
+        const settings = readAgentSettings();
+        const incoming = payload.settings || {};
+        for (const key of ["defaultProvider", "defaultModel", "externalEditor", "mcpServers", "packages"]) {
+          if (!Object.prototype.hasOwnProperty.call(incoming, key)) continue;
+          if (incoming[key] === null || incoming[key] === undefined || incoming[key] === "") {
+            delete settings[key];
+          } else {
+            settings[key] = incoming[key];
+          }
+        }
+        writeAgentSettings(settings);
+        if (Object.prototype.hasOwnProperty.call(payload, "agentsMd")) {
+          fs.mkdirSync(PI_AGENT_DIR, { recursive: true });
+          fs.writeFileSync(PI_AGENTS_PATH, String(payload.agentsMd || ""));
+        }
+        serveWebSettings(res);
+      } catch (e: any) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+  }
+
+  function getGitState() {
+    const cwd = getCurrentCwd();
+    try {
+      const inside = execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      if (inside !== "true") return { isRepo: false, cwd, currentBranch: "", branches: [] };
+      const root = execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
+      const currentBranch = execFileSync("git", ["-C", root, "branch", "--show-current"], { encoding: "utf8" }).trim();
+      const branches = execFileSync("git", ["-C", root, "branch", "--format=%(refname:short)"], { encoding: "utf8" })
+        .split("\n")
+        .map((branch) => branch.trim())
+        .filter(Boolean);
+      return { isRepo: true, cwd: root, currentBranch, branches };
+    } catch {
+      return { isRepo: false, cwd, currentBranch: "", branches: [] };
+    }
+  }
+
+  function serveGitState(res: http.ServerResponse) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(getGitState()));
+  }
+
+  function checkoutGitBranch(req: http.IncomingMessage, res: http.ServerResponse) {
+    let body = "";
+    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+    req.on("end", () => {
+      try {
+        const { branch } = JSON.parse(body);
+        if (!branch || typeof branch !== "string") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "branch required" }));
+          return;
+        }
+        const state = getGitState();
+        if (!state.isRepo) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Not a git repository" }));
+          return;
+        }
+        if (!state.branches.includes(branch)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unknown local branch" }));
+          return;
+        }
+        execFileSync("git", ["-C", state.cwd, "checkout", branch], { stdio: "ignore" });
+        const nextState = getGitState();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, ...nextState }));
+      } catch (e: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+  }
+
   function handleApiRoute(req: http.IncomingMessage, res: http.ServerResponse, urlPath: string) {
     // CORS headers
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -895,6 +1052,26 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     if (urlPath === "/api/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok", mode: "mirror", mirrorUrl, tailscaleUrl: tailscaleUrl || undefined, platform: process.platform }));
+      return;
+    }
+
+    if (urlPath === "/api/web-settings" && req.method === "GET") {
+      serveWebSettings(res);
+      return;
+    }
+
+    if (urlPath === "/api/web-settings" && req.method === "POST") {
+      saveWebSettings(req, res);
+      return;
+    }
+
+    if (urlPath === "/api/git" && req.method === "GET") {
+      serveGitState(res);
+      return;
+    }
+
+    if (urlPath === "/api/git/checkout" && req.method === "POST") {
+      checkoutGitBranch(req, res);
       return;
     }
 
@@ -1153,35 +1330,15 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
   function serveProjectsList(res: http.ServerResponse) {
     const projectsDir = TAU_SETTINGS.projectsDir;
-    if (!projectsDir) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ projects: [] }));
-      return;
-    }
-
-    const resolved = projectsDir.startsWith("~")
-      ? path.join(process.env.HOME || "", projectsDir.slice(1))
-      : projectsDir;
-
-    if (!fs.existsSync(resolved)) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ projects: [], error: "Directory not found" }));
-      return;
-    }
-
     try {
-      const entries = fs.readdirSync(resolved, { withFileTypes: true });
       const instances = getRunningInstances();
+      const projectInfo = new Map<string, { name: string; path: string; sessionCount: number; lastActive: number | null; active: boolean }>();
 
-      // Build session count + recency map from session history
       const sessionInfo = new Map<string, { count: number; lastActive: number }>();
       if (fs.existsSync(SESSIONS_DIR)) {
         for (const dir of fs.readdirSync(SESSIONS_DIR, { withFileTypes: true })) {
           if (!dir.isDirectory()) continue;
           const decodedPath = dir.name.replace(/^--/, "/").replace(/--$/, "").replace(/-/g, "/");
-          // Check if this session dir maps to a subdirectory of the projects folder
-          if (!decodedPath.startsWith(resolved + "/") && !decodedPath.startsWith(resolved)) continue;
-
           const sessionDir = path.join(SESSIONS_DIR, dir.name);
           const files = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jsonl"));
           let lastMtime = 0;
@@ -1195,20 +1352,43 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         }
       }
 
-      const projects = entries
-        .filter(e => e.isDirectory() && !e.name.startsWith("."))
-        .map(e => {
-          const fullPath = path.join(resolved, e.name);
-          const info = sessionInfo.get(fullPath) || { count: 0, lastActive: 0 };
-          const isActive = instances.some(i => i.cwd === fullPath);
-          return {
-            name: e.name,
-            path: fullPath,
-            sessionCount: info.count,
-            lastActive: info.lastActive || null,
-            active: isActive,
-          };
+      const addProject = (projectPath: string) => {
+        if (!projectPath) return;
+        const resolvedPath = projectPath.startsWith("~")
+          ? path.join(process.env.HOME || "", projectPath.slice(1))
+          : projectPath;
+        const info = sessionInfo.get(resolvedPath) || { count: 0, lastActive: 0 };
+        projectInfo.set(resolvedPath, {
+          name: path.basename(resolvedPath) || resolvedPath,
+          path: resolvedPath,
+          sessionCount: info.count,
+          lastActive: info.lastActive || null,
+          active: instances.some(i => i.cwd === resolvedPath) || resolvedPath === getCurrentCwd(),
         });
+      };
+
+      if (projectsDir) {
+        const resolved = projectsDir.startsWith("~")
+          ? path.join(process.env.HOME || "", projectsDir.slice(1))
+          : projectsDir;
+        if (fs.existsSync(resolved)) {
+          for (const entry of fs.readdirSync(resolved, { withFileTypes: true })) {
+            if (entry.isDirectory() && !entry.name.startsWith(".")) {
+              addProject(path.join(resolved, entry.name));
+            }
+          }
+        }
+      }
+
+      addProject(getCurrentCwd());
+      for (const projectPath of sessionInfo.keys()) {
+        addProject(projectPath);
+      }
+
+      const projects = Array.from(projectInfo.values()).sort((a, b) => {
+        if (a.active !== b.active) return a.active ? -1 : 1;
+        return (b.lastActive || 0) - (a.lastActive || 0) || a.name.localeCompare(b.name);
+      });
 
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ projects }));
