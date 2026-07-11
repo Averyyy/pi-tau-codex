@@ -7,7 +7,9 @@ import { StateManager } from './state.js';
 import { MessageRenderer } from './message-renderer.js';
 import { ToolCardRenderer } from './tool-card.js';
 import { DialogHandler } from './dialogs.js';
+import { ExtensionTuiBridge, renderAnsiText } from './extension-tui.js';
 import { SessionSidebar } from './session-sidebar.js';
+import { getSessionHistoryFallback } from './session-history.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
 
@@ -54,6 +56,7 @@ const slashMenu = document.getElementById('slash-menu');
 const extensionWidgetsAbove = document.getElementById('extension-widgets-above');
 const extensionWidgetsBelow = document.getElementById('extension-widgets-below');
 const settingsCurrentBranch = document.getElementById('settings-current-branch');
+const extensionTuiBridge = new ExtensionTuiBridge(wsClient, extensionWidgetsAbove, extensionWidgetsBelow);
 
 // State tracking
 let currentStreamingElement = null;
@@ -73,6 +76,15 @@ let viewingActiveSession = true; // Whether we're viewing the live session or a 
 let isMirrorMode = false; // Set when mirror_sync received
 let liveInstances = []; // All running Tau instances [{port, sessionFile, cwd}]
 let currentProjectPath = '';
+let sidebarRefreshTimer = null;
+
+function scheduleSidebarRefresh() {
+  clearTimeout(sidebarRefreshTimer);
+  sidebarRefreshTimer = setTimeout(async () => {
+    await sidebar.loadSessions(false);
+    updateMirrorLiveIndicator();
+  }, 250);
+}
 
 // File browser
 const fileSidebar = document.getElementById('file-sidebar');
@@ -199,6 +211,8 @@ wsClient.addEventListener('connected', () => {
 });
 
 wsClient.addEventListener('disconnected', () => {
+  dialogHandler.dismissCurrentDialog();
+  clearExtensionUIState();
   updateConnectionStatus('disconnected');
 });
 
@@ -259,6 +273,21 @@ function handleRPCEvent(event) {
     case 'extension_ui_request':
       handleExtensionUIRequest(event);
       break;
+    case 'extension_ui_cancel':
+      dialogHandler.cancel(event.id);
+      break;
+    case 'extension_tui_mount':
+      extensionTuiBridge.mount(event);
+      break;
+    case 'extension_tui_update':
+      extensionTuiBridge.update(event);
+      break;
+    case 'extension_tui_unmount':
+      extensionTuiBridge.unmount(event.id);
+      break;
+    case 'extension_tui_error':
+      messageRenderer.renderError(`Extension UI rendering failed: ${event.error}`);
+      break;
     case 'extension_error':
       messageRenderer.renderError(`Extension error: ${event.error}`);
       break;
@@ -268,6 +297,7 @@ function handleRPCEvent(event) {
         const activeItem = document.querySelector('.session-item.active .session-title');
         if (activeItem) activeItem.textContent = event.name;
       }
+      scheduleSidebarRefresh();
       break;
   }
 }
@@ -318,6 +348,7 @@ function handleAgentEnd() {
 let currentStreamingThinking = '';
 
 function handleMessageStart(message) {
+  if (message.role === 'user') scheduleSidebarRefresh();
   if (message.role === 'assistant') {
     currentStreamingText = '';
     currentStreamingThinking = '';
@@ -335,6 +366,8 @@ function handleMessageStart(message) {
       }
     }
     lastSentMessage = null;
+  } else if (message.role === 'custom' && message.display === true) {
+    messageRenderer.renderCustomMessage(message);
   }
 }
 
@@ -366,6 +399,7 @@ function handleMessageUpdate(event) {
 }
 
 function handleMessageEnd(message) {
+  if (message?.role === 'user') scheduleSidebarRefresh();
   if (currentStreamingElement) {
     // Pass usage info for cost display
     const usage = message?.usage || null;
@@ -385,6 +419,7 @@ function handleMessageEnd(message) {
     updateCostDisplay();
     updateTokenUsage();
     showNewMessageBadge();
+    scheduleSidebarRefresh();
   }
 }
 
@@ -462,6 +497,14 @@ function handleExtensionUIRequest(event) {
 const extensionStatuses = new Map();
 const extensionWidgets = new Map();
 
+function clearExtensionUIState() {
+  extensionStatuses.clear();
+  extensionWidgets.clear();
+  extensionWidgetsAbove.replaceChildren();
+  extensionWidgetsBelow.replaceChildren();
+  extensionTuiBridge.clear();
+}
+
 function getEventArgs(event) {
   return Array.isArray(event.args) ? event.args : [];
 }
@@ -519,7 +562,10 @@ function renderExtensionChrome() {
     for (const [key, value] of extensionStatuses) {
       const item = document.createElement('div');
       item.className = 'extension-status-pill';
-      item.textContent = `${key}: ${value}`;
+      item.append(`${key}: `);
+      const content = document.createElement('span');
+      renderAnsiText(content, value);
+      item.appendChild(content);
       row.appendChild(item);
     }
     extensionWidgetsAbove.appendChild(row);
@@ -769,6 +815,12 @@ function sendMessage() {
     return;
   }
 
+  const newSessionDraft = isNewSessionMode ? {
+    message,
+    images: [...pendingImages],
+    filePaths: [...pendingFilePaths],
+  } : null;
+
   messageInput.value = '';
   messageInput.style.height = 'auto';
   hideSlashMenu();
@@ -786,11 +838,15 @@ function sendMessage() {
   pendingFilePaths = [];
   renderAttachmentPreviews();
 
-  if (isNewSessionMode && isMirrorMode) {
-    launchNewSessionWithPendingMessage(cmd);
+  if (isNewSessionMode) {
+    exitNewSessionMode();
+    lastSentMessage = message;
+    messageRenderer.renderUserMessage({ content: message, images: cmd.images });
+    void launchNewSessionWithPendingMessage(cmd).then((result) => {
+      if (!result.ok) restoreNewSessionDraft(newSessionDraft, result.error);
+    });
     return;
   }
-  if (isNewSessionMode) exitNewSessionMode();
 
   if (state.isStreaming) {
     // Queue it — show as bubble above input
@@ -869,7 +925,7 @@ const commands = [
 
 ];
 
-const fallbackSlashCommands = [
+const webSlashCommands = [
   { name: 'settings', description: 'Open settings', source: 'builtin' },
   { name: 'model', description: 'Open model picker', source: 'builtin' },
   { name: 'compact', description: 'Compact context', source: 'builtin' },
@@ -879,17 +935,9 @@ const fallbackSlashCommands = [
   { name: 'new', description: 'Start a new session', source: 'builtin' },
   { name: 'copy', description: 'Copy the latest assistant message', source: 'builtin' },
   { name: 'reload', description: 'Reload the web UI', source: 'builtin' },
-  { name: 'tree', description: 'Show conversation tree in the terminal', source: 'builtin' },
-  { name: 'fork', description: 'Fork the session in the terminal', source: 'builtin' },
-  { name: 'clone', description: 'Clone the current branch in the terminal', source: 'builtin' },
-  { name: 'trust', description: 'Manage project trust in the terminal', source: 'builtin' },
-  { name: 'login', description: 'Sign in from the terminal', source: 'builtin' },
-  { name: 'logout', description: 'Sign out from the terminal', source: 'builtin' },
-  { name: 'quit', description: 'Quit the terminal session', source: 'builtin' },
 ];
 
-let slashCommands = fallbackSlashCommands;
-let slashCommandsLoaded = false;
+const slashCommands = webSlashCommands;
 let slashSelectedIndex = 0;
 let lastSlashQuery = null;
 
@@ -931,25 +979,6 @@ function openSlashMenu() {
   updateSlashMenu(true);
 }
 
-async function fetchSlashCommands() {
-  if (slashCommandsLoaded) return slashCommands;
-  const resp = await fetch('/api/rpc', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'get_commands' }),
-  });
-  const data = await resp.json();
-  if (data.success && Array.isArray(data.data?.commands)) {
-    const byName = new Map();
-    for (const command of [...fallbackSlashCommands, ...data.data.commands]) {
-      if (command?.name) byName.set(command.name, command);
-    }
-    slashCommands = Array.from(byName.values());
-  }
-  slashCommandsLoaded = true;
-  return slashCommands;
-}
-
 function ensureSlashAtCursor() {
   if (getSlashFragment()) return;
   const start = messageInput.selectionStart ?? messageInput.value.length;
@@ -985,8 +1014,7 @@ async function updateSlashMenu(force = false) {
     lastSlashQuery = fragment.query;
   }
 
-  const commands = await fetchSlashCommands();
-  const filtered = commands
+  const filtered = slashCommands
     .filter((command) => {
       const name = String(command.name || '').toLowerCase();
       const desc = String(command.description || '').toLowerCase();
@@ -1138,7 +1166,8 @@ function runSlashCommand(text) {
     return true;
   }
 
-  return false;
+  messageRenderer.renderSystemMessage(`/${rawName || 'command'} is not available in Tau web. Use the Pi terminal for this command.`);
+  return true;
 }
 
 function copyLatestAssistantMessage() {
@@ -1207,11 +1236,6 @@ const modelDropdown = document.getElementById('model-dropdown');
 const modelDropdownBtn = document.getElementById('model-dropdown-btn');
 const modelDropdownLabel = document.getElementById('model-dropdown-label');
 const modelDropdownMenu = document.getElementById('model-dropdown-menu');
-const thinkingBtn = document.getElementById('thinking-btn');
-function updateThinkingBtn() {
-  thinkingBtn.textContent = currentThinkingLevel;
-  thinkingBtn.classList.toggle('off', currentThinkingLevel === 'off');
-}
 let currentModelId = '';
 let currentModelProvider = '';
 let availableModels = [];
@@ -1246,7 +1270,7 @@ async function fetchModelInfo() {
     if (stateData.success && stateData.data?.thinkingLevel) {
       currentThinkingLevel = stateData.data.thinkingLevel;
       availableThinkingLevels = stateData.data.availableThinkingLevels || ['off'];
-      updateThinkingBtn();
+      updateModelLabel();
     }
     if (stateData.success && stateData.data?.cwd) {
       currentProjectPath = stateData.data.cwd;
@@ -1258,7 +1282,7 @@ async function fetchModelInfo() {
 
 function updateModelLabel() {
   const shortName = currentModelId.replace(/^claude-/, '').replace(/-\d{8}$/, '');
-  modelDropdownLabel.textContent = shortName || 'model';
+  modelDropdownLabel.textContent = `${shortName || 'model'} · ${currentThinkingLevel}`;
 }
 
 function modelIsCurrent(model) {
@@ -1276,85 +1300,112 @@ function toggleModelDropdown() {
 
 function openModelDropdown() {
   modelDropdownMenu.innerHTML = '';
-  let showAllModels = scopedModels.length === 0;
+  const chevron = '<svg width="7" height="12" viewBox="0 0 7 12" fill="none"><path d="m1 1 5 5-5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
-  // Search input
-  const search = document.createElement('input');
-  search.className = 'model-dropdown-search';
-  search.placeholder = 'Search models…';
-  search.type = 'text';
-  modelDropdownMenu.appendChild(search);
+  const renderConfig = () => {
+    modelDropdownMenu.innerHTML = '';
+    const shortName = currentModelId.replace(/^claude-/, '').replace(/-\d{8}$/, '') || 'model';
+    const rows = [
+      { label: 'Model', value: shortName, action: renderModels },
+      { label: 'Reasoning', value: currentThinkingLevel, action: renderThinking },
+    ];
+    for (const row of rows) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'model-config-row';
+      button.innerHTML = `<span>${row.label}</span><span class="model-config-value">${escapeHtml(row.value)}</span>${chevron}`;
+      button.addEventListener('click', row.action);
+      modelDropdownMenu.appendChild(button);
+    }
+  };
 
-  // Items container
-  const itemsContainer = document.createElement('div');
-  itemsContainer.className = 'model-dropdown-items';
-  modelDropdownMenu.appendChild(itemsContainer);
+  const renderBack = (title) => {
+    const back = document.createElement('button');
+    back.type = 'button';
+    back.className = 'model-dropdown-back';
+    back.innerHTML = `<span>‹</span><strong>${title}</strong>`;
+    back.addEventListener('click', renderConfig);
+    modelDropdownMenu.appendChild(back);
+  };
 
-  function renderItems(filter) {
-    itemsContainer.innerHTML = '';
-    const query = (filter || '').toLowerCase();
-    const scopedIds = new Set(scopedModels.map(m => `${m.provider}/${m.id}`));
-    const current = availableModels.find(modelIsCurrent);
-    const scopedWithCurrent = current && !scopedIds.has(`${current.provider}/${current.id}`)
-      ? [current, ...scopedModels]
-      : scopedModels;
-    const activeModels = showAllModels ? availableModels : scopedWithCurrent;
+  function renderModels() {
+    modelDropdownMenu.innerHTML = '';
+    renderBack('Models');
+    let showAllModels = scopedModels.length === 0;
+    const search = document.createElement('input');
+    search.className = 'model-dropdown-search';
+    search.placeholder = 'Search models…';
+    search.type = 'text';
+    modelDropdownMenu.appendChild(search);
+    const itemsContainer = document.createElement('div');
+    itemsContainer.className = 'model-dropdown-items';
+    modelDropdownMenu.appendChild(itemsContainer);
 
-    activeModels.forEach(m => {
-      const shortName = m.id.replace(/-\d{8}$/, '');
-      const providerStr = m.provider || '';
-      if (query && !shortName.toLowerCase().includes(query) && !providerStr.toLowerCase().includes(query)) return;
+    const renderItems = () => {
+      itemsContainer.innerHTML = '';
+      const query = search.value.toLowerCase();
+      const scopedIds = new Set(scopedModels.map(m => `${m.provider}/${m.id}`));
+      const current = availableModels.find(modelIsCurrent);
+      const scopedWithCurrent = current && !scopedIds.has(`${current.provider}/${current.id}`) ? [current, ...scopedModels] : scopedModels;
+      const activeModels = showAllModels ? availableModels : scopedWithCurrent;
+      for (const model of activeModels) {
+        const shortName = model.id.replace(/-\d{8}$/, '');
+        if (query && !`${shortName} ${model.provider || ''}`.toLowerCase().includes(query)) continue;
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = `model-dropdown-item${modelIsCurrent(model) ? ' active' : ''}`;
+        item.innerHTML = `<span>${escapeHtml(shortName)}<span class="model-dropdown-item-provider">${escapeHtml(model.provider || '')}</span></span>${modelIsCurrent(model) ? '<span>✓</span>' : ''}`;
+        item.addEventListener('click', async () => {
+          const data = await rpcCommand({ type: 'set_model', provider: model.provider, modelId: model.id }, `Switching to ${shortName}...`);
+          if (!data?.success) return;
+          currentModelId = data.data?.model?.id || model.id;
+          currentModelProvider = data.data?.model?.provider || model.provider || '';
+          currentThinkingLevel = data.data?.thinkingLevel || currentThinkingLevel;
+          availableThinkingLevels = data.data?.availableThinkingLevels || availableThinkingLevels;
+          if (model.contextWindow) contextWindowSize = model.contextWindow;
+          updateModelLabel();
+          closeModelDropdown();
+        });
+        itemsContainer.appendChild(item);
+      }
+      if (scopedModels.length > 0) {
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'model-dropdown-scope-btn';
+        toggle.textContent = showAllModels ? 'Show scoped models' : `Show other models (${Math.max(0, availableModels.length - scopedModels.length)})`;
+        toggle.addEventListener('click', () => { showAllModels = !showAllModels; renderItems(); });
+        itemsContainer.appendChild(toggle);
+      }
+    };
+    search.addEventListener('input', renderItems);
+    renderItems();
+    requestAnimationFrame(() => search.focus());
+  }
 
-      const el = document.createElement('div');
-      el.className = `model-dropdown-item${modelIsCurrent(m) ? ' active' : ''}`;
-      const ctxK = m.contextWindow ? `${(m.contextWindow / 1000).toFixed(0)}k` : '';
-      const providerLabel = m.provider && m.provider !== 'anthropic' ? `<span class="model-dropdown-item-provider">${m.provider}</span>` : '';
-      el.innerHTML = `<span>${shortName}${providerLabel}</span><span class="model-dropdown-item-ctx">${ctxK}</span>`;
-      el.addEventListener('click', async () => {
-        closeModelDropdown();
-        const display = m.id.replace(/^claude-/, '').replace(/-\d{8}$/, '');
-        const data = await rpcCommand({ type: 'set_model', provider: m.provider, modelId: m.id }, `Switching to ${display}...`);
-        currentModelId = data?.data?.model?.id || m.id;
-        currentModelProvider = data?.data?.model?.provider || m.provider || '';
-        currentThinkingLevel = data?.data?.thinkingLevel || currentThinkingLevel;
-        availableThinkingLevels = data?.data?.availableThinkingLevels || availableThinkingLevels;
+  function renderThinking() {
+    modelDropdownMenu.innerHTML = '';
+    renderBack('Reasoning');
+    const levels = Array.from(new Set([...availableThinkingLevels, currentThinkingLevel])).filter(Boolean);
+    for (const level of levels) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = `model-dropdown-item${level === currentThinkingLevel ? ' active' : ''}`;
+      item.innerHTML = `<span>${escapeHtml(level)}</span>${level === currentThinkingLevel ? '<span>✓</span>' : ''}`;
+      item.addEventListener('click', async () => {
+        const data = await rpcCommand({ type: 'set_thinking_level', level }, `Switching to ${level}...`);
+        if (!data?.success) return;
+        currentThinkingLevel = data.data?.level || level;
         updateModelLabel();
-        updateThinkingBtn();
-        if (m.contextWindow) {
-          contextWindowSize = m.contextWindow;
-          updateTokenUsage();
-        }
+        closeModelDropdown();
       });
-      itemsContainer.appendChild(el);
-    });
-
-    if (scopedModels.length > 0) {
-      const toggle = document.createElement('button');
-      toggle.type = 'button';
-      toggle.className = 'model-dropdown-scope-btn';
-      toggle.textContent = showAllModels ? 'Show scoped models' : `Show other models (${availableModels.length - scopedModels.length})`;
-      toggle.addEventListener('click', () => {
-        showAllModels = !showAllModels;
-        renderItems(search.value);
-      });
-      itemsContainer.appendChild(toggle);
+      modelDropdownMenu.appendChild(item);
     }
   }
 
-  renderItems('');
-
-  search.addEventListener('input', () => renderItems(search.value));
-  search.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { closeModelDropdown(); e.stopPropagation(); }
-    if (e.key === 'Enter') {
-      const first = itemsContainer.querySelector('.model-dropdown-item');
-      if (first) first.click();
-    }
-  });
+  renderConfig();
 
   modelDropdownMenu.classList.remove('hidden');
   modelDropdown.classList.add('open');
-  requestAnimationFrame(() => search.focus());
 }
 
 function closeModelDropdown() {
@@ -1364,55 +1415,15 @@ function closeModelDropdown() {
 
 modelDropdownBtn.addEventListener('click', toggleModelDropdown);
 
-let thinkingMenu = null;
-
-function closeThinkingDropdown() {
-  thinkingMenu?.remove();
-  thinkingMenu = null;
-}
-
-function openThinkingDropdown() {
-  closeThinkingDropdown();
-  const levels = Array.from(new Set([...availableThinkingLevels, currentThinkingLevel])).filter(Boolean);
-  thinkingMenu = document.createElement('div');
-  thinkingMenu.className = 'model-dropdown-menu thinking-dropdown-menu';
-  for (const level of levels) {
-    const item = document.createElement('button');
-    item.type = 'button';
-    item.className = `model-dropdown-item${level === currentThinkingLevel ? ' active' : ''}`;
-    item.textContent = level;
-    item.addEventListener('click', async () => {
-      const data = await rpcCommand({ type: 'set_thinking_level', level }, `Switching to ${level}...`);
-      if (data?.success && data.data?.level) {
-        currentThinkingLevel = data.data.level;
-        updateThinkingBtn();
-      }
-      closeThinkingDropdown();
-    });
-    thinkingMenu.appendChild(item);
-  }
-  document.body.appendChild(thinkingMenu);
-  const rect = thinkingBtn.getBoundingClientRect();
-  thinkingMenu.style.left = `${rect.left}px`;
-  thinkingMenu.style.top = `${rect.bottom + 4}px`;
-}
-
 // Close dropdown on outside click
 document.addEventListener('click', (e) => {
-  if (!modelDropdown.contains(e.target)) {
+  const clickPath = e.composedPath();
+  if (!clickPath.includes(modelDropdown)) {
     closeModelDropdown();
   }
-  if (!branchDropdown.contains(e.target)) {
+  if (!clickPath.includes(branchDropdown)) {
     closeBranchDropdown();
   }
-  if (!thinkingBtn.contains(e.target) && !thinkingMenu?.contains(e.target)) {
-    closeThinkingDropdown();
-  }
-});
-
-thinkingBtn.addEventListener('click', (event) => {
-  event.stopPropagation();
-  thinkingMenu ? closeThinkingDropdown() : openThinkingDropdown();
 });
 
 // ═══════════════════════════════════════
@@ -1630,6 +1641,9 @@ async function newSession() {
   updateCostDisplay();
   updateTokenUsage();
   state.reset();
+  messageQueue = [];
+  lastSentMessage = null;
+  renderQueuedMessages();
   messageRenderer.clear();
   toolCardRenderer.clear();
   messageRenderer.renderWelcome();
@@ -1644,6 +1658,10 @@ async function newSession() {
 }
 
 async function handleSessionSelect(session, project) {
+  if (!session) {
+    await newSession();
+    return;
+  }
   exitNewSessionMode();
   sidebar.setActive(session.filePath);
   sessionTotalCost = 0;
@@ -1679,13 +1697,14 @@ async function switchSession(sessionFile, session = null, project = null) {
 
       if (dirName && file) {
         try {
-          const res = await fetch(`/api/sessions/${dirName}/${file}`);
+          const sessionPath = encodeURIComponent(`${dirName}/${file}`);
+          const res = await fetch(`/api/sessions/${sessionPath}`);
           console.log('[App] History fetch status:', res.status);
           const data = await res.json();
           console.log('[App] History entries:', data.entries?.length || 0);
 
           messageRenderer.clear();
-          renderSessionHistory(data.entries || []);
+          renderSessionHistoryOrWelcome(data.entries || []);
         } catch (e) {
           console.error('[App] History fetch error:', e);
         }
@@ -1748,14 +1767,17 @@ async function switchSession(sessionFile, session = null, project = null) {
 
 function handleMirrorSync(data) {
   console.log('[Mirror] Received state snapshot:', data.entries?.length, 'entries');
+  clearExtensionUIState();
   isMirrorMode = true;
 
   // Track the active session
   mirrorActiveSessionFile = data.sessionFile || null;
+  sidebar.setActive(mirrorActiveSessionFile);
   currentProjectPath = data.cwd || currentProjectPath;
   viewingActiveSession = true;
   updateMirrorInputState();
   updateMirrorLiveIndicator();
+  fetchGitState().catch(() => {});
 
   // Update model display
   if (data.model) {
@@ -1771,23 +1793,23 @@ function handleMirrorSync(data) {
   if (data.thinkingLevel) {
     currentThinkingLevel = data.thinkingLevel;
     availableThinkingLevels = data.availableThinkingLevels || availableThinkingLevels;
-    updateThinkingBtn();
+    updateModelLabel();
   }
+
+  // Keep the optimistic user bubble while Pi is still flushing the first entry.
+  const pendingUserMessage = lastSentMessage && messagesContainer.querySelector('.message.user:not(.history)')
+    ? lastSentMessage
+    : null;
 
   // Clear and render message history
   messageRenderer.clear();
   sessionTotalCost = 0;
   lastInputTokens = 0;
 
-  if (data.entries && data.entries.length > 0) {
-    renderSessionHistory(data.entries);
-  } else {
-    messageRenderer.renderWelcome();
-  }
+  renderSessionHistoryOrWelcome(data.entries || [], pendingUserMessage);
 
   updateCostDisplay();
   updateTokenUsage();
-  flushPendingNewMessage();
 }
 
 // Mark all live sessions in the sidebar with a green dot
@@ -1838,110 +1860,132 @@ async function launchSessionInstance(sessionFile, projectPath) {
     messageRenderer.renderError('Cannot resume session: missing project path');
     return false;
   }
-  await pollInstances();
-  const beforePids = new Set(liveInstances.map(instance => instance.pid));
   document.querySelector('.input-area')?.classList.remove('mirror-readonly');
   messageInput.disabled = true;
   messageInput.placeholder = 'Opening session...';
   statusText.textContent = 'Opening session...';
 
-  const response = await fetch('/api/projects/launch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: projectPath, sessionFile }),
-  });
-  const data = await response.json();
-  if (!response.ok || !data.ok) {
-    messageRenderer.renderError(data.error || 'Failed to open session');
+  try {
+    const response = await fetch('/api/sessions/launch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: projectPath, sessionFile }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      messageRenderer.renderError(data.error || 'Failed to open session');
+      statusText.textContent = 'Connected';
+      updateMirrorInputState();
+      return false;
+    }
+
+    navigateToInstance(data);
+    return true;
+  } catch (error) {
+    messageRenderer.renderError(error instanceof Error ? error.message : 'Failed to open session');
     statusText.textContent = 'Connected';
     updateMirrorInputState();
     return false;
   }
-
-  for (let i = 0; i < 20; i += 1) {
-    await wait(500);
-    await pollInstances();
-    const instance = liveInstances.find(item => item.sessionFile === sessionFile && !beforePids.has(item.pid));
-    if (instance) {
-      navigateToInstance(instance);
-      return true;
-    }
-  }
-
-  messageRenderer.renderError('Session opened, but Tau did not see its mirror yet');
-  statusText.textContent = 'Connected';
-  updateMirrorInputState();
-  return false;
-}
-
-function currentPort() {
-  return Number(new URL(wsClient.url).port || location.port || 80);
 }
 
 async function launchNewSessionWithPendingMessage(cmd) {
-  const projectPath = selectedNewProject?.path || currentProjectPath;
-  if (!projectPath) {
-    messageRenderer.renderError('Cannot start new session: missing project path');
-    return;
-  }
+  if (isLaunchingNewSession) return { ok: false, error: 'New session is already opening' };
+  isLaunchingNewSession = true;
+  messageInput.disabled = true;
+  sendBtn.disabled = true;
 
-  await pollInstances();
-  const beforePids = new Set(liveInstances.map(instance => instance.pid));
-  localStorage.setItem('tau-pending-new-message', JSON.stringify({ sourcePort: currentPort(), cmd }));
-  statusText.textContent = 'Opening new session...';
+  let navigated = false;
+  try {
+    if (!newSessionProjectLoad) startNewSessionProjectLoad();
+    await newSessionProjectLoad;
+    statusText.textContent = 'Opening new session...';
 
-  const response = await fetch('/api/projects/launch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: projectPath }),
-  });
-  const data = await response.json();
-  if (!response.ok || !data.ok) {
-    localStorage.removeItem('tau-pending-new-message');
-    messageRenderer.renderError(data.error || 'Failed to open new session');
+    const response = await fetch('/api/projects/launch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(selectedNewProject ? { path: selectedNewProject.path } : { noProject: true }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      statusText.textContent = 'Connected';
+      return { ok: false, error: data.error || 'Failed to open new session' };
+    }
+
+    try {
+      await handoffPromptToInstance(data, cmd);
+    } catch (error) {
+      statusText.textContent = 'Connected';
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    navigated = true;
+    navigateToInstance(data);
+    return { ok: true };
+  } catch (error) {
+    console.error('[App] Failed to launch new session:', error);
     statusText.textContent = 'Connected';
-    return;
-  }
-
-  for (let i = 0; i < 20; i += 1) {
-    await wait(500);
-    await pollInstances();
-    const instance = liveInstances.find(item => item.cwd === projectPath && !beforePids.has(item.pid));
-    if (instance) {
-      navigateToInstance(instance);
-      return;
+    return { ok: false, error: error instanceof Error ? error.message : 'Failed to open new session' };
+  } finally {
+    if (!navigated) {
+      isLaunchingNewSession = false;
+      messageInput.disabled = false;
+      sendBtn.disabled = false;
+      updateMirrorInputState();
     }
   }
-
-  localStorage.removeItem('tau-pending-new-message');
-  messageRenderer.renderError('New session opened, but Tau did not see its mirror yet');
-  statusText.textContent = 'Connected';
 }
 
-function flushPendingNewMessage() {
-  const raw = localStorage.getItem('tau-pending-new-message');
-  if (!raw) return;
-  const pending = JSON.parse(raw);
-  if (currentPort() === pending.sourcePort) return;
-  const { cmd } = pending;
-  localStorage.removeItem('tau-pending-new-message');
-  exitNewSessionMode();
-  lastSentMessage = cmd.message;
-  messageRenderer.renderUserMessage({ content: cmd.message, images: cmd.images });
-  wsClient.send(cmd);
+function handoffPromptToInstance(instance, cmd) {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${protocol}//${location.hostname}:${instance.port}/ws`);
+  const id = `handoff-${Date.now()}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.close();
+      reject(new Error('New session did not accept the message'));
+    }, 5000);
+    socket.onmessage = (event) => {
+      const message = JSON.parse(event.data);
+      if (message.type === 'mirror_sync') {
+        socket.send(JSON.stringify({ ...cmd, id }));
+      } else if (message.type === 'response' && message.id === id) {
+        clearTimeout(timer);
+        socket.close();
+        if (message.success) resolve();
+        else reject(new Error(message.error || 'New session rejected the message'));
+      }
+    };
+    socket.onerror = () => {
+      clearTimeout(timer);
+      socket.close();
+      reject(new Error('Could not connect to the new session'));
+    };
+  });
 }
 
 // ═══════════════════════════════════════
 // Session history rendering
 // ═══════════════════════════════════════
 
+function renderSessionHistoryOrWelcome(entries, pendingUserMessage = null) {
+  const fallback = getSessionHistoryFallback(
+    renderSessionHistory(entries),
+    pendingUserMessage,
+  );
+  if (fallback === 'pending-user') {
+    messageRenderer.renderUserMessage({ content: pendingUserMessage });
+  } else if (fallback === 'welcome') {
+    messageRenderer.renderWelcome();
+  }
+}
+
 function renderSessionHistory(entries) {
   console.log(`[History] Rendering ${entries.length} entries`);
-  let userCount = 0, assistantCount = 0, toolCardCount = 0, toolResultCount = 0;
+  let userCount = 0, assistantCount = 0, toolCardCount = 0, toolResultCount = 0, renderedCount = 0;
 
   for (const entry of entries) {
-    if (entry.type === 'custom_message') {
-      messageRenderer.renderCustomMessage(entry, true);
+    if (entry.type === 'custom_message' && entry.display === true) {
+      if (messageRenderer.renderCustomMessage(entry, true)) renderedCount++;
       continue;
     }
 
@@ -1967,6 +2011,7 @@ function renderSessionHistory(entries) {
       if (content || images.length > 0) {
         userCount++;
         messageRenderer.renderUserMessage({ content: content || '', images: images.length > 0 ? images : undefined }, true);
+        renderedCount++;
       }
     } else if (msg.role === 'assistant') {
       const textBlocks = (msg.content || []).filter((b) => b.type === 'text');
@@ -1993,6 +2038,7 @@ function renderSessionHistory(entries) {
           false,
           true
         );
+        renderedCount++;
 
         // Track cost and tokens from history
         if (msg.usage?.cost?.total) {
@@ -2006,12 +2052,15 @@ function renderSessionHistory(entries) {
 
       // Show tool calls as compact history cards
       for (const tc of toolCalls) {
-        toolCardCount++;
         const card = toolCardRenderer.createHistoryCard({
           toolCallId: tc.id,
           toolName: tc.name,
           args: tc.arguments || {},
         });
+        if (card) {
+          toolCardCount++;
+          renderedCount++;
+        }
         console.log(`[History] Tool card created: ${tc.name}`, card?.offsetHeight, card?.innerHTML?.substring(0, 100));
       }
     } else if (msg.role === 'toolResult') {
@@ -2042,6 +2091,8 @@ function renderSessionHistory(entries) {
       messagesEl.style.scrollBehavior = '';
     });
   });
+
+  return renderedCount;
 }
 
 // ═══════════════════════════════════════
@@ -2179,8 +2230,6 @@ const settingsPanel = document.getElementById('settings-panel');
 const settingsOverlay = document.getElementById('settings-overlay');
 const settingsClose = document.getElementById('settings-close');
 const themeGrid = document.getElementById('theme-grid');
-const toggleAutoCompact = document.getElementById('toggle-auto-compact');
-const btnThinkingLevel = document.getElementById('btn-thinking-level');
 const toggleShowThinking = document.getElementById('toggle-show-thinking');
 const settingsTabs = document.getElementById('settings-tabs');
 const settingsTabPanels = Array.from(document.querySelectorAll('.settings-tab-panel'));
@@ -2202,10 +2251,12 @@ function buildThemeGrid() {
   for (const [id, theme] of Object.entries(themes)) {
     const btn = document.createElement('button');
     btn.className = `theme-swatch${current === id ? ' active' : ''}`;
+    btn.type = 'button';
+    btn.setAttribute('aria-label', theme.name);
     const dots = (theme.colors || []).map(c => 
       `<span class="swatch-dot" style="background:${c}"></span>`
     ).join('');
-    btn.innerHTML = `<span class="swatch-colors">${dots}</span>`;
+    btn.innerHTML = `<span>${escapeHtml(theme.name)}</span><span class="swatch-colors">${dots}</span>`;
     btn.addEventListener('click', () => {
       applyTheme(id);
       themeGrid.querySelectorAll('.theme-swatch').forEach(s => s.classList.remove('active'));
@@ -2285,28 +2336,6 @@ async function openSettings() {
   });
   fetchGitState();
 
-  // Fetch current state for toggles
-  try {
-    const resp = await fetch('/api/rpc', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'get_state' }),
-    });
-    const data = await resp.json();
-    if (data.success && data.data) {
-      const s = data.data;
-      // Auto-compaction toggle
-      toggleAutoCompact.className = `settings-toggle${s.autoCompactionEnabled ? ' on' : ''}`;
-      // Thinking level
-      btnThinkingLevel.textContent = s.thinkingLevel || 'off';
-      currentThinkingLevel = s.thinkingLevel || 'off';
-      availableThinkingLevels = s.availableThinkingLevels || availableThinkingLevels;
-      updateThinkingBtn();
-    }
-  } catch (e) {
-    // Silent
-  }
-
   // Fetch auth state
   try {
     const authData = await rpcCommand({ type: 'get_auth' });
@@ -2329,23 +2358,6 @@ function closeSettings() {
 settingsBtn.addEventListener('click', openSettings);
 settingsClose.addEventListener('click', closeSettings);
 settingsOverlay.addEventListener('click', closeSettings);
-
-// Auto-compaction toggle
-toggleAutoCompact.addEventListener('click', async () => {
-  const isOn = toggleAutoCompact.classList.contains('on');
-  toggleAutoCompact.className = `settings-toggle${isOn ? '' : ' on'}`;
-  await rpcCommand({ type: 'set_auto_compaction', enabled: !isOn });
-});
-
-// Thinking level cycle (settings panel button)
-btnThinkingLevel.addEventListener('click', async () => {
-  const data = await rpcCommand({ type: 'cycle_thinking_level' });
-  if (data?.success && data.data?.level) {
-    btnThinkingLevel.textContent = data.data.level;
-    currentThinkingLevel = data.data.level;
-    updateThinkingBtn();
-  }
-});
 
 // Show thinking toggle (local pref)
 const showThinking = localStorage.getItem('tau-show-thinking') !== 'false';
@@ -2584,6 +2596,9 @@ const newProjectMenu = document.getElementById('new-project-menu');
 let isNewSessionMode = false;
 let newSessionProjects = [];
 let selectedNewProject = null;
+let newSessionTaskPath = '';
+let newSessionProjectLoad = null;
+let isLaunchingNewSession = false;
 
 function projectShortName(project) {
   if (!project?.path) return '不使用项目';
@@ -2604,16 +2619,24 @@ async function loadNewSessionProjects() {
   const response = await fetch('/api/projects');
   const data = await response.json();
   newSessionProjects = data.projects || [];
-  selectedNewProject =
-    newSessionProjects.find(p => p.path === currentProjectPath) ||
-    newSessionProjects.find(p => p.active) ||
-    newSessionProjects[0] ||
-    null;
+  newSessionTaskPath = data.taskPath || '';
+  selectedNewProject = currentProjectPath === newSessionTaskPath
+    ? null
+    : newSessionProjects.find(p => p.path === currentProjectPath) ||
+      newSessionProjects.find(p => p.active) ||
+      newSessionProjects[0] ||
+      null;
   renderNewProjectLabel();
 }
 
-function wait(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function startNewSessionProjectLoad() {
+  const load = loadNewSessionProjects();
+  newSessionProjectLoad = load;
+  load.catch((error) => {
+    if (newSessionProjectLoad === load) newSessionProjectLoad = null;
+    console.error('[App] Failed to load projects:', error);
+  });
+  return load;
 }
 
 function navigateToInstance(instance) {
@@ -2688,12 +2711,36 @@ function closeNewProjectMenu() {
   newProjectMenu.classList.add('hidden');
 }
 
+function restoreNewSessionDraft(draft, error) {
+  state.reset();
+  lastSentMessage = null;
+  messageRenderer.clear();
+  toolCardRenderer.clear();
+  sidebar.clearActive();
+  isNewSessionMode = true;
+  document.body.classList.add('new-session-mode');
+  newSessionTools.classList.remove('hidden');
+  messageRenderer.renderWelcome();
+  renderNewProjectLabel();
+  messageRenderer.renderError(error);
+
+  pendingImages = draft.images;
+  pendingFilePaths = draft.filePaths;
+  renderAttachmentPreviews();
+  messageInput.value = draft.message;
+  messageInput.dispatchEvent(new Event('input'));
+  messageInput.disabled = false;
+  sendBtn.disabled = false;
+  updateMirrorInputState();
+  if (!isMobile()) messageInput.focus();
+}
+
 function enterNewSessionMode() {
   isNewSessionMode = true;
   document.body.classList.add('new-session-mode');
   newSessionTools.classList.remove('hidden');
   renderNewSessionWelcome();
-  loadNewSessionProjects().catch(() => {});
+  startNewSessionProjectLoad();
   if (!isMobile()) messageInput.focus();
 }
 

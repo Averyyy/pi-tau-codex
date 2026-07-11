@@ -2,20 +2,77 @@
  * Session Sidebar - Lists sessions grouped by project, handles switching
  */
 
+const LEGACY_PREFERENCE_KEYS = [
+  'tau-collapsed-projects',
+  'tau-favourites',
+  'tau-hidden-projects',
+  'tau-project-names',
+  'tau-project-order',
+  'tau-pinned-projects',
+  'tau-sidebar-projects-open',
+  'tau-sidebar-tasks-open',
+  'tau-sidebar-hidden-open',
+];
+
+function defaultSidebarPreferences() {
+  return {
+    revision: 0,
+    favourites: [],
+    hiddenProjects: [],
+    projectNames: {},
+    projectOrder: [],
+    pinnedProjects: [],
+    collapsedProjects: [],
+    sections: {
+      favouritesOpen: true,
+      projectsOpen: true,
+      tasksOpen: true,
+      hiddenProjectsOpen: false,
+    },
+  };
+}
+
+function readLegacySidebarPreferences() {
+  const readJson = (key, fallback) => {
+    const value = localStorage.getItem(key);
+    return value === null ? fallback : JSON.parse(value);
+  };
+  return {
+    favourites: readJson('tau-favourites', []),
+    hiddenProjects: readJson('tau-hidden-projects', []),
+    projectNames: readJson('tau-project-names', {}),
+    projectOrder: readJson('tau-project-order', []),
+    pinnedProjects: readJson('tau-pinned-projects', []),
+    collapsedProjects: readJson('tau-collapsed-projects', []),
+    sections: {
+      projectsOpen: localStorage.getItem('tau-sidebar-projects-open') !== 'false',
+      tasksOpen: localStorage.getItem('tau-sidebar-tasks-open') !== 'false',
+      hiddenProjectsOpen: localStorage.getItem('tau-sidebar-hidden-open') === 'true',
+    },
+  };
+}
+
+function clearLegacySidebarPreferences() {
+  for (const key of LEGACY_PREFERENCE_KEYS) localStorage.removeItem(key);
+}
+
 export class SessionSidebar {
   constructor(container, onSessionSelect) {
     this.container = container;
     this.onSessionSelect = onSessionSelect;
     this.activeSessionFile = null;
     this.projects = [];
-    this.collapsedProjects = new Set();
+    this.tasks = null;
     this.searchQuery = '';
-    this.favourites = JSON.parse(localStorage.getItem('tau-favourites') || '[]');
-    this.hiddenProjects = JSON.parse(localStorage.getItem('tau-hidden-projects') || '[]');
-    this.projectNames = JSON.parse(localStorage.getItem('tau-project-names') || '{}');
+    this.preferenceWrites = Promise.resolve();
+    this.applyPreferences(defaultSidebarPreferences());
+    this.preferencesReady = this.bootstrapPreferences();
     this.contextMenu = null;
-    this.archivedProjectsOpen = localStorage.getItem('tau-sidebar-archived-open') === 'true';
-    this.hiddenProjectsOpen = localStorage.getItem('tau-sidebar-hidden-open') === 'true';
+    this.projectDrag = null;
+    this.hoverCard = document.createElement('div');
+    this.hoverCard.className = 'session-hover-card';
+    this.hoverCard.setAttribute('role', 'tooltip');
+    document.body.appendChild(this.hoverCard);
 
     // Close context menu on click anywhere
     document.addEventListener('click', () => this.closeContextMenu());
@@ -23,10 +80,58 @@ export class SessionSidebar {
       // Close if right-clicking outside a session item
       if (!e.target.closest('.session-item')) this.closeContextMenu();
     });
+    document.addEventListener('pointermove', (e) => this.handleProjectPointerMove(e));
+    document.addEventListener('pointerup', (e) => this.finishProjectPointerDrag(e));
+    document.addEventListener('pointercancel', (e) => this.cancelProjectPointerDrag(e));
   }
 
-  saveFavourites() {
-    localStorage.setItem('tau-favourites', JSON.stringify(this.favourites));
+  applyPreferences(preferences) {
+    this.preferences = preferences;
+    this.favourites = preferences.favourites;
+    this.hiddenProjects = preferences.hiddenProjects;
+    this.projectNames = preferences.projectNames;
+    this.projectOrder = preferences.projectOrder;
+    this.pinnedProjects = preferences.pinnedProjects;
+    this.collapsedProjects = new Set(preferences.collapsedProjects);
+    this.favouritesOpen = preferences.sections.favouritesOpen;
+    this.projectsOpen = preferences.sections.projectsOpen;
+    this.tasksOpen = preferences.sections.tasksOpen;
+    this.hiddenProjectsOpen = preferences.sections.hiddenProjectsOpen;
+  }
+
+  async bootstrapPreferences() {
+    const res = await fetch('/api/sidebar-preferences', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'bootstrap', preferences: readLegacySidebarPreferences() }),
+    });
+    if (!res.ok) throw new Error((await res.json()).error || 'Failed to load sidebar preferences');
+    const data = await res.json();
+    this.applyPreferences(data.preferences);
+    clearLegacySidebarPreferences();
+  }
+
+  queuePreferenceMutation(mutation, render = true) {
+    const write = this.preferenceWrites.then(async () => {
+      const res = await fetch('/api/sidebar-preferences', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(mutation),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to save sidebar preferences');
+      this.applyPreferences(data.preferences);
+      if (render) this.render();
+      return data.preferences;
+    });
+    this.preferenceWrites = write.catch(() => undefined);
+    return write;
+  }
+
+  commitPreferenceMutation(mutation) {
+    void this.queuePreferenceMutation(mutation).catch((error) => {
+      console.error('[Sidebar] Failed to save preferences:', error);
+    });
   }
 
   isFavourite(filePath) {
@@ -34,43 +139,47 @@ export class SessionSidebar {
   }
 
   toggleFavourite(filePath) {
-    const idx = this.favourites.indexOf(filePath);
-    if (idx >= 0) {
-      this.favourites.splice(idx, 1);
-    } else {
-      this.favourites.push(filePath);
-    }
-    this.saveFavourites();
-    this.render();
-  }
-
-  saveProjectPrefs() {
-    localStorage.setItem('tau-hidden-projects', JSON.stringify(this.hiddenProjects));
-    localStorage.setItem('tau-project-names', JSON.stringify(this.projectNames));
+    this.commitPreferenceMutation({ type: 'toggle_favourite', filePath });
   }
 
   projectDisplayName(project) {
     if (this.projectNames[project.path]) return this.projectNames[project.path];
-    const pathParts = project.path.split('/').filter(Boolean);
-    return pathParts.length > 0 ? pathParts[pathParts.length - 1] : project.path;
+    const cleanPath = project.path.replace(/[\\/]+$/, '');
+    const pathParts = cleanPath.split(/[\\/]+/).filter(Boolean);
+    return pathParts.length > 0 ? pathParts[pathParts.length - 1] : cleanPath;
   }
 
   isProjectHidden(project) {
     return this.hiddenProjects.includes(project.path);
   }
 
-  async loadSessions() {
+  async loadSessions(showLoading = true) {
     try {
-      this.container.innerHTML = Array.from({length: 6}, () =>
-        '<div class="session-skeleton"><div class="session-skeleton-title"></div><div class="session-skeleton-meta"></div></div>'
-      ).join('');
+      if (showLoading) {
+        this.container.innerHTML = Array.from({length: 6}, () =>
+          '<div class="session-skeleton"><div class="session-skeleton-title"></div><div class="session-skeleton-meta"></div></div>'
+        ).join('');
+      }
+      await this.preferencesReady;
       const res = await fetch('/api/sessions');
+      if (!res.ok) throw new Error('Failed to load sessions');
       const data = await res.json();
       this.projects = data.projects || [];
+      this.tasks = data.tasks || null;
+      await this.normalizeCollapsedProjectKeys();
       this.render();
     } catch (error) {
       console.error('[Sidebar] Failed to load sessions:', error);
       this.container.innerHTML = '<div class="session-loading">Failed to load sessions</div>';
+    }
+  }
+
+  async normalizeCollapsedProjectKeys() {
+    const mappings = this.projects
+      .filter((project) => this.collapsedProjects.has(project.dirName) && !this.collapsedProjects.has(project.path))
+      .map((project) => ({ projectPath: project.path, legacyKey: project.dirName }));
+    if (mappings.length > 0) {
+      await this.queuePreferenceMutation({ type: 'normalize_collapsed_projects', mappings }, false);
     }
   }
 
@@ -153,7 +262,7 @@ export class SessionSidebar {
 
       // Find the matching project/session to pass to onSessionSelect
       item.addEventListener('click', () => {
-        for (const project of this.projects) {
+        for (const project of this.allGroups()) {
           const session = project.sessions.find(s => s.filePath === result.filePath);
           if (session) {
             this.onSessionSelect(session, project);
@@ -214,6 +323,10 @@ export class SessionSidebar {
       });
       group.style.display = hasVisible ? '' : 'none';
     });
+    this.container.querySelectorAll('.task-sessions .session-item').forEach(item => {
+      const title = (item.querySelector('.session-title')?.textContent || '').toLowerCase();
+      item.classList.toggle('hidden', !title.includes(this.searchQuery));
+    });
   }
 
   setActive(filePath) {
@@ -232,7 +345,7 @@ export class SessionSidebar {
   // Context Menu
   // ═══════════════════════════════════════
 
-  showContextMenu(e, session, project, itemEl) {
+  showContextMenu(e, session) {
     e.preventDefault();
     this.closeContextMenu();
 
@@ -242,9 +355,7 @@ export class SessionSidebar {
 
     const items = [
       { icon: isFav ? '★' : '☆', label: isFav ? 'Unfavourite' : 'Favourite', action: () => this.toggleFavourite(session.filePath) },
-      { icon: '✎', label: 'Rename', action: () => this.startRename(itemEl) },
-      { icon: '📋', label: 'Export HTML', action: () => this.exportSession(session) },
-      { icon: '🗑', label: 'Delete', action: () => this.deleteSession(session, itemEl) },
+      { icon: '🗑', label: 'Delete', action: () => this.deleteSession(session) },
     ];
 
     for (const item of items) {
@@ -268,7 +379,9 @@ export class SessionSidebar {
     this.closeContextMenu();
 
     const hidden = this.isProjectHidden(project);
+    const pinned = this.pinnedProjects.includes(project.path);
     const items = [
+      { icon: pinned ? '✓' : '↑', label: pinned ? '取消置顶' : '置顶项目', action: () => this.toggleProjectPinned(project) },
       { icon: hidden ? '☑' : '☐', label: hidden ? '取消隐藏' : '隐藏项目', action: () => this.toggleProjectHidden(project) },
       { icon: '✎', label: '重命名项目', action: () => this.renameProject(project) },
       { icon: '↗', label: '在 Finder / Explorer 中打开', action: () => this.openProjectFolder(project) },
@@ -308,44 +421,7 @@ export class SessionSidebar {
     }
   }
 
-  startRename(itemEl) {
-    const titleEl = itemEl.querySelector('.session-title');
-    if (!titleEl) return;
-    const currentName = titleEl.textContent;
-
-    const input = document.createElement('input');
-    input.className = 'session-rename-input';
-    input.value = currentName;
-    titleEl.replaceWith(input);
-    input.focus();
-    input.select();
-
-    const commit = async () => {
-      const newName = input.value.trim();
-      if (newName && newName !== currentName) {
-        try {
-          await fetch('/api/rpc', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ type: 'set_session_name', name: newName }),
-          });
-        } catch { /* silent */ }
-      }
-      const newTitle = document.createElement('div');
-      newTitle.className = 'session-title';
-      newTitle.title = newName || currentName;
-      newTitle.textContent = newName || currentName;
-      input.replaceWith(newTitle);
-    };
-
-    input.addEventListener('blur', commit);
-    input.addEventListener('keydown', (ke) => {
-      if (ke.key === 'Enter') { ke.preventDefault(); input.blur(); }
-      if (ke.key === 'Escape') { input.value = currentName; input.blur(); }
-    });
-  }
-
-  async deleteSession(session, itemEl) {
+  async deleteSession(session) {
     if (!confirm(`Delete "${session.name || session.firstMessage || 'this session'}"?`)) return;
     try {
       const res = await fetch('/api/sessions/delete', {
@@ -353,60 +429,146 @@ export class SessionSidebar {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filePath: session.filePath }),
       });
-      if (res.ok) {
-        itemEl.remove();
-        // Remove from favourites if present
-        const favIdx = this.favourites.indexOf(session.filePath);
-        if (favIdx >= 0) {
-          this.favourites.splice(favIdx, 1);
-          this.saveFavourites();
-        }
-        // If this was the active session, clear it
-        if (session.filePath === this.activeSessionFile) {
-          this.clearActive();
-          if (this.onSessionSelect) this.onSessionSelect(null, null);
-        }
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || 'Failed to delete session');
       }
+      await this.queuePreferenceMutation({ type: 'remove_session', filePath: session.filePath }, false);
+      // If this was the active session, clear it
+      if (session.filePath === this.activeSessionFile) {
+        this.clearActive();
+        if (this.onSessionSelect) await this.onSessionSelect(null, null);
+      }
+      await this.loadSessions(false);
     } catch (e) {
       console.error('[Sidebar] Delete failed:', e);
     }
   }
 
-  async exportSession(session) {
-    try {
-      const data = await (await fetch('/api/rpc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'export_html' }),
-      })).json();
-      if (data?.success && data.data?.path) {
-        window.open(`/api/sessions/${encodeURIComponent(data.data.path)}`);
-      }
-    } catch { /* silent */ }
+  toggleProjectHidden(project) {
+    this.commitPreferenceMutation({ type: 'toggle_project_hidden', projectPath: project.path });
   }
 
-  toggleProjectHidden(project) {
-    const idx = this.hiddenProjects.indexOf(project.path);
-    if (idx >= 0) {
-      this.hiddenProjects.splice(idx, 1);
-    } else {
-      this.hiddenProjects.push(project.path);
-    }
-    this.saveProjectPrefs();
-    this.render();
+  toggleProjectPinned(project) {
+    this.commitPreferenceMutation({ type: 'toggle_project_pinned', projectPath: project.path });
+  }
+
+  allGroups() {
+    return this.tasks ? [...this.projects, this.tasks] : this.projects;
+  }
+
+  orderedProjects(projects) {
+    const savedIndex = new Map(this.projectOrder.map((projectPath, index) => [projectPath, index]));
+    const sourceIndex = new Map(this.projects.map((project, index) => [project.path, index]));
+    const pinnedIndex = new Map(this.pinnedProjects.map((projectPath, index) => [projectPath, index]));
+    return [...projects].sort((a, b) => {
+      const aPinned = pinnedIndex.get(a.path);
+      const bPinned = pinnedIndex.get(b.path);
+      if (aPinned !== undefined || bPinned !== undefined) {
+        if (aPinned === undefined) return 1;
+        if (bPinned === undefined) return -1;
+        return aPinned - bPinned;
+      }
+      return (savedIndex.get(a.path) ?? sourceIndex.get(a.path) ?? Number.MAX_SAFE_INTEGER) -
+        (savedIndex.get(b.path) ?? sourceIndex.get(b.path) ?? Number.MAX_SAFE_INTEGER);
+    });
+  }
+
+  moveProject(sourcePath, targetPath, insertAfter) {
+    if (!sourcePath || sourcePath === targetPath) return;
+    const sourcePinned = this.pinnedProjects.includes(sourcePath);
+    if (sourcePinned !== this.pinnedProjects.includes(targetPath)) return;
+
+    const mutation = {
+      type: 'move_project',
+      sourcePath,
+      targetPath,
+      insertAfter,
+      projectPaths: this.orderedProjects(this.projects).map((project) => project.path),
+    };
+    if (sourcePinned) mutation.pinnedProjectPaths = [...this.pinnedProjects];
+    this.commitPreferenceMutation(mutation);
+  }
+
+  startProjectPointerDrag(event, project, group) {
+    if (event.pointerType !== 'mouse' || event.button !== 0 || event.target.closest('.project-menu-btn')) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    this.projectDrag = {
+      sourcePath: project.path,
+      sourceGroup: group,
+      sourceHeader: event.currentTarget,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      targetGroup: null,
+      insertAfter: false,
+      dragging: false,
+    };
+  }
+
+  handleProjectPointerMove(event) {
+    const drag = this.projectDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    if (!drag.dragging && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 6) return;
+
+    event.preventDefault();
+    drag.dragging = true;
+    document.body.classList.add('project-dragging');
+    drag.sourceGroup.classList.add('dragging');
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest('.project-group');
+    const targetRect = target?.getBoundingClientRect();
+    const insertAfter = Boolean(targetRect && event.clientY > targetRect.top + targetRect.height / 2);
+    const targetPath = target?.dataset.projectPath;
+    const validTarget = target && target !== drag.sourceGroup && targetPath &&
+      this.pinnedProjects.includes(drag.sourcePath) === this.pinnedProjects.includes(targetPath)
+      ? target
+      : null;
+    if (drag.targetGroup === validTarget && drag.insertAfter === insertAfter) return;
+    drag.targetGroup?.classList.remove('drag-over');
+    drag.targetGroup?.classList.remove('drag-over-after');
+    drag.targetGroup = validTarget;
+    drag.insertAfter = drag.targetGroup ? insertAfter : false;
+    drag.targetGroup?.classList.add('drag-over');
+    drag.targetGroup?.classList.toggle('drag-over-after', drag.insertAfter);
+  }
+
+  finishProjectPointerDrag(event) {
+    const drag = this.projectDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    this.clearProjectPointerDrag(drag);
+    if (!drag.dragging) return;
+
+    event.preventDefault();
+    const suppressClick = (clickEvent) => {
+      clickEvent.preventDefault();
+      clickEvent.stopImmediatePropagation();
+      drag.sourceHeader.removeEventListener('click', suppressClick, true);
+    };
+    drag.sourceHeader.addEventListener('click', suppressClick, true);
+    requestAnimationFrame(() => drag.sourceHeader.removeEventListener('click', suppressClick, true));
+    const targetPath = drag.targetGroup?.dataset.projectPath;
+    if (targetPath) this.moveProject(drag.sourcePath, targetPath, drag.insertAfter);
+  }
+
+  cancelProjectPointerDrag(event) {
+    const drag = this.projectDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    this.clearProjectPointerDrag(drag);
+  }
+
+  clearProjectPointerDrag(drag) {
+    this.projectDrag = null;
+    document.body.classList.remove('project-dragging');
+    drag.sourceGroup.classList.remove('dragging');
+    drag.targetGroup?.classList.remove('drag-over');
+    drag.targetGroup?.classList.remove('drag-over-after');
   }
 
   renameProject(project) {
     const name = prompt('重命名项目', this.projectDisplayName(project));
     if (name === null) return;
     const trimmed = name.trim();
-    if (trimmed) {
-      this.projectNames[project.path] = trimmed;
-    } else {
-      delete this.projectNames[project.path];
-    }
-    this.saveProjectPrefs();
-    this.render();
+    this.commitPreferenceMutation({ type: 'set_project_name', projectPath: project.path, name: trimmed || null });
   }
 
   async openProjectFolder(project) {
@@ -422,7 +584,7 @@ export class SessionSidebar {
   // Render
   // ═══════════════════════════════════════
 
-  buildSessionItem(session, project) {
+  buildSessionItem(session, project, isTask = false) {
     const item = document.createElement('div');
     item.className = 'session-item';
     item.dataset.filePath = session.filePath;
@@ -445,29 +607,53 @@ export class SessionSidebar {
       <div class="session-meta">${time}</div>
     `;
 
-    item.addEventListener('click', () => this.onSessionSelect(session, project));
-    item.addEventListener('contextmenu', (e) => this.showContextMenu(e, session, project, item));
+    item.addEventListener('click', () => {
+      this.hideSessionHoverCard();
+      this.onSessionSelect(session, project);
+    });
+    item.addEventListener('contextmenu', (e) => this.showContextMenu(e, session));
+    item.addEventListener('pointerenter', () => this.showSessionHoverCard(item, title, time, project, isTask));
+    item.addEventListener('pointerleave', () => this.hideSessionHoverCard());
 
     return item;
   }
 
+  showSessionHoverCard(item, title, time, project, isTask) {
+    this.hoverCard.innerHTML = `
+      <div class="session-hover-title">${this.escapeHtml(title)}</div>
+      <div class="session-hover-meta">${this.escapeHtml(time)}</div>
+      <div class="session-hover-context">${isTask ? 'Task' : this.escapeHtml(this.projectDisplayName(project))}</div>
+      ${!isTask && project.branch ? `<div class="session-hover-context branch">${this.escapeHtml(project.branch)}</div>` : ''}
+    `;
+    const rect = item.getBoundingClientRect();
+    this.hoverCard.style.left = `${rect.right + 10}px`;
+    this.hoverCard.style.top = '12px';
+    this.hoverCard.classList.add('visible');
+    this.hoverCard.style.top = `${Math.max(12, Math.min(rect.top, window.innerHeight - this.hoverCard.offsetHeight - 12))}px`;
+  }
+
+  hideSessionHoverCard() {
+    this.hoverCard.classList.remove('visible');
+  }
+
   render() {
-    if (this.projects.length === 0) {
+    this.hideSessionHoverCard();
+    if (this.projects.length === 0 && !this.tasks?.sessions?.length) {
       this.container.innerHTML = '<div class="session-loading">No sessions found</div>';
       return;
     }
 
     this.container.innerHTML = '';
 
-    const visibleProjects = this.projects.filter(project => !this.isProjectHidden(project));
+    const visibleProjects = this.orderedProjects(this.projects.filter(project => !this.isProjectHidden(project)));
     const hiddenProjects = this.projects.filter(project => this.isProjectHidden(project));
 
-    // Favourites section — collect from visible projects
+    // Favourites are shortcuts, so they remain reachable even when their project is hidden.
     const favSessions = [];
-    for (const project of visibleProjects) {
+    for (const project of this.allGroups()) {
       for (const session of project.sessions) {
         if (this.isFavourite(session.filePath)) {
-          favSessions.push({ session, project });
+          favSessions.push({ session, project, isTask: project === this.tasks });
         }
       }
     }
@@ -477,41 +663,45 @@ export class SessionSidebar {
       favGroup.className = 'favourites-group';
 
       const header = document.createElement('div');
-      header.className = 'project-header favourites-header';
-      header.innerHTML = `<span class="fav-star">★</span> <span>Favourites</span> <span class="project-count">${favSessions.length}</span>`;
+      header.className = `project-header favourites-header${this.favouritesOpen ? '' : ' collapsed'}`;
+      header.setAttribute('role', 'button');
+      header.tabIndex = 0;
+      header.innerHTML = `<span class="chevron">▼</span><span class="fav-star">★</span> <span>Favourites</span> <span class="project-count">${favSessions.length}</span>`;
+      const toggleFavourites = () => {
+        this.commitPreferenceMutation({ type: 'toggle_section', section: 'favourites' });
+      };
+      header.addEventListener('click', toggleFavourites);
+      header.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          toggleFavourites();
+        }
+      });
       favGroup.appendChild(header);
 
       const sessionsDiv = document.createElement('div');
-      sessionsDiv.className = 'project-sessions';
-      for (const { session, project } of favSessions) {
-        sessionsDiv.appendChild(this.buildSessionItem(session, project));
+      sessionsDiv.className = `project-sessions${this.favouritesOpen ? '' : ' collapsed'}`;
+      for (const { session, project, isTask } of favSessions) {
+        sessionsDiv.appendChild(this.buildSessionItem(session, project, isTask));
       }
       favGroup.appendChild(sessionsDiv);
       this.container.appendChild(favGroup);
     }
 
-    const scopedProjects = visibleProjects.slice(0, 6);
-    const archivedProjects = visibleProjects.slice(6);
+    this.appendCollapsibleSection('Projects', visibleProjects.length, this.projectsOpen, () => {
+      this.commitPreferenceMutation({ type: 'toggle_section', section: 'projects' });
+    });
+    if (this.projectsOpen) this.appendProjectSection('', visibleProjects, false);
 
-    this.appendProjectSection('Scoped Projects', scopedProjects, true);
-
-    if (archivedProjects.length > 0) {
-      const header = document.createElement('button');
-      header.type = 'button';
-      header.className = `sidebar-section-header${this.archivedProjectsOpen ? '' : ' collapsed'}`;
-      header.innerHTML = `
-        <span>Archived Projects</span>
-        <span class="project-count">${archivedProjects.length}</span>
-      `;
-      header.addEventListener('click', () => {
-        this.archivedProjectsOpen = !this.archivedProjectsOpen;
-        localStorage.setItem('tau-sidebar-archived-open', String(this.archivedProjectsOpen));
-        this.render();
-      });
-      this.container.appendChild(header);
-      if (this.archivedProjectsOpen) {
-        this.appendProjectSection('', archivedProjects, true);
-      }
+    const taskCount = this.tasks?.sessions?.length || 0;
+    this.appendCollapsibleSection('Tasks', taskCount, this.tasksOpen, () => {
+      this.commitPreferenceMutation({ type: 'toggle_section', section: 'tasks' });
+    });
+    if (this.tasksOpen && this.tasks) {
+      const sessionsDiv = document.createElement('div');
+      sessionsDiv.className = 'task-sessions';
+      for (const session of this.tasks.sessions) sessionsDiv.appendChild(this.buildSessionItem(session, this.tasks, true));
+      this.container.appendChild(sessionsDiv);
     }
 
     if (hiddenProjects.length > 0) {
@@ -523,9 +713,7 @@ export class SessionSidebar {
         <span class="project-count">${hiddenProjects.length}</span>
       `;
       header.addEventListener('click', () => {
-        this.hiddenProjectsOpen = !this.hiddenProjectsOpen;
-        localStorage.setItem('tau-sidebar-hidden-open', String(this.hiddenProjectsOpen));
-        this.render();
+        this.commitPreferenceMutation({ type: 'toggle_section', section: 'hiddenProjects' });
       });
       this.container.appendChild(header);
       if (this.hiddenProjectsOpen) {
@@ -534,6 +722,15 @@ export class SessionSidebar {
     }
 
     if (this.searchQuery) this.applySearch();
+  }
+
+  appendCollapsibleSection(title, count, open, onClick) {
+    const header = document.createElement('button');
+    header.type = 'button';
+    header.className = `sidebar-section-header${open ? '' : ' collapsed'}`;
+    header.innerHTML = `<span>${this.escapeHtml(title)}</span><span class="project-count">${count}</span>`;
+    header.addEventListener('click', onClick);
+    this.container.appendChild(header);
   }
 
   appendProjectSection(title, projects, showHeader) {
@@ -550,7 +747,8 @@ export class SessionSidebar {
     for (const project of projects) {
       const group = document.createElement('div');
       group.className = 'project-group';
-      const isCollapsed = this.collapsedProjects.has(project.dirName);
+      group.dataset.projectPath = project.path;
+      const isCollapsed = this.collapsedProjects.has(project.path);
 
       const header = document.createElement('div');
       header.className = `project-header${isCollapsed ? ' collapsed' : ''}`;
@@ -559,22 +757,19 @@ export class SessionSidebar {
 
       header.innerHTML = `
         <span class="chevron">▼</span>
+        ${this.pinnedProjects.includes(project.path) ? '<span class="project-pin" aria-label="Pinned">●</span>' : ''}
         <span class="project-title" title="${this.escapeHtml(project.path)}">${this.escapeHtml(shortPath)}</span>
         <span class="project-count">${project.sessions.length}</span>
         <button type="button" class="project-menu-btn" aria-label="Project actions">•••</button>
       `;
 
       header.addEventListener('click', () => {
-        if (this.collapsedProjects.has(project.dirName)) {
-          this.collapsedProjects.delete(project.dirName);
-        } else {
-          this.collapsedProjects.add(project.dirName);
-        }
-        header.classList.toggle('collapsed');
-        sessionsDiv.classList.toggle('collapsed');
+        this.commitPreferenceMutation({ type: 'toggle_project_collapsed', projectPath: project.path });
       });
 
       header.querySelector('.project-menu-btn')?.addEventListener('click', (e) => this.showProjectMenu(e, project));
+      header.addEventListener('contextmenu', (e) => this.showProjectMenu(e, project));
+      header.addEventListener('pointerdown', (event) => this.startProjectPointerDrag(event, project, group));
       group.appendChild(header);
 
       const sessionsDiv = document.createElement('div');

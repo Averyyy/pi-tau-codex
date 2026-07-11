@@ -104,6 +104,17 @@ Environment variables (set before starting Pi):
 | `TAU_DISABLED`    | `0`         | Set to `1` to disable Tau (it stays installed but won't start the server)    |
 | `TAU_USER`        | *(none)*    | HTTP Basic Auth username (both `TAU_USER` and `TAU_PASS` required to enable) |
 | `TAU_PASS`        | *(none)*    | HTTP Basic Auth password                                                     |
+| `TAU_LINUX_TERMINAL` | *(required for web-launched Pi on Linux)* | Terminal to open: `gnome-terminal`, `konsole`, `kitty`, `alacritty`, `wezterm`, or `xterm` |
+
+### Interactive session launch
+
+Starting or resuming a session from Tau opens Pi in a real terminal, so the Pi TUI stays usable alongside the browser. macOS opens Terminal and Windows opens a visible PowerShell window. On Linux, set an explicit supported terminal before starting Pi, for example:
+
+```bash
+TAU_LINUX_TERMINAL=gnome-terminal pi
+```
+
+Tau checks both that terminal and `pi` are executable before it opens the new session. An absent or unsupported Linux terminal setting is returned as an actionable launch error instead of starting Pi without a TTY.
 
 ### Authentication
 

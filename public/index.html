@@ -12,6 +12,7 @@
   <meta name="apple-mobile-web-app-title" content="Pi Tau">
   <meta name="theme-color" content="#f5f3ef">
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="extension-tui.css">
   <!-- KaTeX for math rendering -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.css">
   <script src="https://cdn.jsdelivr.net/npm/katex@0.16.21/dist/katex.min.js"></script>
@@ -58,7 +59,6 @@
             </button>
             <div class="model-dropdown-menu hidden" id="model-dropdown-menu"></div>
           </div>
-          <button class="thinking-tag" id="thinking-btn" title="Set thinking level">off</button>
         </div>
         <div class="header-right">
           <div class="pill session-cost" id="session-cost" title="Session cost"></div>
@@ -185,7 +185,7 @@
   <div class="settings-panel hidden" id="settings-panel">
     <div class="settings-header">
       <h3>Settings</h3>
-      <button class="settings-close" id="settings-close"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+      <button class="settings-close" id="settings-close" aria-label="Close settings" title="Close settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
     </div>
     <div class="settings-body">
       <div class="settings-tabs" id="settings-tabs">
@@ -199,14 +199,6 @@
         <div class="settings-tab-panel active" data-panel="general">
           <div class="settings-section">
             <div class="settings-section-title">Agent</div>
-            <div class="settings-row" id="setting-auto-compact">
-              <span class="settings-label">Auto-compaction</span>
-              <button class="settings-toggle" id="toggle-auto-compact"></button>
-            </div>
-            <div class="settings-row" id="setting-thinking">
-              <span class="settings-label">Thinking level</span>
-              <button class="settings-value-btn" id="btn-thinking-level"></button>
-            </div>
             <label class="settings-field">
               <span class="settings-label">Default provider</span>
               <input class="settings-input wide" id="settings-default-provider" type="text">

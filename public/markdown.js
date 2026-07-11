@@ -264,81 +264,169 @@ export function renderUserMarkdown(text) {
   return html.replace(/\n$/, '');
 }
 
+/**
+ * Content from a session is untrusted, even when it was produced by Pi.  Inline
+ * parsing therefore keeps raw text and generated markup in separate segments:
+ * user text is escaped exactly once and only renderer-owned fragments become HTML.
+ */
 function renderInline(text) {
-  // Inline code (must come first to protect content)
-  const codeSpans = [];
-  text = text.replace(/`([^`]+)`/g, (_, code) => {
-    const idx = codeSpans.length;
-    codeSpans.push(`<code>${escapeHtml(code)}</code>`);
-    return `%%ICODE${idx}%%`;
+  let segments = [{ type: 'text', value: String(text ?? '') }];
+
+  // Inline code and math must be protected before emphasis parsing.
+  segments = replaceTextSegments(segments, /`([^`]+)`/g, (_, code) => ({
+    type: 'html',
+    value: `<code>${escapeHtml(code)}</code>`,
+  }));
+  segments = replaceTextSegments(segments, /\$\$([\s\S]*?)\$\$/g, (match) => ({
+    type: 'html',
+    value: escapeHtml(match),
+  }));
+  segments = replaceTextSegments(segments, /\$(?=[^\d\s])[^$\n]+?(?<=\S)\$/g, (match) => ({
+    type: 'html',
+    value: escapeHtml(match),
+  }));
+
+  // Images precede links so the leading ! is retained as image syntax.
+  segments = replaceTextSegments(segments, /!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, url) => {
+    const safeUrl = sanitizeUrl(url, { image: true });
+    return safeUrl
+      ? { type: 'html', value: `<img src="${escapeHtml(safeUrl)}" alt="${escapeHtml(alt)}" class="inline-image">` }
+      : { type: 'html', value: escapeHtml(match) };
+  });
+  segments = replaceTextSegments(segments, /\[([^\]]+)\]\(([^)]+)\)/g, (match, label, url) => {
+    const safeUrl = sanitizeUrl(url);
+    return safeUrl
+      ? { type: 'html', value: createLinkHtml(label, safeUrl) }
+      : { type: 'html', value: escapeHtml(match) };
+  });
+  segments = replaceTextSegments(segments, /(^|[^"'])(https?:\/\/[^\s<>"']+)/g, (match, prefix, url) => {
+    const safeUrl = sanitizeUrl(url);
+    if (!safeUrl) return { type: 'html', value: escapeHtml(match) };
+    return {
+      type: 'html',
+      value: `${escapeHtml(prefix)}${createLinkHtml(url, safeUrl)}`,
+    };
   });
 
-  // Math (protect $$...$$ and $...$ before *, _, etc. corrupt them)
-  const mathSpans = [];
-  // $$...$$ first (greedy, for display math appearing inline or in lists)
-  text = text.replace(/\$\$([\s\S]*?)\$\$/g, (match) => {
-    const idx = mathSpans.length;
-    mathSpans.push(match);
-    return `%%MATHX${idx}%%`;
-  });
-  // Then $...$ (inline math — opening $ not followed by digit/space).
-  // This avoids matching currency amounts like $100.
-  text = text.replace(/\$(?=[^\d\s])[^$\n]+?(?<=\S)\$/g, (match) => {
-    const idx = mathSpans.length;
-    mathSpans.push(match);
-    return `%%MATHX${idx}%%`;
-  });
+  return segments.map((segment) => {
+    if (segment.type === 'html') return segment.value;
+    return renderFormattedText(segment.value);
+  }).join('');
+}
 
-  // Images (before links so ![...](...) isn't caught by link regex)
-  text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" class="inline-image">');
+function replaceTextSegments(segments, pattern, createSegment) {
+  const result = [];
+  for (const segment of segments) {
+    if (segment.type !== 'text') {
+      result.push(segment);
+      continue;
+    }
 
-  // Bold + italic
-  text = text.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+    let lastIndex = 0;
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(segment.value)) !== null) {
+      if (match.index > lastIndex) {
+        result.push({ type: 'text', value: segment.value.slice(lastIndex, match.index) });
+      }
+      result.push(createSegment(...match));
+      lastIndex = pattern.lastIndex;
+    }
+    if (lastIndex < segment.value.length || lastIndex === 0) {
+      result.push({ type: 'text', value: segment.value.slice(lastIndex) });
+    }
+  }
+  return result;
+}
 
-  // Bold
-  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  text = text.replace(/__(.+?)__/g, '<strong>$1</strong>');
+function renderFormattedText(text) {
+  let html = escapeHtml(text);
+  html = html.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/__(.+?)__/g, '<strong>$1</strong>');
+  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  html = html.replace(/_(.+?)_/g, '<em>$1</em>');
+  return html.replace(/~~(.+?)~~/g, '<del>$1</del>');
+}
 
-  // Italic
-  text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
-  text = text.replace(/_(.+?)_/g, '<em>$1</em>');
+function createLinkHtml(label, url) {
+  return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${renderFormattedText(label)}</a>`;
+}
 
-  // Strikethrough
-  text = text.replace(/~~(.+?)~~/g, '<del>$1</del>');
+const SAFE_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
+const SAFE_IMAGE_PROTOCOLS = new Set(['http:', 'https:']);
+const SAFE_IMAGE_MIME_TYPES = new Set([
+  'image/avif',
+  'image/gif',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+]);
+const BASE64_IMAGE_DATA = /^data:(image\/(?:avif|gif|jpeg|png|webp));base64,([A-Za-z0-9+/]+={0,2})$/i;
+const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 
-  // Links
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+/**
+ * Accept normal web links, mailto links, and same-origin relative paths only.
+ * Rejecting every other scheme keeps markdown from turning stored content into
+ * executable navigation such as javascript: or data: URLs.
+ */
+export function sanitizeUrl(value, { image = false } = {}) {
+  if (typeof value !== 'string') return null;
+  const url = value.trim();
+  if (!url || /[\u0000-\u001F\u007F\s]/.test(url)) return null;
 
-  // Auto-link bare URLs
-  text = text.replace(/(^|[^"'])(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+  const protocols = image ? SAFE_IMAGE_PROTOCOLS : SAFE_LINK_PROTOCOLS;
+  const scheme = url.match(/^([a-z][a-z0-9+.-]*):/i);
+  if (scheme) {
+    return protocols.has(scheme[1].toLowerCase() + ':') ? url : null;
+  }
 
-  // Restore math (before inline code so math inside code stays as code)
-  text = text.replace(/%%MATHX(\d+)%%/g, (_, idx) => mathSpans[parseInt(idx)]);
+  if (url.startsWith('//')) return protocols.has('https:') ? url : null;
+  if (url.includes(':')) return null;
+  return url;
+}
 
-  // Restore inline code
-  text = text.replace(/%%ICODE(\d+)%%/g, (_, idx) => codeSpans[parseInt(idx)]);
+/**
+ * Pi stores image payloads in session JSONL, so validate them before assigning
+ * src. Raster-only data URLs avoid accepting an executable SVG or HTML payload.
+ */
+export function sanitizeImageSource(image) {
+  if (!image || typeof image.data !== 'string') return null;
+  const data = image.data.trim();
+  if (!data) return null;
 
-  return text;
+  if (data.startsWith('data:')) {
+    return BASE64_IMAGE_DATA.test(data) ? data : null;
+  }
+
+  const mimeType = typeof image.mimeType === 'string' && image.mimeType
+    ? image.mimeType.toLowerCase()
+    : 'image/png';
+  if (!SAFE_IMAGE_MIME_TYPES.has(mimeType) || !BASE64.test(data)) return null;
+  return `data:${mimeType};base64,${data}`;
 }
 
 function escapeHtml(text) {
-  return text
+  return String(text ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // Global copy function for code blocks
-window.copyCode = function(btn) {
-  const codeBlock = btn.closest('.code-block-wrapper').querySelector('code');
-  const text = codeBlock.textContent;
-  navigator.clipboard.writeText(text).then(() => {
-    btn.textContent = 'Copied!';
-    btn.classList.add('copied');
-    setTimeout(() => {
-      btn.textContent = 'Copy';
-      btn.classList.remove('copied');
-    }, 2000);
-  });
-};
+if (typeof window !== 'undefined') {
+  window.copyCode = function(btn) {
+    const codeBlock = btn.closest('.code-block-wrapper').querySelector('code');
+    const text = codeBlock.textContent;
+    navigator.clipboard.writeText(text).then(() => {
+      btn.textContent = 'Copied!';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = 'Copy';
+        btn.classList.remove('copied');
+      }, 2000);
+    });
+  };
+}

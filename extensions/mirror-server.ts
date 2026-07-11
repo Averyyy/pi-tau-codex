@@ -16,8 +16,23 @@ import * as http from "node:http";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { execFileSync } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import QRCode from "qrcode";
+import {
+  dispatchBrowserInput,
+  hasBrowserInputListener,
+  sameBrowserInputOwner,
+} from "./browser-input-bridge.js";
+import {
+  createLaunchEnvironment,
+  createLinuxTerminalLaunch,
+  createWindowsTerminalLaunch,
+  requireLinuxExecutable,
+  requireSupportedLinuxTerminal,
+} from "./interactive-launch.ts";
+import { resolveSessionFilePath } from "./session-file-paths.ts";
 
 // Load tau settings from ~/.pi/agent/settings.json (falls back to env vars)
 function loadTauSettings(): { port: number; host: string; autoStart: boolean; user: string; pass: string; authEnabled?: boolean; projectsDir?: string } {
@@ -98,32 +113,20 @@ const SESSIONS_DIR = process.env.PI_CODING_AGENT_SESSION_DIR || path.join(PI_AGE
 const INSTANCES_DIR = path.join(USER_HOME, ".pi", "tau-instances");
 const PI_SETTINGS_PATH = path.join(PI_AGENT_DIR, "settings.json");
 const PI_AGENTS_PATH = path.join(PI_AGENT_DIR, "AGENTS.md");
+const SIDEBAR_PREFERENCES_PATH = path.join(PI_AGENT_DIR, "tau-sidebar.json");
+const SIDEBAR_PREFERENCES_LOCK_PATH = `${SIDEBAR_PREFERENCES_PATH}.lock`;
+const SIDEBAR_PREFERENCES_LOCK_TIMEOUT_MS = 5_000;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const LAUNCH_TIMEOUT_MS = 20_000;
 
-const BUILTIN_COMMANDS = [
-  { name: "settings", description: "Open settings", source: "builtin" },
-  { name: "model", description: "Select or search models", source: "builtin" },
-  { name: "scoped-models", description: "Configure scoped models", source: "builtin" },
-  { name: "export", description: "Export the current session", source: "builtin" },
-  { name: "import", description: "Import a session", source: "builtin" },
-  { name: "share", description: "Share the current session", source: "builtin" },
-  { name: "copy", description: "Copy the latest assistant message", source: "builtin" },
-  { name: "name", description: "Rename this session", source: "builtin" },
-  { name: "session", description: "Show current session details", source: "builtin" },
-  { name: "changelog", description: "Show changelog", source: "builtin" },
-  { name: "hotkeys", description: "Show keyboard shortcuts", source: "builtin" },
-  { name: "fork", description: "Fork this session", source: "builtin" },
-  { name: "clone", description: "Clone the current branch", source: "builtin" },
-  { name: "tree", description: "Open the conversation tree", source: "builtin" },
-  { name: "trust", description: "Manage project trust", source: "builtin" },
-  { name: "login", description: "Sign in", source: "builtin" },
-  { name: "logout", description: "Sign out", source: "builtin" },
-  { name: "new", description: "Start a new session", source: "builtin" },
-  { name: "compact", description: "Compact context", source: "builtin" },
-  { name: "resume", description: "Resume a previous session", source: "builtin" },
-  { name: "reload", description: "Reload configuration", source: "builtin" },
-  { name: "quit", description: "Quit Pi", source: "builtin" },
-];
+type TauInstance = {
+  port: number;
+  pid: number;
+  sessionFile: string;
+  cwd: string;
+  startedAt: string;
+  launchId?: string;
+};
 
 function readAgentSettings(): Record<string, unknown> {
   if (!fs.existsSync(PI_SETTINGS_PATH)) return {};
@@ -135,20 +138,340 @@ function writeAgentSettings(settings: Record<string, unknown>) {
   fs.writeFileSync(PI_SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
 }
 
+type SidebarSectionPreferences = {
+  favouritesOpen: boolean;
+  projectsOpen: boolean;
+  tasksOpen: boolean;
+  hiddenProjectsOpen: boolean;
+};
+
+type SidebarPreferences = {
+  revision: number;
+  favourites: string[];
+  hiddenProjects: string[];
+  projectNames: Record<string, string>;
+  projectOrder: string[];
+  pinnedProjects: string[];
+  collapsedProjects: string[];
+  sections: SidebarSectionPreferences;
+};
+
+function defaultSidebarPreferences(): SidebarPreferences {
+  return {
+    revision: 0,
+    favourites: [],
+    hiddenProjects: [],
+    projectNames: {},
+    projectOrder: [],
+    pinnedProjects: [],
+    collapsedProjects: [],
+    sections: {
+      favouritesOpen: true,
+      projectsOpen: true,
+      tasksOpen: true,
+      hiddenProjectsOpen: false,
+    },
+  };
+}
+
+function sidebarStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string" || !entry || seen.has(entry)) continue;
+    seen.add(entry);
+    result.push(entry);
+  }
+  return result;
+}
+
+function requireSidebarPreferenceStringList(value: unknown, name: string): string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry)) {
+    throw new Error(`${name} must be a string array`);
+  }
+  const result = [...value] as string[];
+  if (new Set(result).size !== result.length) {
+    throw new Error(`${name} must not contain duplicates`);
+  }
+  return result;
+}
+
+function normalizeSidebarPreferences(value: unknown): SidebarPreferences {
+  const raw = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const rawSections = raw.sections && typeof raw.sections === "object"
+    ? raw.sections as Record<string, unknown>
+    : {};
+  const rawNames = raw.projectNames && typeof raw.projectNames === "object"
+    ? raw.projectNames as Record<string, unknown>
+    : {};
+  const projectNames: Record<string, string> = {};
+  for (const [projectPath, name] of Object.entries(rawNames)) {
+    if (typeof name === "string" && name) projectNames[projectPath] = name;
+  }
+  return {
+    revision: typeof raw.revision === "number" && Number.isSafeInteger(raw.revision) && raw.revision >= 0
+      ? raw.revision
+      : 0,
+    favourites: sidebarStringList(raw.favourites),
+    hiddenProjects: sidebarStringList(raw.hiddenProjects),
+    projectNames,
+    projectOrder: sidebarStringList(raw.projectOrder),
+    pinnedProjects: sidebarStringList(raw.pinnedProjects),
+    collapsedProjects: sidebarStringList(raw.collapsedProjects),
+    sections: {
+      favouritesOpen: rawSections.favouritesOpen !== false,
+      projectsOpen: rawSections.projectsOpen !== false,
+      tasksOpen: rawSections.tasksOpen !== false,
+      hiddenProjectsOpen: rawSections.hiddenProjectsOpen === true,
+    },
+  };
+}
+
+function readSidebarPreferences(): SidebarPreferences {
+  if (!fs.existsSync(SIDEBAR_PREFERENCES_PATH)) return defaultSidebarPreferences();
+  return normalizeSidebarPreferences(JSON.parse(fs.readFileSync(SIDEBAR_PREFERENCES_PATH, "utf8")));
+}
+
+function writeSidebarPreferences(preferences: SidebarPreferences) {
+  fs.mkdirSync(PI_AGENT_DIR, { recursive: true });
+  const pendingPath = `${SIDEBAR_PREFERENCES_PATH}.${randomUUID()}.tmp`;
+  fs.writeFileSync(pendingPath, JSON.stringify(preferences, null, 2) + "\n");
+  fs.renameSync(pendingPath, SIDEBAR_PREFERENCES_PATH);
+}
+
+function removeDeadSidebarPreferencesLock(): boolean {
+  try {
+    const owner = fs.readFileSync(SIDEBAR_PREFERENCES_LOCK_PATH, "utf8").trim();
+    const ownerPid = Number(owner);
+    if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return false;
+    try {
+      process.kill(ownerPid, 0);
+      return false;
+    } catch (error: any) {
+      if (error?.code !== "ESRCH") return false;
+      fs.unlinkSync(SIDEBAR_PREFERENCES_LOCK_PATH);
+      return true;
+    }
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return true;
+    throw error;
+  }
+}
+
+async function withSidebarPreferencesLock<T>(operation: () => T | Promise<T>): Promise<T> {
+  const deadline = Date.now() + SIDEBAR_PREFERENCES_LOCK_TIMEOUT_MS;
+  let lockFd = -1;
+
+  while (lockFd === -1) {
+    try {
+      lockFd = fs.openSync(SIDEBAR_PREFERENCES_LOCK_PATH, "wx", 0o600);
+      fs.writeFileSync(lockFd, String(process.pid));
+    } catch (error: any) {
+      if (lockFd !== -1) {
+        fs.closeSync(lockFd);
+        fs.unlinkSync(SIDEBAR_PREFERENCES_LOCK_PATH);
+      }
+      lockFd = -1;
+      if (error?.code !== "EEXIST") throw error;
+      if (removeDeadSidebarPreferencesLock()) continue;
+      if (Date.now() >= deadline) throw new Error("Sidebar preferences are busy");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+
+  try {
+    return await operation();
+  } finally {
+    fs.closeSync(lockFd);
+    fs.unlinkSync(SIDEBAR_PREFERENCES_LOCK_PATH);
+  }
+}
+
+function requireSidebarPreferenceString(value: unknown, name: string): string {
+  if (typeof value !== "string" || !value) throw new Error(`${name} required`);
+  return value;
+}
+
+function toggleSidebarPreferenceList(list: string[], value: string) {
+  const index = list.indexOf(value);
+  if (index === -1) list.push(value);
+  else list.splice(index, 1);
+}
+
+function applySidebarPreferencesMutation(preferences: SidebarPreferences, mutation: any): SidebarPreferences {
+  if (!mutation || typeof mutation !== "object") throw new Error("mutation required");
+  const type = mutation.type;
+
+  switch (type) {
+    case "toggle_favourite":
+      toggleSidebarPreferenceList(preferences.favourites, requireSidebarPreferenceString(mutation.filePath, "filePath"));
+      break;
+    case "remove_session": {
+      const filePath = requireSidebarPreferenceString(mutation.filePath, "filePath");
+      preferences.favourites = preferences.favourites.filter((entry) => entry !== filePath);
+      break;
+    }
+    case "toggle_project_hidden":
+      toggleSidebarPreferenceList(preferences.hiddenProjects, requireSidebarPreferenceString(mutation.projectPath, "projectPath"));
+      break;
+    case "toggle_project_pinned": {
+      const projectPath = requireSidebarPreferenceString(mutation.projectPath, "projectPath");
+      const index = preferences.pinnedProjects.indexOf(projectPath);
+      if (index === -1) preferences.pinnedProjects.unshift(projectPath);
+      else preferences.pinnedProjects.splice(index, 1);
+      break;
+    }
+    case "set_project_name": {
+      const projectPath = requireSidebarPreferenceString(mutation.projectPath, "projectPath");
+      if (mutation.name === null || mutation.name === "") {
+        delete preferences.projectNames[projectPath];
+      } else if (typeof mutation.name === "string") {
+        preferences.projectNames[projectPath] = mutation.name;
+      } else {
+        throw new Error("name must be a string or null");
+      }
+      break;
+    }
+    case "toggle_project_collapsed":
+      toggleSidebarPreferenceList(preferences.collapsedProjects, requireSidebarPreferenceString(mutation.projectPath, "projectPath"));
+      break;
+    case "normalize_collapsed_projects": {
+      if (!Array.isArray(mutation.mappings)) throw new Error("mappings required");
+      const collapsed = new Set(preferences.collapsedProjects);
+      for (const mapping of mutation.mappings) {
+        const projectPath = requireSidebarPreferenceString(mapping?.projectPath, "projectPath");
+        const legacyKey = requireSidebarPreferenceString(mapping?.legacyKey, "legacyKey");
+        if (collapsed.has(legacyKey) && !collapsed.has(projectPath)) {
+          collapsed.delete(legacyKey);
+          collapsed.add(projectPath);
+        }
+      }
+      preferences.collapsedProjects = [...collapsed];
+      break;
+    }
+    case "set_section_open": {
+      const section = requireSidebarPreferenceString(mutation.section, "section");
+      if (typeof mutation.open !== "boolean") throw new Error("open must be a boolean");
+      const sectionKey = `${section}Open` as keyof SidebarSectionPreferences;
+      if (!(sectionKey in preferences.sections)) throw new Error("Unknown sidebar section");
+      preferences.sections[sectionKey] = mutation.open;
+      break;
+    }
+    case "toggle_section": {
+      const section = requireSidebarPreferenceString(mutation.section, "section");
+      const sectionKey = `${section}Open` as keyof SidebarSectionPreferences;
+      if (!(sectionKey in preferences.sections)) throw new Error("Unknown sidebar section");
+      preferences.sections[sectionKey] = !preferences.sections[sectionKey];
+      break;
+    }
+    case "move_project": {
+      const sourcePath = requireSidebarPreferenceString(mutation.sourcePath, "sourcePath");
+      const targetPath = requireSidebarPreferenceString(mutation.targetPath, "targetPath");
+      if (sourcePath === targetPath) throw new Error("sourcePath and targetPath must differ");
+      if (!Array.isArray(mutation.projectPaths)) throw new Error("projectPaths required");
+      const projectPaths = sidebarStringList(mutation.projectPaths);
+      if (!projectPaths.includes(sourcePath) || !projectPaths.includes(targetPath)) {
+        throw new Error("Project order must include source and target");
+      }
+
+      const sourcePinned = preferences.pinnedProjects.includes(sourcePath);
+      const targetPinned = preferences.pinnedProjects.includes(targetPath);
+      if (sourcePinned !== targetPinned) {
+        throw new Error("Pinned projects can only be reordered with pinned projects");
+      }
+
+      if (sourcePinned) {
+        const pinnedProjectPaths = requireSidebarPreferenceStringList(
+          mutation.pinnedProjectPaths,
+          "pinnedProjectPaths",
+        );
+        const currentPinned = preferences.pinnedProjects;
+        if (
+          pinnedProjectPaths.length !== currentPinned.length ||
+          pinnedProjectPaths.some((projectPath) => !currentPinned.includes(projectPath))
+        ) {
+          throw new Error("pinnedProjectPaths must preserve pinned project membership");
+        }
+
+        const reordered = [...currentPinned];
+        reordered.splice(reordered.indexOf(sourcePath), 1);
+        const targetIndex = reordered.indexOf(targetPath);
+        reordered.splice(targetIndex + (mutation.insertAfter === true ? 1 : 0), 0, sourcePath);
+        preferences.pinnedProjects = reordered;
+        break;
+      }
+
+      if (mutation.pinnedProjectPaths !== undefined) {
+        throw new Error("pinnedProjectPaths is only valid for pinned project reordering");
+      }
+      const visibleProjectPaths = new Set(projectPaths);
+      const existing = preferences.projectOrder.filter((entry) => visibleProjectPaths.has(entry));
+      const missing = projectPaths.filter((entry) => !existing.includes(entry));
+      const other = preferences.projectOrder.filter((entry) => !visibleProjectPaths.has(entry));
+      const ordered = [...existing, ...missing, ...other];
+      const from = ordered.indexOf(sourcePath);
+      ordered.splice(from, 1);
+      const targetIndex = ordered.indexOf(targetPath);
+      ordered.splice(targetIndex + (mutation.insertAfter === true ? 1 : 0), 0, sourcePath);
+      preferences.projectOrder = ordered;
+      break;
+    }
+    default:
+      throw new Error("Unknown sidebar preference mutation");
+  }
+
+  preferences.revision += 1;
+  return preferences;
+}
+
+async function mutateSidebarPreferences(mutation: any): Promise<SidebarPreferences> {
+  return withSidebarPreferencesLock(() => {
+    const exists = fs.existsSync(SIDEBAR_PREFERENCES_PATH);
+    if (mutation?.type === "bootstrap") {
+      const preferences = exists
+        ? readSidebarPreferences()
+        : normalizeSidebarPreferences(mutation.preferences);
+      if (!exists) {
+        preferences.revision = 1;
+        writeSidebarPreferences(preferences);
+      }
+      return preferences;
+    }
+    const preferences = applySidebarPreferencesMutation(readSidebarPreferences(), mutation);
+    writeSidebarPreferences(preferences);
+    return preferences;
+  });
+}
+
 // Instance registry — tracks all running Tau servers
-function registerInstance(port: number, sessionFile: string, cwd: string) {
+function writeInstanceFile(info: TauInstance) {
   fs.mkdirSync(INSTANCES_DIR, { recursive: true });
-  const info = { port, pid: process.pid, sessionFile, cwd, startedAt: new Date().toISOString() };
-  fs.writeFileSync(path.join(INSTANCES_DIR, `${process.pid}.json`), JSON.stringify(info));
+  const file = path.join(INSTANCES_DIR, `${info.pid}.json`);
+  const pendingFile = `${file}.${randomUUID()}.tmp`;
+  fs.writeFileSync(pendingFile, JSON.stringify(info));
+  fs.renameSync(pendingFile, file);
+}
+
+function registerInstance(port: number, sessionFile: string, cwd: string) {
+  const info: TauInstance = {
+    port,
+    pid: process.pid,
+    sessionFile,
+    cwd,
+    startedAt: new Date().toISOString(),
+    launchId: process.env.TAU_LAUNCH_ID || undefined,
+  };
+  writeInstanceFile(info);
 }
 
 function updateInstanceSession(sessionFile: string) {
   const file = path.join(INSTANCES_DIR, `${process.pid}.json`);
   if (!fs.existsSync(file)) return;
   try {
-    const info = JSON.parse(fs.readFileSync(file, "utf8"));
+    const info = JSON.parse(fs.readFileSync(file, "utf8")) as TauInstance;
     info.sessionFile = sessionFile;
-    fs.writeFileSync(file, JSON.stringify(info));
+    writeInstanceFile(info);
   } catch {}
 }
 
@@ -156,9 +479,9 @@ function unregisterInstance() {
   try { fs.unlinkSync(path.join(INSTANCES_DIR, `${process.pid}.json`)); } catch {}
 }
 
-function getRunningInstances(): Array<{ port: number; pid: number; sessionFile: string; cwd: string }> {
+function getRunningInstances(): TauInstance[] {
   if (!fs.existsSync(INSTANCES_DIR)) return [];
-  const instances: any[] = [];
+  const instances: TauInstance[] = [];
   for (const file of fs.readdirSync(INSTANCES_DIR)) {
     if (!file.endsWith(".json")) continue;
     try {
@@ -248,18 +571,113 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function launchPi(projectPath: string, options: { sessionFile?: string; message?: string } = {}) {
+function launchInteractiveTerminal(
+  command: string,
+  args: string[],
+  projectPath: string,
+  launchId: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: projectPath,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false,
+      env: createLaunchEnvironment(launchId, process.env),
+    });
+    child.once("error", reject);
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
+}
+
+async function launchPi(
+  projectPath: string,
+  launchId: string,
+  options: { sessionFile?: string } = {},
+): Promise<void> {
   const args = ["--approve"];
   if (options.sessionFile) args.push("--session", options.sessionFile);
-  if (options.message) args.push(options.message);
-  const command = `cd ${shellQuote(projectPath)} && pi ${args.map(shellQuote).join(" ")}`;
   if (process.platform === "darwin") {
-    execFileSync("osascript", ["-e", `tell app "iTerm2" to create window with default profile command ${JSON.stringify(command)}`]);
+    const piPath = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
+    const command = `cd ${shellQuote(projectPath)} && TAU_LAUNCH_ID=${shellQuote(launchId)} ${shellQuote(piPath)} ${args.map(shellQuote).join(" ")}`;
+    execFileSync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(`${command}; exit`)}`]);
     return;
   }
-  const { spawn } = require("node:child_process");
-  const child = spawn("pi", args, { cwd: projectPath, detached: true, stdio: "ignore" });
-  child.unref();
+  if (process.platform === "win32") {
+    const launch = createWindowsTerminalLaunch(projectPath, launchId, args, process.env);
+    await launchInteractiveTerminal(launch.command, launch.args, projectPath, launchId);
+    return;
+  }
+  if (process.platform === "linux") {
+    const terminal = requireSupportedLinuxTerminal(process.env.TAU_LINUX_TERMINAL);
+    const terminalExecutable = requireLinuxExecutable(terminal, process.env);
+    const piExecutable = requireLinuxExecutable("pi", process.env);
+    const launch = createLinuxTerminalLaunch(terminal, projectPath, piExecutable, args);
+    await launchInteractiveTerminal(terminalExecutable, launch.args, projectPath, launchId);
+    return;
+  }
+  throw new Error(`Tau cannot open an interactive Pi terminal on ${process.platform}`);
+}
+
+function waitForLaunchedInstance(
+  projectPath: string,
+  options: { sessionFile?: string } = {},
+): Promise<TauInstance> {
+  fs.mkdirSync(INSTANCES_DIR, { recursive: true });
+  const launchId = randomUUID();
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let watcher: fs.FSWatcher | null = null;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const finish = (error?: Error, instance?: TauInstance) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      watcher?.close();
+      if (error) reject(error);
+      else if (instance) resolve(instance);
+      else reject(new Error("Tau instance registration was empty"));
+    };
+
+    const inspectRegistration = (filename?: string | Buffer | null) => {
+      const names = filename && filename.toString().endsWith(".json")
+        ? [filename.toString()]
+        : fs.readdirSync(INSTANCES_DIR).filter((name) => name.endsWith(".json"));
+      for (const name of names) {
+        const file = path.join(INSTANCES_DIR, name);
+        if (!fs.existsSync(file)) continue;
+        const instance = JSON.parse(fs.readFileSync(file, "utf8")) as TauInstance;
+        if (instance.launchId === launchId) {
+          finish(undefined, instance);
+          return;
+        }
+      }
+    };
+
+    watcher = fs.watch(INSTANCES_DIR, (_eventType, filename) => {
+      try {
+        inspectRegistration(filename);
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    watcher.on("error", (error) => finish(error));
+    timeout = setTimeout(() => {
+      finish(new Error(`Tau instance did not register within ${LAUNCH_TIMEOUT_MS / 1000} seconds`));
+    }, LAUNCH_TIMEOUT_MS);
+
+    try {
+      void launchPi(projectPath, launchId, options).catch((error) => {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      });
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
 }
 
 function checkBasicAuth(req: http.IncomingMessage): boolean {
@@ -377,12 +795,491 @@ export default function (pi: ExtensionAPI) {
   let devReloadTimer: ReturnType<typeof setTimeout> | null = null;
   const clients = new Set<WebSocket>();
   const devClients = new Set<http.ServerResponse>();
+  const sessionFileCache = new Map<string, { mtimeMs: number; size: number; value: any }>();
+  let sessionTailWatcher: fs.FSWatcher | null = null;
+  let sessionTailDirectoryWatcher: fs.FSWatcher | null = null;
+  let sessionTailFile: string | null = null;
+  let sessionTailOffset = 0;
+  let sessionTailRemainder = Buffer.alloc(0);
 
   // Store latest context reference for use in command handlers
   let latestCtx: ExtensionContext | null = null;
 
-  // Pending RPC-style requests from browser (id -> resolver)
-  const pendingRequests = new Map<string, (response: any) => void>();
+  // Pending browser dialogs follow Pi's RPC UI semantics: callers can cancel
+  // with an AbortSignal, time out, or lose the browser that owns the dialog.
+  type BrowserUIResponse = { cancelled?: boolean; value?: string; confirmed?: boolean };
+  type PendingBrowserUIRequest = {
+    client: WebSocket;
+    resolve: (response: BrowserUIResponse) => void;
+    cleanup: () => void;
+  };
+  type BrowserUIOwner = {
+    client: WebSocket;
+    leaseId: number;
+  };
+  type BrowserUIExecution = {
+    owner: BrowserUIOwner;
+    editorText?: string;
+  };
+  type BrowserUILease = BrowserUIOwner & {
+    inputText: string;
+    inputObserved: boolean;
+    active: boolean;
+  };
+  type BrowserTerminalInputListener = {
+    handler: (data: string) => { consume?: boolean; data?: string } | undefined;
+  };
+  const pendingRequests = new Map<string, PendingBrowserUIRequest>();
+  const extensionStatuses = new Map<string, string>();
+  const extensionWidgets = new Map<string, { lines: string[]; placement?: "aboveEditor" | "belowEditor" }>();
+  type BrowserTuiComponent = {
+    id: string;
+    component: { render(width: number): string[]; handleInput?: (data: string) => void };
+    tui: { requestRender?: (...args: any[]) => unknown };
+    kind: "custom" | "widget";
+    owner?: BrowserUIOwner;
+    placement?: "aboveEditor" | "belowEditor";
+    overlay?: boolean;
+  };
+  type BrowserTuiObserver = {
+    ids: Set<string>;
+    requestRender: (...args: any[]) => unknown;
+  };
+  const browserTuiComponents = new Map<string, BrowserTuiComponent>();
+  const browserTuiObservers = new WeakMap<object, BrowserTuiObserver>();
+  const browserTuiWidths = new WeakMap<WebSocket, number>();
+  let browserTuiSequence = 0;
+  let browserTuiRenderQueued = false;
+  let uiRequestSequence = 0;
+  let proxiedUI: any = null;
+  let browserUILeaseSequence = 0;
+  let browserTerminalInputSequence = 0;
+  let browserUILease: BrowserUILease | null = null;
+  const browserUIExecution = new AsyncLocalStorage<BrowserUIExecution>();
+  const browserTerminalInputListeners = new Map<number, BrowserTerminalInputListener>();
+
+  function isSubagentChild() {
+    return process.env.PI_SUBAGENT_CHILD === "1";
+  }
+
+  function browserUIOwnerIsActive(owner: BrowserUIOwner | undefined) {
+    return !!owner
+      && browserUILease?.active === true
+      && sameBrowserInputOwner(owner, browserUILease)
+      && clients.has(owner.client)
+      && owner.client.readyState === WebSocket.OPEN;
+  }
+
+  function getBrowserUIOwner() {
+    const owner = browserUIExecution.getStore()?.owner;
+    return browserUIOwnerIsActive(owner) ? owner : undefined;
+  }
+
+  function getBrowserUIClient() {
+    return getBrowserUIOwner()?.client;
+  }
+
+  function runWithBrowserUIOwner<T>(owner: BrowserUIOwner, operation: () => T): T {
+    return browserUIExecution.run({ owner }, operation);
+  }
+
+  function runWithBrowserTerminalInput<T>(owner: BrowserUIOwner, editorText: string, operation: () => T): T {
+    return browserUIExecution.run({ owner, editorText }, operation);
+  }
+
+  function hasBrowserTerminalInputListeners() {
+    return hasBrowserInputListener(browserTerminalInputListeners);
+  }
+
+  function acquireBrowserUILease(client: WebSocket, inputText: string): BrowserUIOwner | undefined {
+    if (!clients.has(client)) return undefined;
+    if (browserUILease) releaseBrowserUILease();
+    browserUILease = {
+      client,
+      leaseId: ++browserUILeaseSequence,
+      inputText,
+      inputObserved: false,
+      active: true,
+    };
+    emitBrowserTuiComponents();
+    return { client, leaseId: browserUILease.leaseId };
+  }
+
+  function releaseBrowserUILease(client?: WebSocket) {
+    if (!browserUILease || (client && browserUILease.client !== client)) return;
+    const owner: BrowserUIOwner = {
+      client: browserUILease.client,
+      leaseId: browserUILease.leaseId,
+    };
+    settleBrowserUIRequests((request) => request.client === owner.client, true);
+    browserUILease = null;
+    emitBrowserTuiComponents();
+  }
+
+  function settleBrowserUIRequest(id: string, response: BrowserUIResponse, notifyClient = false) {
+    const request = pendingRequests.get(id);
+    if (!request) return false;
+    pendingRequests.delete(id);
+    request.cleanup();
+    if (notifyClient) {
+      sendTo(request.client, { type: "event", event: { type: "extension_ui_cancel", id } });
+    }
+    request.resolve(response);
+    return true;
+  }
+
+  function settleBrowserUIRequests(predicate: (request: PendingBrowserUIRequest) => boolean, notifyClient = false) {
+    for (const [id, request] of [...pendingRequests]) {
+      if (predicate(request)) settleBrowserUIRequest(id, { cancelled: true }, notifyClient);
+    }
+  }
+
+  function requestBrowserUI(
+    client: WebSocket,
+    method: string,
+    payload: Record<string, unknown>,
+    opts?: { signal?: AbortSignal; timeout?: number },
+  ) {
+    if (opts?.signal?.aborted) return Promise.resolve<BrowserUIResponse>({ cancelled: true });
+
+    // Tau presents one modal at a time. A new request explicitly cancels the
+    // previous one for that browser instead of leaving its extension awaiting.
+    settleBrowserUIRequests((request) => request.client === client, true);
+    const id = `tau-ui-${++uiRequestSequence}`;
+    return new Promise<BrowserUIResponse>((resolve) => {
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      const onAbort = () => settleBrowserUIRequest(id, { cancelled: true }, true);
+      const cleanup = () => {
+        if (timeoutId) clearTimeout(timeoutId);
+        opts?.signal?.removeEventListener("abort", onAbort);
+      };
+
+      pendingRequests.set(id, { client, resolve, cleanup });
+      opts?.signal?.addEventListener("abort", onAbort, { once: true });
+      if (opts?.timeout) {
+        timeoutId = setTimeout(() => settleBrowserUIRequest(id, { cancelled: true }, true), opts.timeout);
+      }
+      sendTo(client, { type: "event", event: { type: "extension_ui_request", id, method, ...payload } });
+    });
+  }
+
+  function broadcastBrowserUI(method: string, payload: Record<string, unknown>) {
+    broadcast({
+      type: "event",
+      event: { type: "extension_ui_request", id: `tau-ui-${++uiRequestSequence}`, method, ...payload },
+    });
+  }
+
+  function sendBrowserUI(client: WebSocket, method: string, payload: Record<string, unknown>) {
+    sendTo(client, {
+      type: "event",
+      event: { type: "extension_ui_request", id: `tau-ui-${++uiRequestSequence}`, method, ...payload },
+    });
+  }
+
+  function browserTuiWidth(client: WebSocket) {
+    return browserTuiWidths.get(client) ?? 100;
+  }
+
+  function renderBrowserTuiComponent(component: BrowserTuiComponent, client: WebSocket) {
+    return component.component.render(browserTuiWidth(client));
+  }
+
+  function isBrowserTuiComponentInteractive(component: BrowserTuiComponent, client: WebSocket) {
+    const lease = browserUILease;
+    if (!lease || !browserUIOwnerIsActive(lease) || lease.client !== client) return false;
+    if (component.kind === "widget") return hasBrowserTerminalInputListeners();
+    return !!component.owner
+      && sameBrowserInputOwner(component.owner, lease)
+      && (!!component.component.handleInput || hasBrowserTerminalInputListeners());
+  }
+
+  function sendBrowserTuiComponent(client: WebSocket, type: "extension_tui_mount" | "extension_tui_update", component: BrowserTuiComponent) {
+    sendTo(client, {
+      type: "event",
+      event: {
+        type,
+        id: component.id,
+        kind: component.kind,
+        placement: component.placement,
+        overlay: component.overlay,
+        interactive: isBrowserTuiComponentInteractive(component, client),
+        lines: renderBrowserTuiComponent(component, client),
+      },
+    });
+  }
+
+  function emitBrowserTuiComponents(ids?: Iterable<string>) {
+    const targetIds = ids ? [...ids] : [...browserTuiComponents.keys()];
+    for (const id of targetIds) {
+      const component = browserTuiComponents.get(id);
+      if (!component) continue;
+      for (const client of clients) {
+        sendBrowserTuiComponent(client, "extension_tui_update", component);
+      }
+    }
+  }
+
+  function scheduleBrowserTuiRender() {
+    if (browserTuiRenderQueued) return;
+    browserTuiRenderQueued = true;
+    queueMicrotask(() => {
+      browserTuiRenderQueued = false;
+      try {
+        emitBrowserTuiComponents();
+      } catch (error) {
+        console.error("[Mirror] Failed to render extension TUI component for browser:", error);
+        broadcast({
+          type: "event",
+          event: { type: "extension_tui_error", error: error instanceof Error ? error.message : String(error) },
+        });
+      }
+    });
+  }
+
+  function observeBrowserTui(tui: BrowserTuiComponent["tui"]) {
+    const known = browserTuiObservers.get(tui as object);
+    if (known) return known;
+
+    const requestRender = tui.requestRender;
+    if (typeof requestRender !== "function") {
+      throw new Error("Pi TUI component factory did not receive a TUI with requestRender()");
+    }
+    const observer: BrowserTuiObserver = {
+      ids: new Set(),
+      requestRender,
+    };
+    tui.requestRender = function (...args: any[]) {
+      const result = observer.requestRender.apply(this, args);
+      scheduleBrowserTuiRender();
+      return result;
+    };
+    browserTuiObservers.set(tui as object, observer);
+    return observer;
+  }
+
+  function mountBrowserTuiComponent(component: BrowserTuiComponent) {
+    unmountBrowserTuiComponent(component.id);
+    browserTuiComponents.set(component.id, component);
+    observeBrowserTui(component.tui).ids.add(component.id);
+    for (const client of clients) {
+      sendBrowserTuiComponent(client, "extension_tui_mount", component);
+    }
+  }
+
+  function unmountBrowserTuiComponent(id: string) {
+    const component = browserTuiComponents.get(id);
+    if (!component) return;
+    browserTuiComponents.delete(id);
+    browserTuiObservers.get(component.tui as object)?.ids.delete(id);
+    broadcast({ type: "event", event: { type: "extension_tui_unmount", id } });
+  }
+
+  function releaseBrowserTuiOwnership(client: WebSocket) {
+    const released: string[] = [];
+    for (const component of browserTuiComponents.values()) {
+      if (component.owner?.client === client) {
+        component.owner = undefined;
+        released.push(component.id);
+      }
+    }
+    if (released.length > 0) emitBrowserTuiComponents(released);
+  }
+
+  function replayBrowserTuiComponents(client: WebSocket) {
+    for (const component of browserTuiComponents.values()) {
+      sendBrowserTuiComponent(client, "extension_tui_mount", component);
+    }
+  }
+
+  function clearBrowserTuiComponents() {
+    for (const id of [...browserTuiComponents.keys()]) {
+      unmountBrowserTuiComponent(id);
+    }
+  }
+
+  function replayBrowserUIState(client: WebSocket) {
+    for (const [key, text] of extensionStatuses) {
+      sendBrowserUI(client, "setStatus", { statusKey: key, statusText: text });
+    }
+    for (const [key, widget] of extensionWidgets) {
+      sendBrowserUI(client, "setWidget", {
+        widgetKey: key,
+        widgetLines: widget.lines,
+        widgetPlacement: widget.placement,
+      });
+    }
+    replayBrowserTuiComponents(client);
+  }
+
+  function clearBrowserUIState() {
+    for (const key of extensionStatuses.keys()) {
+      broadcastBrowserUI("setStatus", { statusKey: key, statusText: undefined });
+    }
+    for (const key of extensionWidgets.keys()) {
+      broadcastBrowserUI("setWidget", { widgetKey: key, widgetLines: undefined });
+    }
+    extensionStatuses.clear();
+    extensionWidgets.clear();
+    browserTerminalInputListeners.clear();
+    clearBrowserTuiComponents();
+  }
+
+  function installBrowserUIProxy(ui: any) {
+    settleBrowserUIRequests(() => true, true);
+    if (proxiedUI === ui) return;
+    proxiedUI = ui;
+    browserTerminalInputListeners.clear();
+    const original = {
+      select: ui.select.bind(ui),
+      confirm: ui.confirm.bind(ui),
+      input: ui.input.bind(ui),
+      editor: ui.editor.bind(ui),
+      notify: ui.notify.bind(ui),
+      setStatus: ui.setStatus.bind(ui),
+      setWidget: ui.setWidget.bind(ui),
+      setTitle: ui.setTitle.bind(ui),
+      setEditorText: ui.setEditorText.bind(ui),
+      pasteToEditor: ui.pasteToEditor.bind(ui),
+      onTerminalInput: ui.onTerminalInput.bind(ui),
+      getEditorText: ui.getEditorText.bind(ui),
+      custom: ui.custom.bind(ui),
+    };
+
+    ui.select = async (title: string, options: string[], opts?: any) => {
+      const client = getBrowserUIClient();
+      if (!client) return original.select(title, options, opts);
+      const response = await requestBrowserUI(client, "select", { title, options, timeout: opts?.timeout }, opts);
+      return response?.cancelled ? undefined : response?.value;
+    };
+    ui.confirm = async (title: string, message: string, opts?: any) => {
+      const client = getBrowserUIClient();
+      if (!client) return original.confirm(title, message, opts);
+      const response = await requestBrowserUI(client, "confirm", { title, message, timeout: opts?.timeout }, opts);
+      return response?.cancelled ? false : !!response?.confirmed;
+    };
+    ui.input = async (title: string, placeholder?: string, opts?: any) => {
+      const client = getBrowserUIClient();
+      if (!client) return original.input(title, placeholder, opts);
+      const response = await requestBrowserUI(client, "input", { title, placeholder, timeout: opts?.timeout }, opts);
+      return response?.cancelled ? undefined : response?.value;
+    };
+    ui.editor = async (title: string, prefill?: string) => {
+      const client = getBrowserUIClient();
+      if (!client) return original.editor(title, prefill);
+      const response = await requestBrowserUI(client, "editor", { title, prefill });
+      return response?.cancelled ? undefined : response?.value;
+    };
+    ui.notify = (message: string, type?: string) => {
+      original.notify(message, type);
+      if (clients.size > 0) broadcastBrowserUI("notify", { message, notifyType: type });
+    };
+    ui.setStatus = (key: string, text?: string) => {
+      original.setStatus(key, text);
+      if (text === undefined) extensionStatuses.delete(key);
+      else extensionStatuses.set(key, text);
+      if (clients.size > 0) broadcastBrowserUI("setStatus", { statusKey: key, statusText: text });
+    };
+    ui.setWidget = (key: string, content: any, options?: any) => {
+      const owner = getBrowserUIOwner();
+      const componentId = `widget:${key}`;
+      unmountBrowserTuiComponent(componentId);
+
+      if (typeof content === "function") {
+        original.setWidget(
+          key,
+          (tui: any, theme: any) => {
+            const component = content(tui, theme);
+            mountBrowserTuiComponent({
+              id: componentId,
+              component,
+              tui,
+              kind: "widget",
+              owner: owner && browserUIOwnerIsActive(owner) ? owner : undefined,
+              placement: options?.placement,
+            });
+            return component;
+          },
+          options,
+        );
+        return;
+      }
+
+      original.setWidget(key, content, options);
+      if (clients.size > 0 && (content === undefined || Array.isArray(content))) {
+        broadcastBrowserUI("setWidget", { widgetKey: key, widgetLines: content, widgetPlacement: options?.placement });
+      }
+      if (content === undefined) extensionWidgets.delete(key);
+      else if (Array.isArray(content)) {
+        extensionWidgets.set(key, { lines: [...content], placement: options?.placement });
+      }
+    };
+    ui.setTitle = (title: string) => {
+      original.setTitle(title);
+      if (clients.size > 0) broadcastBrowserUI("setTitle", { title });
+    };
+    ui.setEditorText = (text: string) => {
+      original.setEditorText(text);
+      if (clients.size > 0) broadcastBrowserUI("set_editor_text", { text });
+    };
+    ui.pasteToEditor = (text: string) => {
+      // Preserve native paste handling in the TUI; Pi RPC hosts receive the
+      // same set_editor_text fallback used by the built-in RPC mode.
+      original.pasteToEditor(text);
+      if (clients.size > 0) broadcastBrowserUI("set_editor_text", { text });
+    };
+    ui.onTerminalInput = (handler: BrowserTerminalInputListener["handler"]) => {
+      // Browser dispatch runs the original handlers directly while its exact
+      // lease is active. Native terminal input revokes that lease first.
+      const unsubscribe = original.onTerminalInput((data: string) => {
+        if (!browserUIExecution.getStore() && browserUILease) releaseBrowserUILease();
+        return handler(data);
+      });
+      const id = ++browserTerminalInputSequence;
+      browserTerminalInputListeners.set(id, { handler });
+      emitBrowserTuiComponents();
+      return () => {
+        unsubscribe();
+        if (browserTerminalInputListeners.delete(id)) emitBrowserTuiComponents();
+      };
+    };
+    ui.getEditorText = () => {
+      const editorText = browserUIExecution.getStore()?.editorText;
+      return editorText === undefined ? original.getEditorText() : editorText;
+    };
+    ui.custom = (factory: any, options?: any) => {
+      const componentId = `custom:${++browserTuiSequence}`;
+      const owner = getBrowserUIOwner();
+      let closed = false;
+
+      const closeBrowserComponent = () => {
+        if (closed) return;
+        closed = true;
+        unmountBrowserTuiComponent(componentId);
+      };
+
+      return original.custom(
+        async (tui: any, theme: any, keybindings: any, done: (result: unknown) => void) => {
+          const component = await factory(tui, theme, keybindings, (result: unknown) => {
+            closeBrowserComponent();
+            done(result);
+          });
+          if (!closed) {
+            mountBrowserTuiComponent({
+              id: componentId,
+              component,
+              tui,
+              kind: "custom",
+              owner: owner && browserUIOwnerIsActive(owner) ? owner : undefined,
+              overlay: options?.overlay === true,
+            });
+          }
+          return component;
+        },
+        options,
+      ).finally(closeBrowserComponent);
+    };
+  }
 
   // ═══════════════════════════════════════
   // Helper: send to one client
@@ -405,6 +1302,119 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function closeSessionTail() {
+    sessionTailWatcher?.close();
+    sessionTailWatcher = null;
+    sessionTailDirectoryWatcher?.close();
+    sessionTailDirectoryWatcher = null;
+    sessionTailFile = null;
+    sessionTailOffset = 0;
+    sessionTailRemainder = Buffer.alloc(0);
+  }
+
+  function readSessionTail(filePath: string) {
+    if (sessionTailFile !== filePath) return;
+    if (!fs.existsSync(filePath)) {
+      closeSessionTail();
+      return;
+    }
+
+    const size = fs.statSync(filePath).size;
+    if (size < sessionTailOffset) {
+      // A rewritten session belongs to the next mirror snapshot, not this tail.
+      sessionTailOffset = size;
+      sessionTailRemainder = Buffer.alloc(0);
+      return;
+    }
+    if (size === sessionTailOffset) return;
+
+    const length = size - sessionTailOffset;
+    const buffer = Buffer.allocUnsafe(length);
+    const fd = fs.openSync(filePath, "r");
+    try {
+      fs.readSync(fd, buffer, 0, length, sessionTailOffset);
+    } finally {
+      fs.closeSync(fd);
+    }
+    sessionTailOffset = size;
+
+    const chunk = sessionTailRemainder.length > 0
+      ? Buffer.concat([sessionTailRemainder, buffer])
+      : buffer;
+    let lineStart = 0;
+    for (let index = 0; index < chunk.length; index++) {
+      if (chunk[index] !== 0x0a) continue;
+      const line = chunk.subarray(lineStart, index);
+      lineStart = index + 1;
+      if (line.length === 0) continue;
+      const entry = JSON.parse(line.toString("utf8"));
+      if (entry.type !== "custom_message") continue;
+      broadcast({
+        type: "event",
+        event: {
+          type: "message_start",
+          message: {
+            role: "custom",
+            customType: entry.customType,
+            content: entry.content,
+            display: entry.display,
+            details: entry.details,
+            timestamp: Date.parse(entry.timestamp),
+          },
+        },
+      });
+    }
+    sessionTailRemainder = Buffer.from(chunk.subarray(lineStart));
+  }
+
+  function armSessionTail(sessionFile: string | undefined) {
+    if (sessionFile && sessionTailFile === sessionFile && (sessionTailWatcher || sessionTailDirectoryWatcher)) return;
+    closeSessionTail();
+    if (!sessionFile) return;
+
+    sessionTailFile = sessionFile;
+    if (fs.existsSync(sessionFile)) {
+      watchSessionFile(sessionFile, fs.statSync(sessionFile).size);
+      return;
+    }
+
+    const directory = path.dirname(sessionFile);
+    const basename = path.basename(sessionFile);
+    sessionTailDirectoryWatcher = fs.watch(directory, (_eventType, filename) => {
+      if (filename && filename.toString() !== basename) return;
+      if (!fs.existsSync(sessionFile)) return;
+      sessionTailDirectoryWatcher?.close();
+      sessionTailDirectoryWatcher = null;
+      watchSessionFile(sessionFile, 0);
+      readSessionTail(sessionFile);
+    });
+    sessionTailDirectoryWatcher.on("error", (error) => {
+      console.error(`[Mirror] Session directory watcher failed: ${error.message}`);
+    });
+
+    // Close the creation race between existsSync() and fs.watch().
+    if (fs.existsSync(sessionFile)) {
+      sessionTailDirectoryWatcher.close();
+      sessionTailDirectoryWatcher = null;
+      watchSessionFile(sessionFile, 0);
+      readSessionTail(sessionFile);
+    }
+  }
+
+  function watchSessionFile(sessionFile: string, offset: number) {
+    sessionTailOffset = offset;
+    sessionTailWatcher = fs.watch(sessionFile, () => {
+      try {
+        readSessionTail(sessionFile);
+      } catch (error) {
+        console.error("[Mirror] Failed to read session tail:", error);
+      }
+    });
+    sessionTailWatcher.on("error", (error) => {
+      console.error(`[Mirror] Session tail watcher failed: ${error.message}`);
+    });
+  }
+
   let mirrorUrl = "";
   let tailscaleUrl = "";
 
@@ -412,6 +1422,11 @@ export default function (pi: ExtensionAPI) {
   // Helper: stop the server
   // ═══════════════════════════════════════
   function stopServer() {
+    releaseBrowserUILease();
+    settleBrowserUIRequests(() => true, true);
+    browserTerminalInputListeners.clear();
+    clearBrowserTuiComponents();
+    closeSessionTail();
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
       heartbeatTimer = null;
@@ -520,6 +1535,10 @@ export default function (pi: ExtensionAPI) {
     pi.on(eventType as any, async (event: any, ctx: ExtensionContext) => {
       latestCtx = ctx;
 
+      // Custom messages are streamed from the session JSONL tail below because
+      // Pi does not expose every sendMessage() call through extension events.
+      if (event.message?.role === "custom") return;
+
       // Forward event to all connected browser clients
       // Wrap in { type: "event", event: ... } to match the existing frontend protocol
       broadcast({ type: "event", event: { type: eventType, ...event } });
@@ -534,11 +1553,43 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
+    if (!isSubagentChild() && (server || TAU_AUTO_START)) {
+      installBrowserUIProxy(ctx.ui);
+      armSessionTail(ctx.sessionManager.getSessionFile());
+    }
     turnCount = 0;
     titleSet = false;
     userMessages = [];
     // Update instance registry with new session file
     updateInstanceSession(ctx.sessionManager.getSessionFile() || "");
+  });
+
+  pi.on("input", async (event) => {
+    if (!browserUILease) return;
+    if (event.source === "extension" && event.text === browserUILease.inputText) {
+      browserUILease.inputObserved = true;
+      return;
+    }
+    releaseBrowserUILease();
+  });
+
+  pi.on("agent_start", async () => {
+    if (!browserUILease?.inputObserved) return;
+    browserUILease.active = true;
+  });
+
+  pi.on("agent_end", async () => {
+    releaseBrowserUILease();
+  });
+
+  pi.on("session_before_switch", async () => {
+    releaseBrowserUILease();
+    clearBrowserUIState();
+  });
+
+  pi.on("session_before_fork", async () => {
+    releaseBrowserUILease();
+    clearBrowserUIState();
   });
 
   pi.on("turn_start", async (_event, _ctx) => {
@@ -676,64 +1727,130 @@ export default function (pi: ExtensionAPI) {
 
     try {
       switch (command.type) {
+        case "extension_ui_response": {
+          const request = pendingRequests.get(command.id);
+          if (request?.client === ws) settleBrowserUIRequest(command.id, command);
+          break;
+        }
+
+        case "extension_tui_resize": {
+          const width = Number(command.width);
+          if (!Number.isInteger(width) || width < 1) {
+            throw new Error("Extension TUI width must be a positive integer");
+          }
+          browserTuiWidths.set(ws, width);
+          for (const component of browserTuiComponents.values()) {
+            sendBrowserTuiComponent(ws, "extension_tui_update", component);
+          }
+          break;
+        }
+
+        case "extension_tui_input": {
+          const component = browserTuiComponents.get(String(command.componentId));
+          if (!component) {
+            throw new Error(`Unknown extension TUI component: ${String(command.componentId)}`);
+          }
+          if (typeof command.data !== "string") {
+            throw new Error("Extension TUI input must be a string");
+          }
+          if (typeof command.editorText !== "string") {
+            throw new Error("Extension TUI input must include the browser editor text");
+          }
+          const lease = browserUILease;
+          if (!lease || !browserUIOwnerIsActive(lease) || lease.client !== ws) {
+            sendTo(ws, error("extension_tui_input", "This extension TUI component is owned by another input surface"));
+            break;
+          }
+          if (component.kind === "widget" && !hasBrowserTerminalInputListeners()) {
+            sendTo(ws, error("extension_tui_input", "This extension TUI component is not browser-interactive"));
+            break;
+          }
+          if (component.kind === "custom"
+            && (!component.owner || !sameBrowserInputOwner(component.owner, lease))
+          ) {
+            sendTo(ws, error("extension_tui_input", "This extension TUI component is owned by another input surface"));
+            break;
+          }
+          const input = runWithBrowserTerminalInput(lease, command.editorText, () =>
+            dispatchBrowserInput(browserTerminalInputListeners, command.data),
+          );
+          if (!input.consumed && component.kind === "custom" && component.component.handleInput) {
+            component.component.handleInput(input.data);
+          }
+          if (!input.consumed && component.kind === "custom" && !component.component.handleInput && !hasBrowserTerminalInputListeners()) {
+            sendTo(ws, error("extension_tui_input", "This extension TUI component is not browser-interactive"));
+            break;
+          }
+          scheduleBrowserTuiRender();
+          break;
+        }
+
         // ─── Prompting ───
         case "prompt": {
-          if (ctx && !ctx.isIdle()) {
-            const behavior = command.streamingBehavior || "steer";
-            if (behavior === "steer") {
-              pi.sendUserMessage(command.message, { deliverAs: "steer" });
-            } else {
-              pi.sendUserMessage(command.message, { deliverAs: "followUp" });
-            }
-          } else {
-            // Build content with optional images
-            if (command.images?.length) {
-              const validMimes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
-              const content: any[] = [{ type: "text", text: command.message || "(see attached image)" }];
-              for (const img of command.images) {
-                if (!img.data || typeof img.data !== "string") {
-                  console.error("[mirror-server] Skipping image: missing or invalid data");
-                  continue;
-                }
-                // Strip data URL prefix if accidentally included
-                const data = img.data.includes(",") ? img.data.split(",")[1] : img.data;
-                const mimeType = (validMimes.includes(img.mimeType) ? img.mimeType : "image/png") as "image/png" | "image/jpeg" | "image/gif" | "image/webp";
-                console.log(`[mirror-server] Image: mimeType=${mimeType}, dataLen=${data.length}, rawMimeType=${img.mimeType}`);
-                const imageBlock = {
-                  type: "image" as const,
-                  data: data,
-                  mimeType: mimeType,
-                };
-                // Defensive: verify mimeType is actually set (debug crash where it was missing)
-                if (!imageBlock.mimeType) {
-                  console.error(`[mirror-server] BUG: mimeType is falsy after assignment! img.mimeType=${img.mimeType}, falling back to image/png`);
-                  imageBlock.mimeType = "image/png";
-                }
-                content.push(imageBlock);
+          const owner = acquireBrowserUILease(ws, String(command.message || ""));
+          if (!owner) throw new Error("Browser client is no longer connected");
+          runWithBrowserUIOwner(owner, () => {
+            if (ctx && !ctx.isIdle()) {
+              const behavior = command.streamingBehavior || "steer";
+              if (behavior === "steer") {
+                pi.sendUserMessage(command.message, { deliverAs: "steer" });
+              } else {
+                pi.sendUserMessage(command.message, { deliverAs: "followUp" });
               }
-              // Only send content array if we actually have images, otherwise just text
-              const hasImages = content.some((c: any) => c.type === "image");
-              if (hasImages) {
-                pi.sendUserMessage(content);
+            } else {
+              // Build content with optional images
+              if (command.images?.length) {
+                const validMimes = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+                const content: any[] = [{ type: "text", text: command.message || "(see attached image)" }];
+                for (const img of command.images) {
+                  if (!img.data || typeof img.data !== "string") {
+                    console.error("[mirror-server] Skipping image: missing or invalid data");
+                    continue;
+                  }
+                  // Strip data URL prefix if accidentally included
+                  const data = img.data.includes(",") ? img.data.split(",")[1] : img.data;
+                  const mimeType = (validMimes.includes(img.mimeType) ? img.mimeType : "image/png") as "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+                  console.log(`[mirror-server] Image: mimeType=${mimeType}, dataLen=${data.length}, rawMimeType=${img.mimeType}`);
+                  const imageBlock = {
+                    type: "image" as const,
+                    data: data,
+                    mimeType: mimeType,
+                  };
+                  // Defensive: verify mimeType is actually set (debug crash where it was missing)
+                  if (!imageBlock.mimeType) {
+                    console.error(`[mirror-server] BUG: mimeType is falsy after assignment! img.mimeType=${img.mimeType}, falling back to image/png`);
+                    imageBlock.mimeType = "image/png";
+                  }
+                  content.push(imageBlock);
+                }
+                // Only send content array if we actually have images, otherwise just text
+                const hasImages = content.some((c: any) => c.type === "image");
+                if (hasImages) {
+                  pi.sendUserMessage(content);
+                } else {
+                  pi.sendUserMessage(command.message);
+                }
               } else {
                 pi.sendUserMessage(command.message);
               }
-            } else {
-              pi.sendUserMessage(command.message);
             }
-          }
+          });
           sendTo(ws, success("prompt"));
           break;
         }
 
         case "steer": {
-          pi.sendUserMessage(command.message, { deliverAs: "steer" });
+          const owner = acquireBrowserUILease(ws, String(command.message || ""));
+          if (!owner) throw new Error("Browser client is no longer connected");
+          runWithBrowserUIOwner(owner, () => pi.sendUserMessage(command.message, { deliverAs: "steer" }));
           sendTo(ws, success("steer"));
           break;
         }
 
         case "follow_up": {
-          pi.sendUserMessage(command.message, { deliverAs: "followUp" });
+          const owner = acquireBrowserUILease(ws, String(command.message || ""));
+          if (!owner) throw new Error("Browser client is no longer connected");
+          runWithBrowserUIOwner(owner, () => pi.sendUserMessage(command.message, { deliverAs: "followUp" }));
           sendTo(ws, success("follow_up"));
           break;
         }
@@ -759,7 +1876,6 @@ export default function (pi: ExtensionAPI) {
             sessionFile: ctx.sessionManager.getSessionFile(),
             sessionName: pi.getSessionName(),
             cwd: getCurrentCwd(),
-            autoCompactionEnabled: true, // Extension can't easily check this
           };
           sendTo(ws, success("get_state", state));
           break;
@@ -894,13 +2010,6 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
-        case "set_auto_compaction": {
-          // Extension can't easily toggle auto-compaction
-          // Just acknowledge
-          sendTo(ws, success("set_auto_compaction"));
-          break;
-        }
-
         case "compact": {
           if (ctx) {
             // Broadcast compaction start to all clients
@@ -938,13 +2047,6 @@ export default function (pi: ExtensionAPI) {
           } catch (e: any) {
             sendTo(ws, error("export_html", e.message));
           }
-          break;
-        }
-
-        // ─── Commands & Files ───
-        case "get_commands": {
-          const commands = [...BUILTIN_COMMANDS, ...pi.getCommands()];
-          sendTo(ws, success("get_commands", { commands }));
           break;
         }
 
@@ -1122,8 +2224,7 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  function getGitState() {
-    const cwd = getCurrentCwd();
+  function getGitState(cwd = getCurrentCwd()) {
     try {
       const inside = execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
         encoding: "utf8",
@@ -1286,34 +2387,83 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
-    if (urlPath === "/api/projects/launch" && req.method === "POST") {
+    if (urlPath === "/api/sidebar-preferences") {
+      if (req.method === "GET") {
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify({ preferences: readSidebarPreferences() }));
+        return;
+      }
+      if (req.method === "POST") {
+        let body = "";
+        req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+        req.on("end", async () => {
+          try {
+            const mutation = JSON.parse(body);
+            const preferences = await mutateSidebarPreferences(mutation);
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({ preferences }));
+          } catch (error: any) {
+            const status = error?.message === "Sidebar preferences are busy" ? 409 : 400;
+            res.writeHead(status, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: error?.message || String(error) }));
+          }
+        });
+        return;
+      }
+      res.writeHead(405, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Method not allowed" }));
+      return;
+    }
+
+    if ((urlPath === "/api/projects/launch" || urlPath === "/api/sessions/launch") && req.method === "POST") {
       let body = "";
       req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-      req.on("end", () => {
+      req.on("end", async () => {
         try {
-          const { path: projectPath, sessionFile, message } = JSON.parse(body);
-          if (!projectPath || typeof projectPath !== "string") {
+          const { path: projectPath, noProject, sessionFile: requestedSessionFile } = JSON.parse(body);
+          if (!noProject && (!projectPath || typeof projectPath !== "string")) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "path required" }));
             return;
           }
-          if (sessionFile !== undefined && (typeof sessionFile !== "string" || !fs.existsSync(sessionFile))) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "valid sessionFile required" }));
-            return;
+          let sessionFile: string | undefined;
+          if (urlPath === "/api/sessions/launch") {
+            if (typeof requestedSessionFile !== "string") {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "valid sessionFile required" }));
+              return;
+            }
+            try {
+              sessionFile = resolveSessionFilePath(SESSIONS_DIR, requestedSessionFile, { allowAbsolute: true });
+            } catch {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "valid sessionFile required" }));
+              return;
+            }
           }
           // Resolve ~ in path
-          const resolved = projectPath.startsWith("~")
-            ? path.join(process.env.HOME || "", projectPath.slice(1))
-            : projectPath;
+          const launchPath = noProject
+            ? USER_HOME
+            : projectPath.startsWith("~")
+              ? path.join(USER_HOME, projectPath.slice(1))
+              : projectPath;
+          const resolved = path.resolve(launchPath);
           if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Directory not found" }));
             return;
           }
-          launchPi(resolved, { sessionFile, message });
+          const instance = await waitForLaunchedInstance(
+            resolved,
+            urlPath === "/api/sessions/launch" ? { sessionFile } : {},
+          );
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true }));
+          res.end(JSON.stringify({
+            port: instance.port,
+            pid: instance.pid,
+            cwd: instance.cwd,
+            sessionFile: instance.sessionFile,
+          }));
         } catch (e: any) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: e.message }));
@@ -1395,10 +2545,15 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
-    // Session file endpoint: /api/sessions/:dirName/:file
-    const sessionMatch = urlPath.match(/^\/api\/sessions\/([^/]+)\/([^/]+)$/);
+    // Session file endpoint: /api/sessions/<relative session path>
+    const sessionMatch = urlPath.split("?", 1)[0].match(/^\/api\/sessions\/(.+)$/);
     if (sessionMatch && req.method === "GET") {
-      serveSessionFile(res, sessionMatch[1], sessionMatch[2]);
+      try {
+        serveSessionFile(res, decodeURIComponent(sessionMatch[1]));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "valid session path required" }));
+      }
       return;
     }
 
@@ -1447,17 +2602,14 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             res.end(JSON.stringify({ error: "filePath required" }));
             return;
           }
-          if (!fs.existsSync(filePath)) {
-            res.writeHead(404, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Session not found" }));
-            return;
-          }
-          fs.unlinkSync(filePath);
+          const sessionFile = resolveSessionFilePath(SESSIONS_DIR, filePath, { allowAbsolute: true });
+          fs.unlinkSync(sessionFile);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ success: true }));
         } catch (err: any) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: err.message }));
+          const status = err?.code === "ENOENT" ? 404 : 400;
+          res.writeHead(status, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: status === 404 ? "Session not found" : "valid sessionFile required" }));
         }
       });
       return;
@@ -1514,9 +2666,9 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
           const files = fs.readdirSync(sessionDir).filter(f => f.endsWith(".jsonl"));
           for (const f of files) {
             try {
-              const filePath = path.join(sessionDir, f);
+              const filePath = resolveSessionFilePath(SESSIONS_DIR, path.join(sessionDir, f), { allowAbsolute: true });
               const parsed = await parseSessionFile(filePath, readline);
-              if (!parsed?.cwd || isTempProjectPath(parsed.cwd)) continue;
+              if (!parsed?.cwd || isTempProjectPath(parsed.cwd) || path.resolve(parsed.cwd) === path.resolve(USER_HOME)) continue;
               const cwd = parsed.cwd;
               const stat = fs.statSync(filePath);
               const info = sessionInfo.get(cwd) || { count: 0, lastActive: 0 };
@@ -1557,7 +2709,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       }
 
       const currentCwd = getCurrentCwd();
-      if (!isTempProjectPath(currentCwd)) addProject(currentCwd);
+      if (!isTempProjectPath(currentCwd) && path.resolve(currentCwd) !== path.resolve(USER_HOME)) addProject(currentCwd);
       for (const projectPath of sessionInfo.keys()) {
         addProject(projectPath);
       }
@@ -1568,7 +2720,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       });
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ projects }));
+      res.end(JSON.stringify({ projects, taskPath: USER_HOME }));
     } catch (e: any) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: e.message }));
@@ -1587,6 +2739,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       const readline = await import("node:readline");
       const dirEntries = fs.readdirSync(SESSIONS_DIR, { withFileTypes: true });
       const projects: any[] = [];
+      let tasks: any = null;
 
       for (const dir of dirEntries) {
         if (!dir.isDirectory()) continue;
@@ -1599,7 +2752,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
         for (const file of files) {
           try {
-            const filePath = path.join(projectDir, file);
+            const filePath = resolveSessionFilePath(SESSIONS_DIR, path.join(projectDir, file), { allowAbsolute: true });
             const parsed = await parseSessionFile(filePath, readline);
             if (parsed?.cwd && !isTempProjectPath(parsed.cwd)) {
               projectPath ||= parsed.cwd;
@@ -1613,7 +2766,17 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         sessions.sort((a, b) => b.mtime - a.mtime);
 
         if (sessions.length > 0) {
-          projects.push({ path: projectPath, dirName: dir.name, sessions });
+          const project = {
+            path: projectPath,
+            dirName: dir.name,
+            branch: getGitState(projectPath).currentBranch,
+            sessions,
+          };
+          if (path.resolve(projectPath) === path.resolve(USER_HOME)) {
+            tasks = project;
+          } else {
+            projects.push(project);
+          }
         }
       }
 
@@ -1624,7 +2787,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       });
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ projects }));
+      res.end(JSON.stringify({ projects, tasks }));
     } catch (e: any) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: e.message }));
@@ -1634,12 +2797,14 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // ═══════════════════════════════════════
   // Session file endpoint
   // ═══════════════════════════════════════
-  function serveSessionFile(res: http.ServerResponse, dirName: string, file: string) {
-    const filePath = path.join(SESSIONS_DIR, dirName, file);
-
-    if (!fs.existsSync(filePath)) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Session not found" }));
+  function serveSessionFile(res: http.ServerResponse, requestedPath: string) {
+    let filePath: string;
+    try {
+      filePath = resolveSessionFilePath(SESSIONS_DIR, requestedPath);
+    } catch (error: any) {
+      const status = error?.code === "ENOENT" ? 404 : 400;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: status === 404 ? "Session not found" : "valid session path required" }));
       return;
     }
 
@@ -1676,6 +2841,9 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // Parse session file header
   // ═══════════════════════════════════════
   async function parseSessionFile(filePath: string, readline: any) {
+    const stat = fs.statSync(filePath);
+    const cached = sessionFileCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.value;
     const stream = fs.createReadStream(filePath, { encoding: "utf8" });
     const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
 
@@ -1683,16 +2851,14 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     let firstMessage: string | null = null;
     let sessionName: string | null = null;
     let userMessageCount = 0;
-    let lineCount = 0;
 
     for await (const line of rl) {
       if (!line.trim()) continue;
-      lineCount++;
 
       try {
         const entry = JSON.parse(line);
         if (entry.type === "session") header = entry;
-        else if (entry.type === "session_info" && entry.name) sessionName = entry.name;
+        else if (entry.type === "session_info" && typeof entry.name === "string") sessionName = entry.name;
         else if (entry.type === "message" && entry.message?.role === "user") {
           userMessageCount++;
           if (!firstMessage) {
@@ -1705,23 +2871,20 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
           }
         }
       } catch { /* skip */ }
-
-      if (lineCount > 50 && firstMessage) break;
     }
 
     rl.close();
     stream.destroy();
 
-    if (!header?.id) return null;
-    if (userMessageCount <= 1 && lineCount <= 8) return null; // pipe mode
-
-    return {
+    const value = !header?.id || userMessageCount === 0 ? null : {
       id: header.id,
       timestamp: header.timestamp || "",
       name: sessionName,
       firstMessage,
       cwd: header.cwd || null,
     };
+    sessionFileCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, value });
+    return value;
   }
 
   // ═══════════════════════════════════════
@@ -1814,7 +2977,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
           if (results.length >= MAX_RESULTS) break;
 
           try {
-            const filePath = path.join(projectDir, file);
+            const filePath = resolveSessionFilePath(SESSIONS_DIR, path.join(projectDir, file), { allowAbsolute: true });
             const stream = fs.createReadStream(filePath, { encoding: "utf8" });
             const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
 
@@ -1907,6 +3070,10 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   function startServer(ctx: ExtensionContext) {
     if (server) return; // Already running
 
+    latestCtx = ctx;
+    installBrowserUIProxy(ctx.ui);
+    armSessionTail(ctx.sessionManager.getSessionFile());
+
     // Clean up zombie instances from killed tmux panes etc.
     cleanupZombieInstances();
 
@@ -1940,11 +3107,15 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       // Send initial state
       sendTo(ws, { type: "state", isStreaming: false, mode: "mirror" });
 
-      // Immediately send state snapshot
+      // The client clears transient extension chrome when it receives the
+      // snapshot, so replay it only after that reset has completed.
       if (latestCtx) {
         buildStateSnapshot(latestCtx).then((snapshot) => {
           sendTo(ws, snapshot);
+          replayBrowserUIState(ws);
         });
+      } else {
+        replayBrowserUIState(ws);
       }
 
       ws.on("message", (data) => {
@@ -1958,11 +3129,19 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
       ws.on("close", () => {
         console.log("[Mirror] Browser client disconnected");
+        releaseBrowserUILease(ws);
+        releaseBrowserTuiOwnership(ws);
+        settleBrowserUIRequests((request) => request.client === ws);
+        browserTuiWidths.delete(ws);
         clients.delete(ws);
       });
 
       ws.on("error", (e) => {
         console.error("[Mirror] Client error:", e);
+        releaseBrowserUILease(ws);
+        releaseBrowserTuiOwnership(ws);
+        settleBrowserUIRequests((request) => request.client === ws);
+        browserTuiWidths.delete(ws);
         clients.delete(ws);
       });
     });
@@ -1971,12 +3150,18 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     heartbeatTimer = setInterval(() => {
       for (const client of clients) {
         if (client.readyState !== WebSocket.OPEN) {
+          releaseBrowserUILease(client);
+          releaseBrowserTuiOwnership(client);
+          browserTuiWidths.delete(client);
           clients.delete(client);
           continue;
         }
 
         if (!(client as any).isAlive) {
           try { client.terminate(); } catch {}
+          releaseBrowserUILease(client);
+          releaseBrowserTuiOwnership(client);
+          browserTuiWidths.delete(client);
           clients.delete(client);
           continue;
         }
@@ -1987,10 +3172,12 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     }, 20000);
 
     const tryListen = (port: number, maxAttempts = 10) => {
-      server!.listen(port, HOST, () => {
+      const handleListening = () => {
+        server!.off("error", handleError);
         onListening(port);
-      });
-      server!.once("error", (err: any) => {
+      };
+      const handleError = (err: any) => {
+        server!.off("listening", handleListening);
         if (err.code === "EADDRINUSE" && port < PORT + maxAttempts) {
           // Check if a stale Tau instance owns this port and kill it
           const instances = getRunningInstances();
@@ -2000,18 +3187,19 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             try { process.kill(stale.pid, "SIGTERM"); } catch {}
             // Wait briefly then retry the same port
             setTimeout(() => {
-              server!.removeAllListeners("error");
               tryListen(port, maxAttempts);
             }, 500);
             return;
           }
           console.log(`[Mirror] Port ${port} in use, trying ${port + 1}...`);
-          server!.removeAllListeners("error");
           tryListen(port + 1, maxAttempts);
         } else {
           console.error(`[Mirror] Failed to start server:`, err.message);
         }
-      });
+      };
+      server!.once("listening", handleListening);
+      server!.once("error", handleError);
+      server!.listen(port, HOST);
     };
 
     const onListening = (port: number) => {
@@ -2084,7 +3272,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     // Skip mirror startup in subagent child processes
     // (pi-subagents sets PI_SUBAGENT_CHILD=1; child processes loading Tau
     // should not attempt to start their own mirror server)
-    if (process.env.PI_SUBAGENT_CHILD === "1") {
+    if (isSubagentChild()) {
       console.log("[Mirror] Subagent child process detected (PI_SUBAGENT_CHILD=1), skipping auto-start.");
       return;
     }

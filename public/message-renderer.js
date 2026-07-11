@@ -2,7 +2,7 @@
  * Message Renderer - Renders chat messages with markdown support
  */
 
-import { renderMarkdown, renderUserMarkdown } from './markdown.js';
+import { renderMarkdown, renderUserMarkdown, sanitizeImageSource } from './markdown.js';
 
 export class MessageRenderer {
   constructor(container) {
@@ -63,20 +63,27 @@ export class MessageRenderer {
     const div = document.createElement('div');
     div.className = `message user${isHistory ? ' history' : ''}`;
 
-    let imagesHtml = '';
-    if (message.images && message.images.length > 0) {
-      imagesHtml = '<div class="message-images">' +
-        message.images.map(img => {
-          const src = img.data.startsWith('data:') ? img.data : `data:${img.mimeType || 'image/png'};base64,${img.data}`;
-          return `<img class="message-image" src="${src}" alt="Attached image" />`;
-        }).join('') +
-        '</div>';
+    const content = document.createElement('div');
+    content.className = 'message-content';
+    content.innerHTML = renderUserMarkdown(message.content);
+
+    if (Array.isArray(message.images) && message.images.length > 0) {
+      const images = document.createElement('div');
+      images.className = 'message-images';
+      for (const imageData of message.images) {
+        const src = sanitizeImageSource(imageData);
+        if (!src) continue;
+        const image = document.createElement('img');
+        image.className = 'message-image';
+        image.src = src;
+        image.alt = 'Attached image';
+        images.appendChild(image);
+      }
+      if (images.childElementCount > 0) content.prepend(images);
     }
 
-    div.innerHTML = `
-      <div class="message-content">${imagesHtml}${renderUserMarkdown(message.content)}</div>
-      <button class="message-copy-btn" aria-label="Copy message"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
-    `;
+    div.innerHTML = '<button class="message-copy-btn" aria-label="Copy message"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>';
+    div.prepend(content);
     this._setupCopyBtn(div);
     this.container.appendChild(div);
     this._renderMath(div);
@@ -171,7 +178,6 @@ export class MessageRenderer {
     if (contentDiv) {
       // Keep any thinking block, update only the text part
       const thinkingBlock = contentDiv.querySelector('.streaming-thinking');
-      const escaped = this.escapeHtml(content);
       if (thinkingBlock) {
         // Remove everything after the thinking block and re-add text
         let textNode = contentDiv.querySelector('.streaming-text');
@@ -180,9 +186,9 @@ export class MessageRenderer {
           textNode.className = 'streaming-text';
           contentDiv.appendChild(textNode);
         }
-        textNode.innerHTML = escaped;
+        textNode.textContent = content;
       } else {
-        contentDiv.innerHTML = escaped;
+        contentDiv.textContent = content;
       }
       this.scrollToBottom();
     }
@@ -236,6 +242,8 @@ export class MessageRenderer {
   }
 
   renderCustomMessage(entry, isHistory = false) {
+    if (entry.display !== true) return null;
+
     const welcome = this.container.querySelector('.welcome');
     if (welcome) welcome.remove();
 
@@ -243,16 +251,37 @@ export class MessageRenderer {
     const div = document.createElement('div');
     div.className = `custom-message${isHistory ? ' history' : ''}`;
 
-    const title = message.display?.title || message.customType || entry.customType || 'Extension';
-    const body = message.display?.body || message.display?.text || message.content;
-    const text = typeof body === 'string' ? body : JSON.stringify(body, null, 2);
+    const title = document.createElement('div');
+    title.className = 'custom-message-title';
+    title.textContent = message.customType;
+    div.appendChild(title);
 
-    div.innerHTML = `
-      <div class="custom-message-title">${this.escapeHtml(title)}</div>
-      <pre class="custom-message-body">${this.escapeHtml(text || '')}</pre>
-    `;
+    const body = document.createElement('div');
+    body.className = 'custom-message-body';
+    const blocks = typeof message.content === 'string'
+      ? [{ type: 'text', text: message.content }]
+      : Array.isArray(message.content) ? message.content : [];
+
+    for (const block of blocks) {
+      if (block.type === 'text') {
+        const text = document.createElement('div');
+        text.className = 'custom-message-text';
+        text.innerHTML = renderMarkdown(block.text);
+        body.appendChild(text);
+      } else if (block.type === 'image') {
+        const image = document.createElement('img');
+        image.className = 'message-image';
+        const src = sanitizeImageSource(block);
+        if (!src) continue;
+        image.src = src;
+        image.alt = 'Extension image';
+        body.appendChild(image);
+      }
+    }
+    div.appendChild(body);
     this.container.appendChild(div);
     if (!isHistory) this.scrollToBottom();
+    return div;
   }
 
   renderError(errorMessage) {

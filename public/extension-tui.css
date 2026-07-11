@@ -1,0 +1,56 @@
+.extension-tui-widgets {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 900px;
+}
+
+.extension-tui-widget,
+.extension-tui-custom {
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-solid);
+  color: var(--text-primary);
+  outline: none;
+}
+
+.extension-tui-widget:focus-visible,
+.extension-tui-custom:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.extension-tui-output {
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  white-space: pre;
+  tab-size: 2;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.extension-tui-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--bg-solid) 48%, transparent);
+}
+
+.extension-tui-overlay .extension-tui-custom {
+  width: min(900px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  box-shadow: var(--shadow-lg);
+}
+
+.extension-tui-measure {
+  position: fixed;
+  visibility: hidden;
+  pointer-events: none;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
