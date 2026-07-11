@@ -10,6 +10,7 @@ import { DialogHandler } from './dialogs.js';
 import { ExtensionTuiBridge, renderAnsiText } from './extension-tui.js';
 import { SessionSidebar } from './session-sidebar.js';
 import { getSessionHistoryFallback } from './session-history.js';
+import { getComposerState } from './composer-state.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
 
@@ -77,6 +78,9 @@ let isMirrorMode = false; // Set when mirror_sync received
 let liveInstances = []; // All running Tau instances [{port, sessionFile, cwd}]
 let currentProjectPath = '';
 let sidebarRefreshTimer = null;
+let isLaunchingNewSession = false;
+let desktopSidebarCollapsed = sidebarEl.classList.contains('collapsed');
+const mobileViewport = window.matchMedia('(max-width: 768px)');
 
 function scheduleSidebarRefresh() {
   clearTimeout(sidebarRefreshTimer);
@@ -805,6 +809,8 @@ function renderAttachmentPreviews() {
 let messageQueue = [];
 
 function sendMessage() {
+  if (getCurrentComposerState().disabled) return;
+
   const message = messageInput.value.trim();
   if (!message && pendingImages.length === 0) return;
 
@@ -1493,10 +1499,6 @@ async function checkoutBranch(branch) {
 }
 
 branchDropdownBtn.addEventListener('click', toggleBranchDropdown);
-settingsCurrentBranch.addEventListener('click', () => {
-  if (!currentGitState.isRepo) return;
-  openBranchDropdown();
-});
 
 // ═══════════════════════════════════════
 // Keyboard shortcuts
@@ -1553,7 +1555,7 @@ function isInInput() {
 // ═══════════════════════════════════════
 
 function isMobile() {
-  return window.innerWidth <= 768;
+  return mobileViewport.matches;
 }
 
 function updateSidebarToggleIcon() {
@@ -1563,6 +1565,7 @@ function updateSidebarToggleIcon() {
 function toggleSidebar() {
   sidebarEl.classList.toggle('collapsed');
   sidebarOverlay.classList.toggle('visible', !sidebarEl.classList.contains('collapsed') && isMobile());
+  if (!isMobile()) desktopSidebarCollapsed = sidebarEl.classList.contains('collapsed');
   updateSidebarToggleIcon();
 }
 
@@ -1839,20 +1842,18 @@ async function pollInstances() {
 setInterval(pollInstances, 5000);
 pollInstances();
 
-// Enable/disable input based on whether we're viewing the live session
-function updateMirrorInputState() {
-  if (!isMirrorMode) return;
+function getCurrentComposerState() {
+  return getComposerState({ isMirrorMode, viewingActiveSession, isLaunchingNewSession });
+}
 
+// Keep every composer entry point aligned with the active session state.
+function updateMirrorInputState() {
   const inputArea = document.querySelector('.input-area');
-  if (viewingActiveSession) {
-    messageInput.disabled = false;
-    messageInput.placeholder = 'Message...';
-    inputArea?.classList.remove('mirror-readonly');
-  } else {
-    messageInput.disabled = true;
-    messageInput.placeholder = 'Viewing historical session (read-only)';
-    inputArea?.classList.add('mirror-readonly');
-  }
+  const composerState = getCurrentComposerState();
+  messageInput.disabled = composerState.disabled;
+  sendBtn.disabled = composerState.disabled;
+  messageInput.placeholder = composerState.placeholder;
+  inputArea?.classList.toggle('mirror-readonly', composerState.readOnly);
 }
 
 async function launchSessionInstance(sessionFile, projectPath) {
@@ -2198,16 +2199,14 @@ function updateUI() {
     statusText.textContent = 'Connected';
   }
 
-  messageInput.disabled = false;
-  sendBtn.disabled = false;
-
+  updateMirrorInputState();
   if (isStreaming) {
     abortBtn.classList.remove('hidden');
     sendBtn.classList.add('hidden');
   } else {
     abortBtn.classList.add('hidden');
     sendBtn.classList.remove('hidden');
-    flushQueue();
+    if (!getCurrentComposerState().disabled) flushQueue();
   }
 }
 
@@ -2565,28 +2564,18 @@ if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
 // Initialize
 // ═══════════════════════════════════════
 
-// On mobile, move cost + token usage above input
-if (isMobile()) {
-  sidebarEl.classList.add('collapsed');
-
-  const mobileBar = document.getElementById('mobile-model-bar');
-  const sessionCost = document.getElementById('session-cost');
-  const tokenUsage = document.getElementById('token-usage');
-  if (mobileBar && sessionCost && tokenUsage) {
-    mobileBar.appendChild(sessionCost);
-    mobileBar.appendChild(tokenUsage);
+function syncResponsiveSidebar(event) {
+  if (event.matches) {
+    desktopSidebarCollapsed = sidebarEl.classList.contains('collapsed');
+    sidebarEl.classList.add('collapsed');
+  } else {
+    sidebarEl.classList.toggle('collapsed', desktopSidebarCollapsed);
   }
-
-  // Start collapsed
-  mobileBar.classList.add('collapsed');
-
-  // Toggle via chevron
-  const contextToggle = document.getElementById('mobile-context-toggle');
-  contextToggle.addEventListener('click', () => {
-    mobileBar.classList.toggle('collapsed');
-    contextToggle.classList.toggle('flipped', !mobileBar.classList.contains('collapsed'));
-  });
+  sidebarOverlay.classList.remove('visible');
 }
+
+syncResponsiveSidebar(mobileViewport);
+mobileViewport.addEventListener('change', syncResponsiveSidebar);
 
 // New session project picker
 const newSessionTools = document.getElementById('new-session-tools');
@@ -2598,7 +2587,6 @@ let newSessionProjects = [];
 let selectedNewProject = null;
 let newSessionTaskPath = '';
 let newSessionProjectLoad = null;
-let isLaunchingNewSession = false;
 
 function projectShortName(project) {
   if (!project?.path) return '不使用项目';

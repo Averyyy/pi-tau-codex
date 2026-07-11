@@ -221,11 +221,11 @@ export class SessionSidebar {
   }
 
   renderSearchResults() {
-    if (!this._searchResults || this._searchResults.length === 0) return;
-
     // Remove previous search results section
     const existing = this.container.querySelector('.search-results-group');
     if (existing) existing.remove();
+
+    if (!this._searchResults || this._searchResults.length === 0) return;
 
     const group = document.createElement('div');
     group.className = 'search-results-group';
