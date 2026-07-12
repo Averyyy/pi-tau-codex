@@ -58,6 +58,10 @@ test('HTTP mutation policy is determined only by method', () => {
 test('WebSocket policy uses an explicit read allowlist', () => {
   assert.equal(isWebSocketMutation('get_state'), false);
   assert.equal(isWebSocketMutation('mirror_sync_request'), false);
+  assert.equal(isWebSocketMutation('get_provider_accounts'), false);
+  assert.equal(isWebSocketMutation('get_enabled_models'), false);
+  assert.equal(isWebSocketMutation('get_about'), false);
+  assert.equal(isWebSocketMutation('set_enabled_models'), true);
   assert.equal(isWebSocketMutation('extension_ui_response'), true);
   assert.equal(isWebSocketMutation('extension_tui_resize'), true);
   assert.equal(isWebSocketMutation('prompt'), true);

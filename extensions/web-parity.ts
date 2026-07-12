@@ -215,7 +215,7 @@ async function loginWithApiKey(choice: LoginChoice, ctx: ExtensionContext): Prom
 	const apiKey = await ctx.ui.input(
 		`Enter API key for ${providerDisplayName(ctx, choice.providerId)}:`,
 		undefined,
-		{ signal: ctx.signal },
+		{ signal: ctx.signal, secret: true } as any,
 	);
 	if (apiKey === undefined) {
 		throw new Error("Login cancelled.");
@@ -271,7 +271,7 @@ async function loginWithOAuth(choice: LoginChoice, ctx: ExtensionContext): Promi
 				const value = await ctx.ui.input(
 					"Paste the authorization code or redirect URL:",
 					undefined,
-					{ signal: loginController.signal },
+					{ signal: loginController.signal, secret: true } as any,
 				);
 				if (value === undefined) {
 					throw new Error("Login cancelled.");

@@ -2,6 +2,49 @@
  * Dialogs - Handles extension UI dialogs
  */
 
+import { renderUserMarkdown } from './markdown.js';
+
+export function configureDialogInput(input, secret, label) {
+  input.type = secret === true ? 'password' : 'text';
+  input.setAttribute('aria-label', label);
+  if (secret !== true) return;
+  input.spellcheck = false;
+  input.autocapitalize = 'none';
+  input.autocomplete = 'off';
+  input.setAttribute('autocorrect', 'off');
+}
+
+export function mountExtensionNotification(documentRef, request) {
+  let region = documentRef.getElementById('extension-notifications');
+  if (!region) {
+    region = documentRef.createElement('div');
+    region.id = 'extension-notifications';
+    region.setAttribute('aria-live', 'polite');
+    documentRef.body.appendChild(region);
+  }
+
+  const notification = documentRef.createElement('div');
+  notification.className = `extension-notification ${request.notifyType || 'info'}`;
+  notification.setAttribute('role', request.notifyType === 'error' ? 'alert' : 'status');
+
+  const message = documentRef.createElement('span');
+  message.innerHTML = renderUserMarkdown(request.message || '');
+  const close = documentRef.createElement('button');
+  close.type = 'button';
+  close.className = 'extension-notification-close';
+  close.setAttribute('aria-label', 'Dismiss notification');
+  close.textContent = '×';
+
+  const dismiss = () => {
+    notification.remove();
+    if (region.childElementCount === 0) region.remove();
+  };
+  close.onclick = dismiss;
+  notification.append(message, close);
+  region.appendChild(notification);
+  return { notification, dismiss };
+}
+
 export class DialogHandler {
   constructor(container, wsClient) {
     this.container = container;
@@ -105,6 +148,7 @@ export class DialogHandler {
     `;
 
     const input = dialog.querySelector('#dialog-input');
+    configureDialogInput(input, request.secret, title || 'Input');
     
     const submit = () => {
       this.respond(id, { value: input.value });
@@ -158,24 +202,8 @@ export class DialogHandler {
   }
 
   showNotification(request) {
-    const { message, notifyType } = request;
-    
-    // Create a temporary notification element
-    const notification = document.createElement('div');
-    notification.className = 'error-message';
-    notification.textContent = `${notifyType === 'error' ? '⚠️' : notifyType === 'warning' ? '⚠️' : 'ℹ️'} ${message}`;
-    
-    // Add to messages container temporarily
-    const messagesContainer = document.getElementById('messages');
-    if (messagesContainer) {
-      messagesContainer.appendChild(notification);
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
-      
-      // Remove after 5 seconds
-      setTimeout(() => {
-        notification.remove();
-      }, 5000);
-    }
+    const { dismiss } = mountExtensionNotification(document, request);
+    setTimeout(dismiss, 30_000);
   }
 
   showDialog(dialogElement, timeout, requestId) {

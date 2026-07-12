@@ -10,9 +10,12 @@
  * - Sends full state snapshot on client connect (messages, model, etc.)
  */
 
-import type {
-  ExtensionAPI,
-  ExtensionContext,
+import {
+  getPackageDir,
+  SettingsManager,
+  VERSION,
+  type ExtensionAPI,
+  type ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
 import * as http from "node:http";
@@ -38,6 +41,13 @@ import {
 } from "./interactive-launch.ts";
 import { exportSessionToHtml } from "./pi-export.js";
 import { aggregateSessionStats } from "./session-stats.js";
+import {
+  createContextSettingsManager,
+  readAboutInfo,
+  readEnabledModelScope,
+  readProviderAccounts,
+  writeEnabledModelScope,
+} from "./settings-parity.js";
 import {
   acquireSessionLaunchReservation,
   completeSessionLaunchReservation,
@@ -1703,7 +1713,12 @@ export default function (pi: ExtensionAPI) {
     ui.input = async (title: string, placeholder?: string, opts?: any) => {
       const client = getBrowserUIClient();
       if (!client) return original.input(title, placeholder, opts);
-      const response = await requestBrowserUI(client, "input", { title, placeholder, timeout: opts?.timeout }, opts);
+      const response = await requestBrowserUI(client, "input", {
+        title,
+        placeholder,
+        timeout: opts?.timeout,
+        secret: opts?.secret === true,
+      }, opts);
       return response?.cancelled ? undefined : response?.value;
     };
     ui.editor = async (title: string, prefill?: string) => {
@@ -2559,6 +2574,45 @@ export default function (pi: ExtensionAPI) {
             break;
           }
           sendTo(ws, success("get_available_models", getModelChoices(ctx)));
+          break;
+        }
+
+        case "get_provider_accounts": {
+          if (!ctx) {
+            sendTo(ws, error("get_provider_accounts", "No context available"));
+            break;
+          }
+          sendTo(ws, success("get_provider_accounts", readProviderAccounts(ctx.modelRegistry)));
+          break;
+        }
+
+        case "get_enabled_models": {
+          if (!ctx) {
+            sendTo(ws, error("get_enabled_models", "No context available"));
+            break;
+          }
+          const settings = createContextSettingsManager(SettingsManager, ctx, PI_AGENT_DIR);
+          sendTo(ws, success("get_enabled_models", readEnabledModelScope(ctx.modelRegistry, settings)));
+          break;
+        }
+
+        case "set_enabled_models": {
+          if (!ctx) {
+            sendTo(ws, error("set_enabled_models", "No context available"));
+            break;
+          }
+          const settings = createContextSettingsManager(SettingsManager, ctx, PI_AGENT_DIR);
+          const scope = await writeEnabledModelScope(ctx.modelRegistry, settings, command.modelRefs);
+          sendTo(ws, success("set_enabled_models", scope));
+          break;
+        }
+
+        case "get_about": {
+          sendTo(ws, success("get_about", readAboutInfo({
+            piVersion: VERSION,
+            piPackageDir: getPackageDir(),
+            tauPackageJsonPath: path.resolve(__dirname, "../package.json"),
+          })));
           break;
         }
 

@@ -1,8 +1,11 @@
 const READ_ONLY_WS_COMMANDS = new Set([
   "get_auth",
+  "get_about",
   "get_available_models",
   "get_commands",
+  "get_enabled_models",
   "get_messages",
+  "get_provider_accounts",
   "get_session_stats",
   "get_state",
   "mirror_sync_request",

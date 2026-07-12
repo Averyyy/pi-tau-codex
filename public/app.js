@@ -14,6 +14,7 @@ import { getComposerState } from './composer-state.js';
 import { filterSlashCommands } from './slash-command-filter.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
+import { createSettingsParity } from './settings-parity.js';
 
 
 // Initialize components
@@ -2844,6 +2845,10 @@ const settingsMcpJson = document.getElementById('settings-mcp-json');
 const settingsPackagesJson = document.getElementById('settings-packages-json');
 const settingsReload = document.getElementById('settings-reload');
 const settingsSave = document.getElementById('settings-save');
+const settingsParity = createSettingsParity({
+  request: (command) => wsClient.request(command),
+  onModelsSaved: fetchModelInfo,
+});
 
 let webSettings = null;
 
@@ -2925,18 +2930,20 @@ async function saveWebSettings() {
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || 'Failed to save settings');
   webSettings = data;
-  statusText.textContent = 'Settings saved';
-  setTimeout(() => { statusText.textContent = 'Connected'; }, 2000);
 }
 
 settingsReload.addEventListener('click', () => {
-  loadWebSettings().catch((error) => {
+  Promise.all([loadWebSettings(), settingsParity.load()]).catch((error) => {
     messageRenderer.renderError(error.message);
   });
 });
 
 settingsSave.addEventListener('click', () => {
-  saveWebSettings().catch((error) => {
+  (async () => {
+    await saveWebSettings();
+    await settingsParity.save();
+    setStatusMessage('Settings saved', 2000);
+  })().catch((error) => {
     messageRenderer.renderError(error.message);
   });
 });
@@ -2948,6 +2955,7 @@ async function openSettings() {
   loadWebSettings().catch((error) => {
     messageRenderer.renderError(error.message);
   });
+  void settingsParity.load();
   fetchGitState();
 
   // Fetch auth state

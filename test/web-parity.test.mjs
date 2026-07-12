@@ -28,3 +28,74 @@ test("quit requires confirmation and delegates shutdown to its host after acknow
   await registeredQuit.handler("", ctx);
   assert.equal(shutdowns, 1);
 });
+
+test("API-key login explicitly marks browser input as secret", async () => {
+  const login = getWebParityCommand("login");
+  let inputOptions;
+  let stored;
+  const authStorage = {
+    reload: () => {},
+    drainErrors: () => [],
+    getAll: () => ({}),
+    getOAuthProviders: () => [],
+    set: (provider, credential) => { stored = { provider, credential }; },
+  };
+  const ctx = {
+    signal: undefined,
+    modelRegistry: {
+      authStorage,
+      getAll: () => [{ provider: "openai" }],
+      getProviderDisplayName: () => "OpenAI",
+      refresh: () => {},
+    },
+    ui: {
+      input: async (_title, _placeholder, options) => {
+        inputOptions = options;
+        return "test-key";
+      },
+      notify: () => {},
+    },
+  };
+
+  await login.handler("openai api-key", ctx, {});
+  assert.equal(inputOptions.secret, true);
+  assert.deepEqual(stored, {
+    provider: "openai",
+    credential: { type: "api_key", key: "test-key" },
+  });
+});
+
+test("OAuth manual codes are secret while ordinary OAuth prompts stay visible", async () => {
+  const login = getWebParityCommand("login");
+  const inputs = [];
+  const authStorage = {
+    reload: () => {},
+    drainErrors: () => [],
+    getAll: () => ({}),
+    getOAuthProviders: () => [{ id: "openai" }],
+    login: async (_provider, callbacks) => {
+      await callbacks.onManualCodeInput();
+      await callbacks.onPrompt({ message: "Account name", placeholder: "name", allowEmpty: false });
+    },
+  };
+  const ctx = {
+    signal: undefined,
+    modelRegistry: {
+      authStorage,
+      getAll: () => [{ provider: "openai" }],
+      getProviderDisplayName: () => "OpenAI",
+      refresh: () => {},
+    },
+    ui: {
+      input: async (title, _placeholder, options) => {
+        inputs.push({ title, options });
+        return "value";
+      },
+      notify: () => {},
+    },
+  };
+
+  await login.handler("openai oauth", ctx, {});
+  assert.equal(inputs[0].options.secret, true);
+  assert.equal(inputs[1].options.secret, undefined);
+});

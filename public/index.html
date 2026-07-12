@@ -219,9 +219,12 @@
       <div class="settings-tabs" id="settings-tabs">
         <button type="button" class="settings-tab active" data-tab="general">General</button>
         <button type="button" class="settings-tab" data-tab="interface">Interface</button>
+        <button type="button" class="settings-tab" data-tab="providers">Providers</button>
+        <button type="button" class="settings-tab" data-tab="models">Models</button>
         <button type="button" class="settings-tab" data-tab="instructions">Custom Instructions</button>
         <button type="button" class="settings-tab" data-tab="mcp">MCP</button>
         <button type="button" class="settings-tab" data-tab="extensions">Extensions</button>
+        <button type="button" class="settings-tab" data-tab="about">About</button>
       </div>
       <div class="settings-content">
         <div class="settings-tab-panel active" data-panel="general">
@@ -261,6 +264,31 @@
             </label>
           </div>
         </div>
+        <div class="settings-tab-panel" data-panel="providers">
+          <div class="settings-section fill">
+            <div class="settings-section-title">Provider accounts</div>
+            <div class="settings-panel-status" id="settings-providers-status" role="status">Loading providers...</div>
+            <div class="settings-data-list" id="settings-providers-list" aria-live="polite"></div>
+          </div>
+        </div>
+        <div class="settings-tab-panel" data-panel="models">
+          <div class="settings-section fill">
+            <div class="settings-section-title">Exact model selections</div>
+            <div class="settings-list-toolbar">
+              <input class="settings-input settings-search" id="settings-model-search" type="search" placeholder="Search models" aria-label="Search models">
+              <button type="button" class="settings-secondary" id="settings-model-select-all">Select all</button>
+            </div>
+            <div class="settings-panel-status" id="settings-models-status" role="status">Loading models...</div>
+            <div class="settings-panel-status warning" id="settings-model-project-warning" role="status" hidden></div>
+            <div class="settings-data-list settings-model-list" id="settings-models-list" aria-live="polite"></div>
+            <details class="settings-patterns" id="settings-model-patterns" hidden>
+              <summary>Preserved Pi patterns</summary>
+              <pre id="settings-model-pattern-list"></pre>
+              <p class="settings-hint">Tau leaves these patterns unchanged for Pi to resolve on the next session or reload.</p>
+            </details>
+            <p class="settings-hint">Exact selections are saved immediately. Preserved patterns remain unchanged for Pi to resolve on the next session or reload. Empty exact selections require at least one preserved pattern.</p>
+          </div>
+        </div>
         <div class="settings-tab-panel" data-panel="instructions">
           <div class="settings-section fill">
             <div class="settings-section-title">Global AGENTS.md</div>
@@ -284,6 +312,24 @@
               <span class="settings-label">Require login</span>
               <button type="button" class="settings-toggle" id="toggle-auth" aria-label="Require login"></button>
             </div>
+          </div>
+        </div>
+        <div class="settings-tab-panel" data-panel="about">
+          <div class="settings-section">
+            <div class="settings-section-title">Versions</div>
+            <div class="settings-row">
+              <span class="settings-label">Pi</span>
+              <span class="settings-version" id="settings-pi-version">...</span>
+            </div>
+            <div class="settings-row">
+              <span class="settings-label">Tau</span>
+              <span class="settings-version" id="settings-tau-version">...</span>
+            </div>
+          </div>
+          <div class="settings-section fill">
+            <div class="settings-section-title">Pi changelog</div>
+            <div class="settings-panel-status" id="settings-about-status" role="status">Loading changelog...</div>
+            <div class="settings-changelog" id="settings-changelog" aria-live="polite"></div>
           </div>
         </div>
         <div class="settings-footer">
