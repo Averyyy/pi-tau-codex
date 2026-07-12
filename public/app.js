@@ -1129,11 +1129,11 @@ const webSlashCommands = [
   { name: 'clone', description: 'Duplicate the current session', source: 'builtin', execution: 'unsupported' },
   { name: 'tree', description: 'Inspect the session tree (read-only in web)', source: 'builtin', execution: 'readonly' },
   { name: 'trust', description: 'Save the project trust decision', source: 'builtin', execution: 'unsupported' },
-  { name: 'login', description: 'Configure provider authentication', source: 'builtin', execution: 'unsupported' },
-  { name: 'logout', description: 'Remove provider authentication', source: 'builtin', execution: 'unsupported' },
+  { name: 'login', description: 'Configure provider authentication', source: 'builtin', execution: 'rpc' },
+  { name: 'logout', description: 'Remove provider authentication', source: 'builtin', execution: 'rpc' },
   { name: 'resume', description: 'Resume a different session from the sidebar', source: 'builtin', execution: 'web' },
   { name: 'reload', description: 'Reload the Tau web UI only', source: 'builtin', execution: 'web' },
-  { name: 'quit', description: 'Quit Pi', source: 'builtin', execution: 'unsupported' },
+  { name: 'quit', description: 'Quit Pi', source: 'builtin', execution: 'rpc' },
 ];
 
 const localSlashCapabilities = Object.freeze({
@@ -1177,16 +1177,16 @@ const localSlashCapabilities = Object.freeze({
     reason: 'Project trust decisions are resolved by Pi before the web mirror and have no web RPC.',
   },
   login: {
-    mode: 'unsupported',
-    enabled: false,
-    label: 'unavailable',
-    reason: 'Provider authentication is not exposed by the Tau web RPC. The Settings auth toggle controls Tau web auth only.',
+    mode: 'rpc',
+    enabled: true,
+    label: 'extension',
+    reason: 'Uses the Tau web-parity extension and Pi public auth storage API.',
   },
   logout: {
-    mode: 'unsupported',
-    enabled: false,
-    label: 'unavailable',
-    reason: 'Provider authentication is not exposed by the Tau web RPC. The Settings auth toggle controls Tau web auth only.',
+    mode: 'rpc',
+    enabled: true,
+    label: 'extension',
+    reason: 'Uses the Tau web-parity extension and Pi public auth storage API.',
   },
   resume: { mode: 'web', enabled: true, label: 'web' },
   reload: {
@@ -1214,10 +1214,10 @@ const localSlashCapabilities = Object.freeze({
     reason: 'Pi changelog access is not exposed by the Tau web RPC.',
   },
   quit: {
-    mode: 'unsupported',
-    enabled: false,
-    label: 'unavailable',
-    reason: 'The web mirror cannot safely quit the Pi process.',
+    mode: 'rpc',
+    enabled: true,
+    label: 'extension',
+    reason: 'Uses the Tau web-parity extension and Pi public ctx.shutdown() API.',
   },
 });
 

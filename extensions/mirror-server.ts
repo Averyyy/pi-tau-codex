@@ -36,6 +36,7 @@ import {
   requireSupportedLinuxTerminal,
 } from "./interactive-launch.ts";
 import { resolveSessionFilePath } from "./session-file-paths.ts";
+import { getWebParityCommand } from "./web-parity.ts";
 
 // Load tau settings from ~/.pi/agent/settings.json (falls back to env vars)
 function loadTauSettings(): { port: number; host: string; autoStart: boolean; user: string; pass: string; authEnabled?: boolean; projectsDir?: string } {
@@ -888,12 +889,12 @@ const BUILTIN_COMMAND_CAPABILITIES: Record<string, Omit<CommandCapability, "avai
     reason: "Pi's trust selector writes through its private interactive host; ExtensionContext exposes only isProjectTrusted()",
   },
   login: {
-    execution: "unsupported",
-    reason: "Provider login requires Pi's interactive OAuth/API-key flow and is not exposed by the mirror",
+    execution: "rpc",
+    reason: "Provided by the Tau web-parity extension through Pi's public auth storage API",
   },
   logout: {
-    execution: "unsupported",
-    reason: "Provider logout is not exposed by the mirror; the Settings auth toggle controls Tau web auth only",
+    execution: "rpc",
+    reason: "Provided by the Tau web-parity extension through Pi's public auth storage API",
   },
   new: {
     execution: "native",
@@ -913,8 +914,8 @@ const BUILTIN_COMMAND_CAPABILITIES: Record<string, Omit<CommandCapability, "avai
     reason: "Uses public ExtensionCommandContext.reload(); Pi reload tears down and recreates the extension runtime",
   },
   quit: {
-    execution: "unsupported",
-    reason: "Pi's quit command is interactive-host-owned; the mirror does not expose process shutdown as a slash command",
+    execution: "rpc",
+    reason: "Provided by the Tau web-parity extension through Pi's public ctx.shutdown() API",
   },
 };
 
@@ -1040,7 +1041,8 @@ function getSlashCommands(pi: ExtensionAPI, hasLiveCommandContext = false) {
       ? { execution: "rpc" as const, available: true }
       : (() => {
           const capability = BUILTIN_COMMAND_CAPABILITIES[name];
-          const available = capability?.execution === "rpc"
+          const available = !!getWebParityCommand(name)
+            || capability?.execution === "rpc"
             || (capability?.execution === "native" && hasLiveCommandContext);
           return {
             execution: capability?.execution || "unsupported",
@@ -1064,6 +1066,8 @@ function getSlashCommands(pi: ExtensionAPI, hasLiveCommandContext = false) {
       sourceInfo: command.sourceInfo,
       ...(TAU_COMMAND_NAMES.has(name)
         ? { execution: "rpc" as const, available: true }
+        : getWebParityCommand(name)
+          ? { execution: "rpc" as const, available: true }
         : {
             execution: "metadata-only" as const,
             available: false,
@@ -2118,11 +2122,12 @@ export default function (pi: ExtensionAPI) {
           const name = String(command.name || "").trim().replace(/^\/+/, "");
           const args = typeof command.args === "string" ? command.args : "";
           const handler = tauCommandHandlers.get(name);
+          const webParityCommand = getWebParityCommand(name);
           if (!name) {
             sendTo(ws, error("run_command", "Command name is required"));
             break;
           }
-          if (!handler) {
+          if (!handler && !webParityCommand) {
             sendTo(ws, error(
               "run_command",
               `/${name} is registered by Pi but is not executable through the web mirror`,
@@ -2139,9 +2144,11 @@ export default function (pi: ExtensionAPI) {
             : undefined;
           if (clients.has(ws) && !owner) throw new Error("Browser client is no longer connected");
           try {
-            const run = () => handler(args, latestCtx!);
-            await (owner ? runWithBrowserUIOwner(owner, run) : run());
-            sendTo(ws, success("run_command"));
+            const run = () => handler
+              ? handler(args, latestCtx!)
+              : webParityCommand!.handler(args, latestCtx!, pi);
+            const result = await (owner ? runWithBrowserUIOwner(owner, run) : run());
+            sendTo(ws, success("run_command", result));
           } catch (commandError) {
             sendTo(ws, error("run_command", errorText(commandError)));
           } finally {
