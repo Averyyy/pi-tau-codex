@@ -44,6 +44,7 @@ export class FileBrowser {
     this.messageInput = messageInput;
     this.onFileInserted = onFileInserted;
     this.currentPath = null;
+    this.pendingFileClick = null;
 
     this.setupDropTarget();
   }
@@ -107,12 +108,25 @@ export class FileBrowser {
         ${size ? `<span class="file-size">${size}</span>` : ''}
       `;
 
-      // Click: navigate directory or insert file path into input
-      el.addEventListener('click', () => {
+      // A file click inserts its path, while a double-click opens it natively.
+      // Delay only the file action so the browser can deliver the dblclick event
+      // without inserting a path first. Directory clicks remain immediate.
+      el.addEventListener('click', (event) => {
         if (item.isDirectory) {
+          clearTimeout(this.pendingFileClick);
+          this.pendingFileClick = null;
           this.load(item.path);
         } else {
-          this.insertPath(item.path);
+          if (event.detail > 1) {
+            clearTimeout(this.pendingFileClick);
+            this.pendingFileClick = null;
+            return;
+          }
+          clearTimeout(this.pendingFileClick);
+          this.pendingFileClick = setTimeout(() => {
+            this.pendingFileClick = null;
+            this.insertPath(item.path);
+          }, 500);
         }
       });
 
@@ -120,6 +134,8 @@ export class FileBrowser {
       el.addEventListener('dblclick', (e) => {
         e.preventDefault();
         if (!item.isDirectory) {
+          clearTimeout(this.pendingFileClick);
+          this.pendingFileClick = null;
           this.openNatively(item.path);
         }
       });

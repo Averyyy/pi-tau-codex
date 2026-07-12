@@ -778,32 +778,78 @@ function getScopedModels(ctx: ExtensionContext, availableModels: any[]): any[] {
   return uniqueModels(scoped);
 }
 
+// Pi's public getCommands() contains extension, prompt, and skill commands,
+// but intentionally omits built-ins. Keep the current runtime's built-in
+// catalog here until Pi exposes a public built-in catalog.
 const BUILTIN_SLASH_COMMANDS = [
   ["settings", "Open settings menu"],
-  ["model", "Select model"],
-  ["scoped-models", "Enable or disable models for cycling"],
-  ["export", "Export the current session"],
-  ["import", "Import and resume a session"],
-  ["share", "Share the current session"],
-  ["copy", "Copy the latest assistant message"],
-  ["name", "Set the session name"],
-  ["session", "Show session information and stats"],
+  ["model", "Select model (opens selector UI)"],
+  ["scoped-models", "Enable/disable models for Ctrl+P cycling"],
+  ["export", "Export session (HTML default, or specify path: .html/.jsonl)"],
+  ["import", "Import and resume a session from a JSONL file"],
+  ["share", "Share session as a secret GitHub gist"],
+  ["copy", "Copy last agent message to clipboard"],
+  ["name", "Set session display name"],
+  ["session", "Show session info and stats"],
   ["changelog", "Show changelog entries"],
-  ["hotkeys", "Show keyboard shortcuts"],
-  ["fork", "Create a new fork from a previous message"],
-  ["clone", "Duplicate the current session"],
-  ["tree", "Navigate the session tree"],
-  ["trust", "Save the project trust decision"],
+  ["hotkeys", "Show all keyboard shortcuts"],
+  ["fork", "Create a new fork from a previous user message"],
+  ["clone", "Duplicate the current session at the current position"],
+  ["tree", "Navigate session tree (switch branches)"],
+  ["trust", "Save project trust decision for future sessions"],
   ["login", "Configure provider authentication"],
   ["logout", "Remove provider authentication"],
   ["new", "Start a new session"],
-  ["compact", "Compact the current session"],
+  ["compact", "Manually compact the session context"],
   ["resume", "Resume a different session"],
-  ["reload", "Reload Pi resources"],
+  ["reload", "Reload keybindings, extensions, prompts, and themes"],
   ["quit", "Quit Pi"],
 ] as const;
 
-function getModelAvailability(ctx: ExtensionContext, model: any) {
+const TAU_COMMAND_NAMES = new Set(["taustop", "taustart", "tau", "qr"]);
+
+type ModelRegistryDiagnostics = {
+  registryError?: string;
+  authErrors?: string[];
+};
+
+const modelRegistryDiagnosticsCache = new WeakMap<object, ModelRegistryDiagnostics>();
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function getModelRegistryDiagnostics(registry: any): ModelRegistryDiagnostics {
+  if (registry && typeof registry === "object") {
+    const cached = modelRegistryDiagnosticsCache.get(registry);
+    if (cached) return cached;
+  }
+
+  const diagnostics: ModelRegistryDiagnostics = {};
+  if (typeof registry.getError === "function") {
+    const registryError = registry.getError();
+    if (registryError) diagnostics.registryError = String(registryError);
+  }
+
+  const drainErrors = registry.authStorage?.drainErrors;
+  if (typeof drainErrors === "function") {
+    const errors = drainErrors.call(registry.authStorage);
+    const messages = Array.isArray(errors)
+      ? errors.map(errorText).filter(Boolean)
+      : [];
+    if (messages.length > 0) diagnostics.authErrors = messages;
+  }
+  if (registry && typeof registry === "object") {
+    modelRegistryDiagnosticsCache.set(registry, diagnostics);
+  }
+  return diagnostics;
+}
+
+function getModelAvailability(
+  ctx: ExtensionContext,
+  model: any,
+  diagnostics: ModelRegistryDiagnostics = getModelRegistryDiagnostics(ctx.modelRegistry),
+) {
   const registry: any = ctx.modelRegistry;
   const available = typeof registry.hasConfiguredAuth === "function"
     ? registry.hasConfiguredAuth(model)
@@ -813,9 +859,15 @@ function getModelAvailability(ctx: ExtensionContext, model: any) {
     : undefined;
   const reason = available
     ? null
-    : authStatus?.source
-      ? `Configure authentication for ${model.provider}`
-      : "Provider authentication is not configured";
+    : diagnostics.authErrors?.[0]
+      ? `Provider authentication could not be loaded for ${model.provider}: ${diagnostics.authErrors[0]}`
+      : diagnostics.registryError
+        ? `Model registry configuration could not be loaded: ${diagnostics.registryError}`
+        : authStatus?.configured
+          ? `Provider authentication for ${model.provider} is configured but unavailable`
+          : authStatus?.source
+            ? `Provider authentication for ${model.provider} is not usable (source: ${authStatus.source})`
+            : `No provider authentication configured for ${model.provider}`;
 
   return {
     available,
@@ -827,11 +879,17 @@ function getModelAvailability(ctx: ExtensionContext, model: any) {
           label: authStatus.label,
         }
       : undefined,
+    registryError: diagnostics.registryError,
+    authErrors: diagnostics.authErrors,
   };
 }
 
-function annotateModelAvailability(ctx: ExtensionContext, model: any) {
-  return { ...model, availability: getModelAvailability(ctx, model) };
+function annotateModelAvailability(
+  ctx: ExtensionContext,
+  model: any,
+  diagnostics?: ModelRegistryDiagnostics,
+) {
+  return { ...model, availability: getModelAvailability(ctx, model, diagnostics) };
 }
 
 function stripModelAvailability(model: any) {
@@ -839,38 +897,50 @@ function stripModelAvailability(model: any) {
   return plainModel;
 }
 
-function getModelChoices(ctx: ExtensionContext): { models: any[]; scopedModels: any[] } {
-  const availableModels = ctx.modelRegistry.getAvailable();
-  const scopedModels = getScopedModels(ctx, availableModels);
-  const models = uniqueModels([...scopedModels, ...availableModels]).map((model) =>
-    annotateModelAvailability(ctx, model),
+function getModelChoices(ctx: ExtensionContext): {
+  models: any[];
+  scopedModels: any[];
+  registryError?: string;
+  authErrors?: string[];
+} {
+  const registry: any = ctx.modelRegistry;
+  const diagnostics = getModelRegistryDiagnostics(registry);
+  const allModels = typeof registry.getAll === "function"
+    ? registry.getAll()
+    : registry.getAvailable();
+  const scopedModels = getScopedModels(ctx, allModels);
+  const currentModel = ctx.model ? [ctx.model] : [];
+  const models = uniqueModels([...scopedModels, ...allModels, ...currentModel]).map((model) =>
+    annotateModelAvailability(ctx, model, diagnostics),
   );
   const scopedRefs = new Set(scopedModels.map(modelRef));
   return {
     models,
     scopedModels: models.filter((model) => scopedRefs.has(modelRef(model))),
+    ...diagnostics,
   };
 }
 
-function getSlashCommands(ctx: ExtensionContext) {
+function getSlashCommands(pi: ExtensionAPI) {
   const commands = BUILTIN_SLASH_COMMANDS.map(([name, description]) => ({
     name,
     description,
     source: "builtin",
+    execution: TAU_COMMAND_NAMES.has(name) ? "rpc" : "unsupported",
   }));
   const seen = new Set(commands.map((command) => command.name));
-  const dynamicCommands = typeof (ctx as any).getCommands === "function"
-    ? (ctx as any).getCommands()
-    : [];
+  const dynamicCommands = pi.getCommands();
 
   for (const command of dynamicCommands) {
-    const name = String(command.invocationName || command.name || "").trim();
+    const name = String(command.name || "").trim();
     if (!name || seen.has(name)) continue;
     seen.add(name);
     commands.push({
       name,
       description: command.description || "Extension command",
       source: command.source || "extension",
+      sourceInfo: command.sourceInfo,
+      execution: TAU_COMMAND_NAMES.has(name) ? "rpc" : "unsupported",
     });
   }
 
@@ -894,6 +964,15 @@ export default function (pi: ExtensionAPI) {
 
   // Store latest context reference for use in command handlers
   let latestCtx: ExtensionContext | null = null;
+  type TauCommand = {
+    description?: string;
+    handler: (args: string, ctx: ExtensionContext) => Promise<void> | void;
+  };
+  const tauCommandHandlers = new Map<string, TauCommand["handler"]>();
+  const registerTauCommand = (name: string, command: TauCommand) => {
+    tauCommandHandlers.set(name, command.handler);
+    pi.registerCommand(name, command);
+  };
 
   // Pending browser dialogs follow Pi's RPC UI semantics: callers can cancel
   // with an AbortSignal, time out, or lose the browser that owns the dialog.
@@ -1551,7 +1630,7 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // /tau-stop and /tau-start commands
   // ═══════════════════════════════════════
-  pi.registerCommand("taustop", {
+  registerTauCommand("taustop", {
     description: "Stop the Tau mirror server",
     handler: async (_args, ctx) => {
       if (!server) {
@@ -1565,7 +1644,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("taustart", {
+  registerTauCommand("taustart", {
     description: "Start the Tau mirror server",
     handler: async (_args, ctx) => {
       if (server) {
@@ -1580,7 +1659,7 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // /qr command — show QR code to connect
   // ═══════════════════════════════════════
-  pi.registerCommand("tau", {
+  registerTauCommand("tau", {
     description: "Open Tau web UI in browser",
     handler: async (_args, ctx) => {
       if (!mirrorUrl) {
@@ -1593,7 +1672,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("qr", {
+  registerTauCommand("qr", {
     description: "Show QR code for Tau mirror URL",
     handler: async (_args, ctx) => {
       if (!mirrorUrl) {
@@ -1907,6 +1986,44 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
+        case "run_command": {
+          const name = String(command.name || "").trim().replace(/^\/+/, "");
+          const args = typeof command.args === "string" ? command.args : "";
+          const handler = tauCommandHandlers.get(name);
+          if (!name) {
+            sendTo(ws, error("run_command", "Command name is required"));
+            break;
+          }
+          if (!handler) {
+            sendTo(ws, error(
+              "run_command",
+              `/${name} is registered by Pi but is not executable through the web mirror`,
+            ));
+            break;
+          }
+          if (!latestCtx) {
+            sendTo(ws, error("run_command", "No active Pi session"));
+            break;
+          }
+
+          const owner = clients.has(ws)
+            ? acquireBrowserUILease(ws, `/${name}${args ? ` ${args}` : ""}`)
+            : undefined;
+          if (clients.has(ws) && !owner) throw new Error("Browser client is no longer connected");
+          try {
+            const run = () => handler(args, latestCtx!);
+            await (owner ? runWithBrowserUIOwner(owner, run) : run());
+            sendTo(ws, success("run_command"));
+          } catch (commandError) {
+            sendTo(ws, error("run_command", errorText(commandError)));
+          } finally {
+            if (owner && browserUILease?.client === ws && browserUILease.leaseId === owner.leaseId) {
+              releaseBrowserUILease(ws);
+            }
+          }
+          break;
+        }
+
         // ─── Prompting ───
         case "prompt": {
           const owner = acquireBrowserUILease(ws, String(command.message || ""));
@@ -2028,7 +2145,7 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, error("get_commands", "No context available"));
             break;
           }
-          sendTo(ws, success("get_commands", { commands: getSlashCommands(ctx) }));
+          sendTo(ws, success("get_commands", { commands: getSlashCommands(pi) }));
           break;
         }
 

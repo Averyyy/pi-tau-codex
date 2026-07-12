@@ -1295,6 +1295,13 @@ body {
   color: var(--text-dim);
 }
 
+.model-dropdown-heading {
+  padding: 6px 12px 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .model-dropdown-menu.hidden,
 .branch-dropdown-menu.hidden {
   display: none;
@@ -1337,6 +1344,30 @@ body {
   font-family: inherit;
   font-size: 10px;
   font-weight: 400;
+}
+
+.model-dropdown-item-main {
+  display: block;
+  min-width: 0;
+}
+
+.model-dropdown-item-name,
+.model-dropdown-item-provider {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-dropdown-item-provider {
+  margin: 2px 0 0;
+}
+
+.model-dropdown-empty {
+  padding: 14px 12px;
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: center;
 }
 
 .model-dropdown-item.active,
@@ -3833,7 +3864,39 @@ body.new-session-mode .input-area {
 
   .tool-card, .thinking-block { width: 100%; }
   .tool-args-preview { max-width: 140px; }
-  .file-sidebar, #file-sidebar-toggle { display: none !important; }
+
+  /* Keep the file browser reachable without taking space from the chat. */
+  #file-sidebar-toggle { display: flex !important; }
+
+  .file-sidebar {
+    position: fixed;
+    inset: 0 0 0 auto;
+    width: min(320px, 86vw);
+    flex: 0 0 min(320px, 86vw);
+    transform: translateX(0);
+    opacity: 1;
+    overflow: hidden;
+    border-left: 1px solid var(--border);
+    background: var(--bg-frosted);
+    box-shadow: -10px 0 24px rgba(0, 0, 0, 0.3);
+    transition: transform 0.3s var(--ease), opacity 0.3s var(--ease);
+    z-index: 210;
+  }
+
+  .file-sidebar.collapsed {
+    width: min(320px, 86vw);
+    flex-basis: min(320px, 86vw);
+    transform: translateX(100%);
+    opacity: 0;
+    overflow: hidden;
+    pointer-events: none;
+  }
+
+  .image-preview-remove {
+    width: 24px;
+    height: 24px;
+    opacity: 1;
+  }
 
   /* iOS-style session list */
   .session-list {

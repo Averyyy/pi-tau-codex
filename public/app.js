@@ -63,6 +63,8 @@ const extensionTuiBridge = new ExtensionTuiBridge(wsClient, extensionWidgetsAbov
 let currentStreamingElement = null;
 let currentStreamingText = '';
 let agentErrorShown = false;
+let abortRequested = false;
+let statusResetTimer = null;
 let sessionTotalCost = 0;
 let lastInputTokens = 0;
 let contextWindowSize = 0;  // fetched from model info
@@ -91,6 +93,74 @@ function scheduleSidebarRefresh() {
   }, 250);
 }
 
+function getErrorMessage(error, fallback = 'Unknown error') {
+  if (typeof error === 'string' && error.trim()) return error.trim();
+  if (error instanceof Error && error.message) return error.message;
+
+  const candidates = [
+    error?.error,
+    error?.errorMessage,
+    error?.message,
+    error?.reason,
+    error?.data?.error,
+  ];
+  const message = candidates.find((value) => typeof value === 'string' && value.trim());
+  return message ? message.trim() : fallback;
+}
+
+function isWebSocketOpen() {
+  return wsClient.ws?.readyState === WebSocket.OPEN;
+}
+
+function setStatusMessage(message, resetAfter = 0) {
+  clearTimeout(statusResetTimer);
+  statusText.textContent = message;
+  if (resetAfter <= 0) return;
+
+  statusResetTimer = setTimeout(() => {
+    statusResetTimer = null;
+    if (state.isStreaming) {
+      statusText.textContent = 'Working...';
+    } else {
+      statusText.textContent = isWebSocketOpen() ? 'Connected' : 'Disconnected';
+    }
+  }, resetAfter);
+}
+
+function renderAppError(error, fallback = 'Request failed') {
+  const message = getErrorMessage(error, fallback);
+  messageRenderer.renderError(message);
+  return message;
+}
+
+function clearActiveToolExecutions(reason) {
+  for (const tool of state.getAllToolExecutions()) {
+    if (tool.status !== 'pending' && tool.status !== 'streaming') continue;
+    state.updateToolExecution(tool.toolCallId, {
+      status: 'error',
+      output: reason,
+      isError: true,
+    });
+    toolCardRenderer.finalizeToolCard(
+      tool.toolCallId,
+      { content: [{ type: 'text', text: reason }] },
+      true,
+    );
+  }
+}
+
+function clearStreamingUI({ flushQueue = false, reason = '' } = {}) {
+  if (reason) clearActiveToolExecutions(reason);
+  document.querySelectorAll('#messages [data-message-id="streaming"]').forEach((element) => element.remove());
+  document.getElementById('compaction-indicator')?.remove();
+  currentStreamingElement = null;
+  currentStreamingText = '';
+  currentStreamingThinking = '';
+  state.setStreaming(false);
+  showTypingIndicator(false);
+  updateUI({ flushPending: flushQueue });
+}
+
 // File browser
 const fileSidebar = document.getElementById('file-sidebar');
 const fileSidebarToggle = document.getElementById('file-sidebar-toggle');
@@ -101,21 +171,50 @@ const fileSidebarPath = document.getElementById('file-sidebar-path');
 const fileBrowser = new FileBrowser(fileList, fileSidebarPath, messageInput, (filePath) => {
   const name = filePath.split(/[/\\]/).pop() || filePath;
   const ext = name.split('.').pop()?.toLowerCase() || '';
+  if (pendingFilePaths.some((item) => item.path === filePath)) return;
   pendingFilePaths.push({ path: filePath, name, ext });
   renderAttachmentPreviews();
 });
 
-fileSidebarToggle.addEventListener('click', () => {
+function syncMobileFileSidebar() {
+  const mobile = mobileViewport.matches;
+  if (!mobile) {
+    fileSidebar.style.removeProperty('display');
+    fileSidebar.style.removeProperty('position');
+    fileSidebar.style.removeProperty('top');
+    fileSidebar.style.removeProperty('right');
+    fileSidebar.style.removeProperty('bottom');
+    fileSidebar.style.removeProperty('width');
+    fileSidebar.style.removeProperty('flex-basis');
+    fileSidebar.style.removeProperty('z-index');
+    return;
+  }
+
+  fileSidebar.style.setProperty('position', 'fixed');
+  fileSidebar.style.setProperty('top', 'var(--toolbar-height)');
+  fileSidebar.style.setProperty('right', '0');
+  fileSidebar.style.setProperty('bottom', '0');
+  fileSidebar.style.setProperty('width', 'min(86vw, 320px)');
+  fileSidebar.style.setProperty('flex-basis', 'min(86vw, 320px)');
+  fileSidebar.style.setProperty('z-index', '250');
+  fileSidebar.style.setProperty('display', fileSidebar.classList.contains('collapsed') ? 'none' : 'flex', 'important');
+}
+
+function toggleFileSidebar() {
   const isCollapsed = fileSidebar.classList.toggle('collapsed');
   if (!isCollapsed && !fileBrowser.currentPath) {
     fileBrowser.load(); // Load session cwd
   }
   localStorage.setItem('tau-file-sidebar', isCollapsed ? 'closed' : 'open');
-});
+  syncMobileFileSidebar();
+}
+
+fileSidebarToggle.addEventListener('click', toggleFileSidebar);
 
 fileSidebarClose.addEventListener('click', () => {
   fileSidebar.classList.add('collapsed');
   localStorage.setItem('tau-file-sidebar', 'closed');
+  syncMobileFileSidebar();
 });
 
 fileSidebarUp.addEventListener('click', () => {
@@ -144,6 +243,8 @@ if (localStorage.getItem('tau-file-sidebar') === 'open') {
   fileSidebar.classList.remove('collapsed');
   fileBrowser.load();
 }
+
+syncMobileFileSidebar();
 
 
 // ═══════════════════════════════════════
@@ -214,12 +315,16 @@ wsClient.addEventListener('connected', () => {
   setTimeout(fetchContextWindow, 1000);
   fetchSlashCommands().catch((error) => {
     console.error('[App] Failed to load slash commands:', error);
+    renderAppError(error, 'Failed to load slash commands');
   });
 });
 
 wsClient.addEventListener('disconnected', () => {
   dialogHandler.dismissCurrentDialog();
   clearExtensionUIState();
+  if (state.isStreaming || currentStreamingElement) {
+    clearStreamingUI({ flushQueue: false, reason: 'Connection lost while the agent was working' });
+  }
   updateConnectionStatus('disconnected');
 });
 
@@ -233,7 +338,14 @@ wsClient.addEventListener('rpcEvent', (e) => {
 });
 
 wsClient.addEventListener('serverError', (e) => {
-  messageRenderer.renderError(e.detail.message);
+  const message = renderAppError(e.detail, 'Server error');
+  if (state.isStreaming || currentStreamingElement) {
+    clearStreamingUI({ flushQueue: false, reason: message });
+  }
+});
+
+wsClient.addEventListener('response', (e) => {
+  handleRPCResponse(e.detail);
 });
 
 // Mirror mode: receive full state snapshot on connect
@@ -312,6 +424,18 @@ function handleRPCEvent(event) {
   }
 }
 
+function handleRPCResponse(response) {
+  if (response?.success !== false) return;
+
+  const message = renderAppError(
+    response,
+    `${response?.command || 'RPC command'} failed`,
+  );
+  if (response?.command === 'prompt') {
+    clearStreamingUI({ flushQueue: false, reason: message });
+  }
+}
+
 function handleCompactionStart() {
   const el = document.createElement('div');
   el.className = 'system-message compaction-message';
@@ -335,6 +459,8 @@ function handleCompactionEnd(event) {
 }
 
 function handleAgentStart() {
+  abortRequested = false;
+  agentErrorShown = false;
   state.setStreaming(true);
   showTypingIndicator(true);
   updateUI();
@@ -348,12 +474,12 @@ function handleAgentEnd(event) {
       && message.errorMessage
     ))
     : null;
-  if (failedMessage) handleAgentError({ error: failedMessage.errorMessage });
+  if (failedMessage && !abortRequested) {
+    handleAgentError({ error: failedMessage.errorMessage });
+  }
 
-  state.setStreaming(false);
-  showTypingIndicator(false);
-  currentStreamingElement = null;
-  currentStreamingText = '';
+  clearStreamingUI({ flushQueue: false });
+  abortRequested = false;
   updateUI();
 
   // Notify via tab title if unfocused
@@ -365,17 +491,16 @@ function handleAgentEnd(event) {
 }
 
 function handleAgentError(event) {
-  if (agentErrorShown) return;
-  agentErrorShown = true;
-  const errorMessage = event?.error || 'Agent failed to respond';
-  document.querySelectorAll('#messages [data-message-id="streaming"]').forEach((element) => element.remove());
-  currentStreamingElement = null;
-  currentStreamingText = '';
-  currentStreamingThinking = '';
-  state.setStreaming(false);
-  showTypingIndicator(false);
-  messageRenderer.renderError(errorMessage);
-  updateUI();
+  const errorMessage = getErrorMessage(event, 'Agent failed to respond');
+  if (abortRequested) {
+    clearStreamingUI({ flushQueue: false });
+    return;
+  }
+  if (!agentErrorShown) {
+    agentErrorShown = true;
+    renderAppError(errorMessage);
+  }
+  clearStreamingUI({ flushQueue: false, reason: errorMessage });
 }
 
 let currentStreamingThinking = '';
@@ -940,11 +1065,20 @@ function flushQueue() {
   }
 }
 
-abortBtn.addEventListener('click', () => {
+function abortCurrentAgent() {
+  if (!state.isStreaming && !currentStreamingElement) return;
+
+  const connected = isWebSocketOpen();
+  abortRequested = connected;
   wsClient.send({ type: 'abort' });
-  messageRenderer.renderError('Aborted by user');
-  showTypingIndicator(false);
-});
+  const message = connected ? 'Aborted by user' : 'Abort failed: WebSocket is not connected';
+  if (!connected) abortRequested = false;
+  clearStreamingUI({ flushQueue: false, reason: message });
+  renderAppError(message);
+  setStatusMessage(connected ? 'Aborted' : 'Abort failed', 3000);
+}
+
+abortBtn.addEventListener('click', abortCurrentAgent);
 
 // ═══════════════════════════════════════
 // Command Palette
@@ -967,13 +1101,26 @@ const commands = [
 const webSlashCommands = [
   { name: 'settings', description: 'Open settings', source: 'builtin' },
   { name: 'model', description: 'Open model picker', source: 'builtin' },
+  { name: 'scoped-models', description: 'Enable or disable models for cycling', source: 'builtin' },
   { name: 'compact', description: 'Compact context', source: 'builtin' },
   { name: 'export', description: 'Export the current session as HTML', source: 'builtin' },
+  { name: 'import', description: 'Import and resume a session from a JSONL file', source: 'builtin' },
+  { name: 'share', description: 'Share the current session', source: 'builtin' },
   { name: 'session', description: 'Show current session stats', source: 'builtin' },
   { name: 'name', description: 'Rename this session', source: 'builtin' },
   { name: 'new', description: 'Start a new session', source: 'builtin' },
   { name: 'copy', description: 'Copy the latest assistant message', source: 'builtin' },
+  { name: 'changelog', description: 'Show changelog entries', source: 'builtin' },
+  { name: 'hotkeys', description: 'Show keyboard shortcuts', source: 'builtin' },
+  { name: 'fork', description: 'Create a new fork from a previous message', source: 'builtin' },
+  { name: 'clone', description: 'Duplicate the current session', source: 'builtin' },
+  { name: 'tree', description: 'Navigate the session tree', source: 'builtin' },
+  { name: 'trust', description: 'Save the project trust decision', source: 'builtin' },
+  { name: 'login', description: 'Configure provider authentication', source: 'builtin' },
+  { name: 'logout', description: 'Remove provider authentication', source: 'builtin' },
+  { name: 'resume', description: 'Resume a different session', source: 'builtin' },
   { name: 'reload', description: 'Reload the web UI', source: 'builtin' },
+  { name: 'quit', description: 'Quit Pi', source: 'builtin' },
 ];
 
 let slashCommands = [...webSlashCommands];
@@ -986,8 +1133,9 @@ async function fetchSlashCommands() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ type: 'get_commands' }),
   });
-  const data = await resp.json();
-  if (!data.success || !Array.isArray(data.data?.commands)) return;
+  const data = await parseJsonResponse(resp, 'Failed to load slash commands');
+  if (!data.success) throw new Error(getErrorMessage(data, 'Failed to load slash commands'));
+  if (!Array.isArray(data.data?.commands)) throw new Error('Slash command registry is invalid');
 
   const seen = new Set();
   slashCommands = data.data.commands.filter((command) => {
@@ -1078,8 +1226,7 @@ async function updateSlashMenu(force = false) {
       const name = String(command.name || '').toLowerCase();
       const desc = String(command.description || '').toLowerCase();
       return !fragment.query || name.includes(fragment.query) || desc.includes(fragment.query);
-    })
-    .slice(0, 18);
+    });
 
   if (filtered.length === 0) {
     hideSlashMenu();
@@ -1110,11 +1257,11 @@ function renderSlashMenu(items, fragment) {
     item.addEventListener('mousedown', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      executeSlashCommand(command, fragment);
     });
     item.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
+      executeSlashCommand(command, fragment);
     });
     slashMenu.appendChild(item);
   });
@@ -1192,10 +1339,9 @@ function handleSlashMenuKeydown(event) {
   if (event.key === 'Enter' || event.key === 'Tab') {
     event.preventDefault();
     const commandName = items[slashSelectedIndex]?.dataset.commandName;
-    const command = slashCommands.find((item) => item.name === commandName);
+    const command = slashCommands.find((item) => String(item.name).toLowerCase() === String(commandName).toLowerCase());
     if (command) {
-      if (event.key === 'Enter') executeSlashCommand(command);
-      else selectSlashCommand(command);
+      executeSlashCommand(command);
     }
     return true;
   }
@@ -1215,6 +1361,17 @@ document.addEventListener('click', (event) => {
   }
 });
 
+function findSlashCommand(name) {
+  return slashCommands.find((command) => String(command.name).toLowerCase() === name.toLowerCase());
+}
+
+function executeRegisteredSlashCommand(command, args) {
+  return rpcCommand(
+    { type: 'run_command', name: command.name, args },
+    `Running /${command.name}...`,
+  );
+}
+
 function runSlashCommand(text) {
   if (!text.startsWith('/')) return false;
   const [rawName, ...rest] = text.slice(1).split(/\s+/);
@@ -1226,6 +1383,10 @@ function runSlashCommand(text) {
     return true;
   }
   if (name === 'model') {
+    openModelDropdown();
+    return true;
+  }
+  if (name === 'scoped-models') {
     openModelDropdown();
     return true;
   }
@@ -1241,6 +1402,18 @@ function runSlashCommand(text) {
     showSessionStats();
     return true;
   }
+  if (name === 'hotkeys') {
+    messageRenderer.renderSystemMessage([
+      'Keyboard shortcuts',
+      '/  Focus the message input',
+      'Enter  Send message',
+      'Shift+Enter  Insert a newline',
+      'Escape  Abort streaming or close the active panel',
+      'Arrow Up/Down  Move through slash commands',
+      'Tab  Execute the selected slash command',
+    ].join('\n'));
+    return true;
+  }
   if (name === 'name') {
     if (args) {
       rpcCommand({ type: 'set_session_name', name: args }, 'Renaming...');
@@ -1253,12 +1426,24 @@ function runSlashCommand(text) {
     newSession();
     return true;
   }
+  if (name === 'resume') {
+    if (isMobile() && sidebarEl.classList.contains('collapsed')) toggleSidebar();
+    sessionSearchInput.focus();
+    messageRenderer.renderSystemMessage('Select a session from the sidebar to resume it.');
+    return true;
+  }
   if (name === 'copy') {
     copyLatestAssistantMessage();
     return true;
   }
   if (name === 'reload') {
     location.reload();
+    return true;
+  }
+
+  const registeredCommand = findSlashCommand(name);
+  if (registeredCommand && registeredCommand.source !== 'builtin') {
+    void executeRegisteredSlashCommand(registeredCommand, args);
     return true;
   }
 
@@ -1279,34 +1464,43 @@ function copyLatestAssistantMessage() {
 
 async function rpcCommand(cmd, statusMsg) {
   try {
-    if (statusMsg) statusText.textContent = statusMsg;
+    if (statusMsg) setStatusMessage(statusMsg);
     const resp = await fetch('/api/rpc', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(cmd),
     });
-    const data = await resp.json();
+    const data = await parseJsonResponse(resp, `${cmd.type || 'RPC command'} failed`);
     if (data.success) {
-      statusText.textContent = 'Done';
-      setTimeout(() => { statusText.textContent = 'Connected'; }, 2000);
+      setStatusMessage('Done', 2000);
     } else {
-      statusText.textContent = data.error || 'Failed';
-      messageRenderer.renderError(data.error || 'Command failed');
-      setTimeout(() => { statusText.textContent = 'Connected'; }, 3000);
+      const message = renderAppError(data, `${cmd.type || 'RPC command'} failed`);
+      setStatusMessage(message, 3000);
     }
     return data;
   } catch (e) {
-    statusText.textContent = 'Error';
-    messageRenderer.renderError(e instanceof Error ? e.message : 'Command failed');
-    setTimeout(() => { statusText.textContent = 'Connected'; }, 3000);
+    const message = renderAppError(e, `${cmd.type || 'RPC command'} failed`);
+    setStatusMessage(message, 3000);
+    return { success: false, error: message };
   }
+}
+
+async function parseJsonResponse(response, fallback) {
+  const body = await response.text();
+  let data;
+  try {
+    data = JSON.parse(body);
+  } catch {
+    throw new Error(`${fallback} (${response.status})`);
+  }
+  if (!response.ok) throw new Error(getErrorMessage(data, `${fallback} (${response.status})`));
+  return data;
 }
 
 async function rpcExportHtml() {
   const data = await rpcCommand({ type: 'export_html' }, 'Exporting...');
   if (data?.success && data.data?.path) {
-    statusText.textContent = `Exported: ${data.data.path}`;
-    setTimeout(() => { statusText.textContent = 'Connected'; }, 4000);
+    setStatusMessage(`Exported: ${data.data.path}`, 4000);
   }
 }
 
@@ -1347,23 +1541,29 @@ async function fetchModelInfo() {
       fetch('/api/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'get_available_models' }) }),
       fetch('/api/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'get_state' }) }),
     ]);
-    const modelsData = await modelsResp.json();
-    const stateData = await stateResp.json();
+    const [modelsData, stateData] = await Promise.all([
+      parseJsonResponse(modelsResp, 'Failed to load models'),
+      parseJsonResponse(stateResp, 'Failed to load model state'),
+    ]);
 
     if (modelsData.success && modelsData.data?.models) {
       availableModels = modelsData.data.models;
       scopedModels = modelsData.data.scopedModels || [];
+    } else if (modelsData.success === false) {
+      renderAppError(modelsData, 'Failed to load models');
     }
     if (stateData.success && stateData.data?.model) {
       currentModelId = stateData.data.model.id || '';
       currentModelProvider = stateData.data.model.provider || '';
       updateModelLabel();
 
-      const model = availableModels.find(m => m.id === currentModelId);
+      const model = availableModels.find(modelIsCurrent);
       if (model?.contextWindow) {
         contextWindowSize = model.contextWindow;
         updateTokenUsage();
       }
+    } else if (stateData.success === false) {
+      renderAppError(stateData, 'Failed to load model state');
     }
     if (stateData.success && stateData.data?.thinkingLevel) {
       currentThinkingLevel = stateData.data.thinkingLevel;
@@ -1375,6 +1575,7 @@ async function fetchModelInfo() {
     }
   } catch (e) {
     console.error('[App] Failed to load model info:', e);
+    renderAppError(e, 'Failed to load model information');
   }
 }
 
@@ -1417,19 +1618,31 @@ function openModelDropdown() {
     }
   };
 
-  const renderBack = (title) => {
+  const renderBack = (title, onBack = renderConfig) => {
     const back = document.createElement('button');
     back.type = 'button';
     back.className = 'model-dropdown-back';
     back.innerHTML = `<span>‹</span><strong>${title}</strong>`;
-    back.addEventListener('click', renderConfig);
+    back.addEventListener('click', onBack);
     modelDropdownMenu.appendChild(back);
   };
 
   function renderModels() {
     modelDropdownMenu.innerHTML = '';
-    renderBack('Models');
+    const heading = document.createElement('div');
+    heading.className = 'model-dropdown-heading';
+    heading.textContent = 'Models';
+    modelDropdownMenu.appendChild(heading);
+
+    const reasoning = document.createElement('button');
+    reasoning.type = 'button';
+    reasoning.className = 'model-config-row';
+    reasoning.innerHTML = `<span>Reasoning</span><span class="model-config-value">${escapeHtml(currentThinkingLevel)}</span>${chevron}`;
+    reasoning.addEventListener('click', renderThinking);
+    modelDropdownMenu.appendChild(reasoning);
+
     let showAllModels = scopedModels.length === 0 || !scopedModels.some((model) => model.availability?.available !== false);
+    let includeUnavailable = false;
     const search = document.createElement('input');
     search.className = 'model-dropdown-search';
     search.placeholder = 'Search models…';
@@ -1441,21 +1654,37 @@ function openModelDropdown() {
 
     const renderItems = () => {
       itemsContainer.innerHTML = '';
-      const query = search.value.toLowerCase();
+      const query = search.value.trim().toLowerCase();
       const scopedIds = new Set(scopedModels.map(m => `${m.provider}/${m.id}`));
       const current = availableModels.find(modelIsCurrent);
       const scopedWithCurrent = current && !scopedIds.has(`${current.provider}/${current.id}`) ? [current, ...scopedModels] : scopedModels;
-      const activeModels = showAllModels ? availableModels : scopedWithCurrent;
-      for (const model of activeModels) {
+      const activeModels = [...(showAllModels ? availableModels : scopedWithCurrent)].sort((a, b) => {
+        const aCurrent = modelIsCurrent(a) ? 0 : 1;
+        const bCurrent = modelIsCurrent(b) ? 0 : 1;
+        if (aCurrent !== bCurrent) return aCurrent - bCurrent;
+        const aAvailable = a.availability?.available === false ? 1 : 0;
+        const bAvailable = b.availability?.available === false ? 1 : 0;
+        if (aAvailable !== bAvailable) return aAvailable - bAvailable;
+        const providerCompare = String(a.provider || '').localeCompare(String(b.provider || ''));
+        if (providerCompare !== 0) return providerCompare;
+        return String(a.id || '').localeCompare(String(b.id || ''));
+      });
+      const visibleModels = activeModels.filter((model) => {
+        const available = model.availability?.available !== false;
+        const searchableText = `${model.id || ''} ${model.provider || ''}`.toLowerCase();
+        if (query && !searchableText.includes(query)) return false;
+        return available || includeUnavailable || Boolean(query) || modelIsCurrent(model);
+      });
+
+      for (const model of visibleModels) {
         const shortName = model.id.replace(/-\d{8}$/, '');
-        if (query && !`${shortName} ${model.provider || ''}`.toLowerCase().includes(query)) continue;
         const item = document.createElement('button');
         item.type = 'button';
         const available = model.availability?.available !== false;
         const availabilityReason = model.availability?.reason || 'Provider authentication is not configured';
         item.disabled = !available;
         item.className = `model-dropdown-item${modelIsCurrent(model) ? ' active' : ''}${available ? '' : ' unavailable'}`;
-        item.innerHTML = `<span>${escapeHtml(shortName)}<span class="model-dropdown-item-provider">${escapeHtml(model.provider || '')}</span>${available ? '' : `<span class="model-dropdown-item-availability">${escapeHtml(availabilityReason)}</span>`}</span>${modelIsCurrent(model) ? '<span>✓</span>' : ''}`;
+        item.innerHTML = `<span class="model-dropdown-item-main"><span class="model-dropdown-item-name">${escapeHtml(shortName)}</span><span class="model-dropdown-item-provider">${escapeHtml(model.provider || '')}</span>${available ? '' : `<span class="model-dropdown-item-availability">${escapeHtml(availabilityReason)}</span>`}</span>${modelIsCurrent(model) ? '<span>✓</span>' : ''}`;
         if (!available) {
           item.title = availabilityReason;
           itemsContainer.appendChild(item);
@@ -1474,11 +1703,35 @@ function openModelDropdown() {
         });
         itemsContainer.appendChild(item);
       }
+
+      if (visibleModels.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'model-dropdown-empty';
+        empty.textContent = query ? 'No matching models' : 'No available models';
+        itemsContainer.appendChild(empty);
+      }
+
+      const unavailableCount = activeModels.filter((model) => model.availability?.available === false).length;
+      if (unavailableCount > 0) {
+        const availabilityToggle = document.createElement('button');
+        availabilityToggle.type = 'button';
+        availabilityToggle.className = 'model-dropdown-scope-btn';
+        availabilityToggle.textContent = includeUnavailable
+          ? 'Hide unavailable models'
+          : `Show unavailable models (${unavailableCount})`;
+        availabilityToggle.addEventListener('click', () => {
+          includeUnavailable = !includeUnavailable;
+          renderItems();
+        });
+        itemsContainer.appendChild(availabilityToggle);
+      }
+
       if (scopedModels.length > 0) {
         const toggle = document.createElement('button');
         toggle.type = 'button';
         toggle.className = 'model-dropdown-scope-btn';
-        toggle.textContent = showAllModels ? 'Show scoped models' : `Show other models (${Math.max(0, availableModels.length - scopedModels.length)})`;
+        const otherCount = availableModels.filter((model) => !scopedIds.has(`${model.provider}/${model.id}`)).length;
+        toggle.textContent = showAllModels ? 'Show scoped models' : `Show other models (${otherCount})`;
         toggle.addEventListener('click', () => { showAllModels = !showAllModels; renderItems(); });
         itemsContainer.appendChild(toggle);
       }
@@ -1490,7 +1743,7 @@ function openModelDropdown() {
 
   function renderThinking() {
     modelDropdownMenu.innerHTML = '';
-    renderBack('Reasoning');
+    renderBack('Reasoning', renderModels);
     const levels = Array.from(new Set([...availableThinkingLevels, currentThinkingLevel])).filter(Boolean);
     for (const level of levels) {
       const item = document.createElement('button');
@@ -1508,7 +1761,7 @@ function openModelDropdown() {
     }
   }
 
-  renderConfig();
+  renderModels();
 
   modelDropdownMenu.classList.remove('hidden');
   modelDropdown.classList.add('open');
@@ -1630,9 +1883,7 @@ document.addEventListener('keydown', (e) => {
     }
 
     if (state.isStreaming) {
-      wsClient.send({ type: 'abort' });
-      messageRenderer.renderError('Aborted by user');
-      showTypingIndicator(false);
+      abortCurrentAgent();
     } else if (!sidebarEl.classList.contains('collapsed') && window.innerWidth <= 768) {
       toggleSidebar();
     }
@@ -1873,6 +2124,11 @@ function handleMirrorSync(data) {
   clearExtensionUIState();
   isMirrorMode = true;
 
+  if (typeof data.isStreaming === 'boolean') {
+    state.setStreaming(data.isStreaming);
+    showTypingIndicator(data.isStreaming);
+  }
+
   // Track the active session
   mirrorActiveSessionFile = data.sessionFile || null;
   sidebar.setActive(mirrorActiveSessionFile);
@@ -1913,6 +2169,7 @@ function handleMirrorSync(data) {
 
   updateCostDisplay();
   updateTokenUsage();
+  updateUI();
 }
 
 // Mark all live sessions in the sidebar with a green dot
@@ -2286,7 +2543,7 @@ function updateConnectionStatus(status) {
   }
 }
 
-function updateUI() {
+function updateUI({ flushPending = true } = {}) {
   const isStreaming = state.isStreaming;
 
   if (isStreaming) {
@@ -2306,7 +2563,7 @@ function updateUI() {
   } else {
     abortBtn.classList.add('hidden');
     sendBtn.classList.remove('hidden');
-    if (!getCurrentComposerState().disabled) flushQueue();
+    if (flushPending && !getCurrentComposerState().disabled) flushQueue();
   }
 }
 
