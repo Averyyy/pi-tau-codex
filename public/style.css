@@ -1369,22 +1369,6 @@ button.token-usage {
   background: var(--bg-glass-hover);
 }
 
-.model-dropdown-item.unavailable,
-.model-dropdown-item.unavailable:hover {
-  color: var(--text-dim);
-  cursor: not-allowed;
-  opacity: 0.72;
-}
-
-.model-dropdown-item-availability {
-  display: block;
-  margin-top: 2px;
-  color: var(--error);
-  font-family: inherit;
-  font-size: 10px;
-  font-weight: 400;
-}
-
 .model-dropdown-item-main {
   display: block;
   min-width: 0;

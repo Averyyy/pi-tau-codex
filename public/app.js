@@ -2043,8 +2043,10 @@ function openModelDropdown() {
     reasoning.addEventListener('click', renderThinking);
     modelDropdownMenu.appendChild(reasoning);
 
-    let showAllModels = scopedModels.length === 0 || !scopedModels.some((model) => model.availability?.available !== false);
-    let includeUnavailable = false;
+    const isModelAvailable = (model) => model.availability?.available !== false;
+    const loggedInModels = availableModels.filter(isModelAvailable);
+    const availableScopedModels = scopedModels.filter(isModelAvailable);
+    let showAllModels = availableScopedModels.length === 0;
     const search = document.createElement('input');
     search.className = 'model-dropdown-search';
     search.placeholder = 'Search models…';
@@ -2057,41 +2059,28 @@ function openModelDropdown() {
     const renderItems = () => {
       itemsContainer.innerHTML = '';
       const query = search.value.trim().toLowerCase();
-      const scopedIds = new Set(scopedModels.map(m => `${m.provider}/${m.id}`));
-      const current = availableModels.find(modelIsCurrent);
-      const scopedWithCurrent = current && !scopedIds.has(`${current.provider}/${current.id}`) ? [current, ...scopedModels] : scopedModels;
-      const activeModels = [...(showAllModels ? availableModels : scopedWithCurrent)].sort((a, b) => {
+      const scopedIds = new Set(availableScopedModels.map(m => `${m.provider}/${m.id}`));
+      const current = loggedInModels.find(modelIsCurrent);
+      const scopedWithCurrent = current && !scopedIds.has(`${current.provider}/${current.id}`) ? [current, ...availableScopedModels] : availableScopedModels;
+      const activeModels = [...(showAllModels ? loggedInModels : scopedWithCurrent)].sort((a, b) => {
         const aCurrent = modelIsCurrent(a) ? 0 : 1;
         const bCurrent = modelIsCurrent(b) ? 0 : 1;
         if (aCurrent !== bCurrent) return aCurrent - bCurrent;
-        const aAvailable = a.availability?.available === false ? 1 : 0;
-        const bAvailable = b.availability?.available === false ? 1 : 0;
-        if (aAvailable !== bAvailable) return aAvailable - bAvailable;
         const providerCompare = String(a.provider || '').localeCompare(String(b.provider || ''));
         if (providerCompare !== 0) return providerCompare;
         return String(a.id || '').localeCompare(String(b.id || ''));
       });
       const visibleModels = activeModels.filter((model) => {
-        const available = model.availability?.available !== false;
         const searchableText = `${model.id || ''} ${model.provider || ''}`.toLowerCase();
-        if (query && !searchableText.includes(query)) return false;
-        return available || includeUnavailable || Boolean(query) || modelIsCurrent(model);
+        return !query || searchableText.includes(query);
       });
 
       for (const model of visibleModels) {
         const shortName = model.id.replace(/-\d{8}$/, '');
         const item = document.createElement('button');
         item.type = 'button';
-        const available = model.availability?.available !== false;
-        const availabilityReason = model.availability?.reason || 'Provider authentication is not configured';
-        item.disabled = !available;
-        item.className = `model-dropdown-item${modelIsCurrent(model) ? ' active' : ''}${available ? '' : ' unavailable'}`;
-        item.innerHTML = `<span class="model-dropdown-item-main"><span class="model-dropdown-item-name">${escapeHtml(shortName)}</span><span class="model-dropdown-item-provider">${escapeHtml(model.provider || '')}</span>${available ? '' : `<span class="model-dropdown-item-availability">${escapeHtml(availabilityReason)}</span>`}</span>${modelIsCurrent(model) ? '<span>✓</span>' : ''}`;
-        if (!available) {
-          item.title = availabilityReason;
-          itemsContainer.appendChild(item);
-          continue;
-        }
+        item.className = `model-dropdown-item${modelIsCurrent(model) ? ' active' : ''}`;
+        item.innerHTML = `<span class="model-dropdown-item-main"><span class="model-dropdown-item-name">${escapeHtml(shortName)}</span><span class="model-dropdown-item-provider">${escapeHtml(model.provider || '')}</span></span>${modelIsCurrent(model) ? '<span>✓</span>' : ''}`;
         item.addEventListener('click', async () => {
           const data = await rpcCommand({ type: 'set_model', provider: model.provider, modelId: model.id }, `Switching to ${shortName}...`);
           if (!data?.success) return;
@@ -2113,27 +2102,11 @@ function openModelDropdown() {
         itemsContainer.appendChild(empty);
       }
 
-      const unavailableCount = activeModels.filter((model) => model.availability?.available === false).length;
-      if (unavailableCount > 0) {
-        const availabilityToggle = document.createElement('button');
-        availabilityToggle.type = 'button';
-        availabilityToggle.className = 'model-dropdown-scope-btn';
-        availabilityToggle.textContent = includeUnavailable
-          ? 'Hide unavailable models'
-          : `Show unavailable models (${unavailableCount})`;
-        availabilityToggle.addEventListener('click', () => {
-          includeUnavailable = !includeUnavailable;
-          renderItems();
-        });
-        itemsContainer.appendChild(availabilityToggle);
-      }
-
-      if (scopedModels.length > 0) {
+      if (availableScopedModels.length > 0) {
         const toggle = document.createElement('button');
         toggle.type = 'button';
         toggle.className = 'model-dropdown-scope-btn';
-        const otherCount = availableModels.filter((model) => !scopedIds.has(`${model.provider}/${model.id}`)).length;
-        toggle.textContent = showAllModels ? 'Show scoped models' : `Show other models (${otherCount})`;
+        toggle.textContent = showAllModels ? 'Show scoped models' : `Show all models (${loggedInModels.length})`;
         toggle.addEventListener('click', () => { showAllModels = !showAllModels; renderItems(); });
         itemsContainer.appendChild(toggle);
       }
