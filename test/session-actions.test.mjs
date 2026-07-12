@@ -15,6 +15,11 @@ const {
   sessionInfoRows,
 } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
 
+test('Connect lists the main local URL and the separate LAN URL', () => {
+  assert.match(source, /\['Local', health\.mirrorUrl\]/);
+  assert.match(source, /\['LAN', health\.lanUrl\]/);
+});
+
 test('new-session drafts never fall back to the previous live session', () => {
   assert.equal(resolveSessionActionContext({
     session: null,

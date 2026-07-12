@@ -336,6 +336,7 @@ export function createSessionActions({
       const urls = [
         ['Current', locationRef.origin],
         ['Local', health.mirrorUrl],
+        ['LAN', health.lanUrl],
         ['Tailscale', health.tailscaleUrl],
       ].filter(([, url]) => Boolean(url));
       const list = documentRef.createElement('div');

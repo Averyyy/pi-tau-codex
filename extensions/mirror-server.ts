@@ -2042,6 +2042,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   let mirrorUrl = "";
+  let lanUrl = "";
   let tailscaleUrl = "";
 
   // ═══════════════════════════════════════
@@ -2081,6 +2082,7 @@ export default function (pi: ExtensionAPI) {
     devClients.clear();
     unregisterInstance();
     mirrorUrl = "";
+    lanUrl = "";
     tailscaleUrl = "";
   }
 
@@ -2140,8 +2142,12 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Mirror server not running yet", "warning");
         return;
       }
+      if (!lanUrl && !tailscaleUrl) {
+        ctx.ui.notify("No remote connection URL is available", "warning");
+        return;
+      }
       const qrPageUrl = `${mirrorUrl}/api/qr`;
-      ctx.ui.notify(`Tau: ${mirrorUrl}  •  QR: ${qrPageUrl}`, "info");
+      ctx.ui.notify(`Tau:${lanUrl ? ` LAN: ${lanUrl}` : ""}${tailscaleUrl ? ` Tailscale: ${tailscaleUrl}` : ""}  •  QR: ${qrPageUrl}`, "info");
       // Open in default browser
       const { exec } = require("node:child_process");
       exec(`open "${qrPageUrl}"`);
@@ -3163,23 +3169,23 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (urlPath === "/api/qr") {
-      if (!mirrorUrl) {
+      const qrUrls = [
+        { label: "LAN", url: lanUrl },
+        { label: "TAILSCALE", url: tailscaleUrl },
+      ].filter(({ url }) => url);
+      if (qrUrls.length === 0) {
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Server not ready" }));
+        res.end(JSON.stringify({ error: "No remote connection URL is available" }));
         return;
       }
-      const qrPromises = [QRCode.toDataURL(mirrorUrl, { width: 256, margin: 2 })];
-      if (tailscaleUrl) qrPromises.push(QRCode.toDataURL(tailscaleUrl, { width: 256, margin: 2 }));
-      Promise.all(qrPromises).then((dataUrls: string[]) => {
-        const tsSection = tailscaleUrl && dataUrls[1]
-          ? `<p style="margin-top:24px;color:rgba(255,255,255,0.3);font-size:11px">TAILSCALE</p><img src="${dataUrls[1]}" width="256" height="256" alt="Tailscale QR"><a href="${tailscaleUrl}">${tailscaleUrl}</a>`
-          : "";
+      Promise.all(qrUrls.map(({ url }) => QRCode.toDataURL(url, { width: 256, margin: 2 }))).then((dataUrls: string[]) => {
+        const sections = qrUrls.map(({ label, url }, index) => `<p style="${index ? "margin-top:24px;" : ""}color:rgba(255,255,255,0.3);font-size:11px">${label}</p><img src="${dataUrls[index]}" width="256" height="256" alt="${label} QR"><a href="${url}">${url}</a>`).join("");
         res.writeHead(200, { "Content-Type": "text/html" });
         res.end(`<!DOCTYPE html>
 <html><head><meta name="viewport" content="width=device-width"><title>Tau — Connect</title>
 <style>body{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#131316;color:#fff;font-family:-apple-system,sans-serif}
 img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rgba(255,255,255,0.5);font-size:13px;margin-top:8px}</style>
-</head><body><p style="color:rgba(255,255,255,0.3);font-size:11px">LAN</p><img src="${dataUrls[0]}" width="256" height="256" alt="QR Code"><a href="${mirrorUrl}">${mirrorUrl}</a>${tsSection}<p style="margin-top:16px">Scan to open Tau on your phone</p></body></html>`);
+</head><body>${sections}<p style="margin-top:16px">Scan to open Tau on your phone</p></body></html>`);
       }).catch((e: any) => {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: e.message }));
@@ -3189,7 +3195,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
     if (urlPath === "/api/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", mode: "mirror", mirrorUrl, tailscaleUrl: tailscaleUrl || undefined, platform: process.platform }));
+      res.end(JSON.stringify({ status: "ok", mode: "mirror", mirrorUrl, lanUrl: lanUrl || undefined, tailscaleUrl: tailscaleUrl || undefined, platform: process.platform }));
       return;
     }
 
@@ -4380,15 +4386,15 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     };
 
     const onListening = (port: number) => {
+      const isWildcard = HOST === "0.0.0.0" || HOST === "::";
       const isLoopback = HOST === "127.0.0.1" || HOST === "::1" || HOST === "localhost";
 
-      let localIp = "localhost";
+      let localIp = !isWildcard && !isLoopback ? HOST : "";
       let tailscaleIp = "";
 
-      if (!isLoopback) {
+      if (isWildcard) {
         // Get local IP for display — prefer en0/en1 (WiFi/Ethernet) over bridges/VPNs
         const nets = require("node:os").networkInterfaces();
-        let fallbackIp = "";
         const preferred = ["en0", "en1"];
         for (const name of preferred) {
           for (const net of nets[name] || []) {
@@ -4397,9 +4403,9 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
               break;
             }
           }
-          if (localIp !== "localhost") break;
+          if (localIp) break;
         }
-        if (localIp === "localhost") {
+        if (!localIp) {
           for (const name of Object.keys(nets)) {
             if (name.startsWith("bridge") || name.startsWith("utun") || name.startsWith("lo")) continue;
             for (const net of nets[name] || []) {
@@ -4408,10 +4414,9 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
                 break;
               }
             }
-            if (localIp !== "localhost") break;
+            if (localIp) break;
           }
         }
-        if (localIp === "localhost" && fallbackIp) localIp = fallbackIp;
 
         // Detect Tailscale IP (100.x.x.x CGNAT range)
         for (const name of Object.keys(nets)) {
@@ -4425,16 +4430,21 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         }
       }
 
-      mirrorUrl = `http://${localIp}:${port}`;
+      const mirrorHost = isWildcard || isLoopback
+        ? "localhost"
+        : HOST.includes(":") ? `[${HOST}]` : HOST;
+      const lanHost = localIp.includes(":") ? `[${localIp}]` : localIp;
+      mirrorUrl = `http://${mirrorHost}:${port}`;
+      lanUrl = lanHost ? `http://${lanHost}:${port}` : "";
       tailscaleUrl = tailscaleIp ? `http://${tailscaleIp}:${port}` : "";
-      console.log(`[Mirror] Tau mirror server running on ${mirrorUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ""}`);
-      ctx.ui.setStatus("mirror", `Mirror: ${localIp}:${port}${tailscaleIp ? ` • TS: ${tailscaleIp}:${port}` : ""}`);
+      console.log(`[Mirror] Tau mirror server running on ${mirrorUrl}${lanUrl ? `  •  LAN: ${lanUrl}` : ""}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ""}`);
+      ctx.ui.setStatus("mirror", `Mirror: ${mirrorHost}:${port}${lanHost ? ` • LAN: ${lanHost}:${port}` : ""}${tailscaleIp ? ` • TS: ${tailscaleIp}:${port}` : ""}`);
 
       // Register this instance
       const sessionFile = ctx.sessionManager.getSessionFile() || "";
       registerInstance(port, sessionFile, ctx.cwd || process.cwd());
 
-      ctx.ui.notify(`Tau mirror: ${mirrorUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ""}  •  /qr for QR code`, "info");
+      ctx.ui.notify(`Tau mirror: ${mirrorUrl}${lanUrl ? `  •  LAN: ${lanUrl}` : ""}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ""}  •  /qr for QR code`, "info");
     };
 
     tryListen(PORT);

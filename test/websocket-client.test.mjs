@@ -96,32 +96,40 @@ test('request correlates a successful response and attaches the connection token
   client.disconnect();
 });
 
-test('concurrent requests resolve correctly when responses arrive in reverse order', async () => {
+test('request ids stay unique without crypto.randomUUID and correlate reverse-order responses', async () => {
+  const randomUUIDDescriptor = Object.getOwnPropertyDescriptor(globalThis.crypto, 'randomUUID');
+  Object.defineProperty(globalThis.crypto, 'randomUUID', { value: undefined, configurable: true });
   const client = connectedClient();
-  const firstPromise = client.request({ type: 'get_state' });
-  const secondPromise = client.request({ type: 'get_messages' });
-  const [firstRequest, secondRequest] = client.ws.sent.slice(-2);
+  try {
+    const firstPromise = client.request({ type: 'get_state' });
+    const secondPromise = client.request({ type: 'get_messages' });
+    const [firstRequest, secondRequest] = client.ws.sent.slice(-2);
+    assert.notEqual(firstRequest.id, secondRequest.id);
 
-  client.ws.receive({
-    type: 'response',
-    id: secondRequest.id,
-    command: 'get_messages',
-    success: true,
-    data: { order: 2 },
-  });
-  assert.deepEqual((await secondPromise).data, { order: 2 });
-  assert.equal(client.pending.size, 1);
+    client.ws.receive({
+      type: 'response',
+      id: secondRequest.id,
+      command: 'get_messages',
+      success: true,
+      data: { order: 2 },
+    });
+    assert.deepEqual((await secondPromise).data, { order: 2 });
+    assert.equal(client.pending.size, 1);
 
-  client.ws.receive({
-    type: 'response',
-    id: firstRequest.id,
-    command: 'get_state',
-    success: true,
-    data: { order: 1 },
-  });
-  assert.deepEqual((await firstPromise).data, { order: 1 });
-  assert.equal(client.pending.size, 0);
-  client.disconnect();
+    client.ws.receive({
+      type: 'response',
+      id: firstRequest.id,
+      command: 'get_state',
+      success: true,
+      data: { order: 1 },
+    });
+    assert.deepEqual((await firstPromise).data, { order: 1 });
+    assert.equal(client.pending.size, 0);
+  } finally {
+    if (randomUUIDDescriptor) Object.defineProperty(globalThis.crypto, 'randomUUID', randomUUIDDescriptor);
+    else delete globalThis.crypto.randomUUID;
+    client.disconnect();
+  }
 });
 
 test('request rejects server failures without discarding response data', async () => {

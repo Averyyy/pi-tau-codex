@@ -30,6 +30,7 @@ export class WebSocketClient extends EventTarget {
     this.url = url;
     this.ws = null;
     this.pending = new Map();
+    this.nextRequestId = 1;
     this.mutationToken = null;
     this.tokenWaiters = new Set();
     this.reconnectAttempts = 0;
@@ -150,7 +151,7 @@ export class WebSocketClient extends EventTarget {
       || (!this.mutationToken && !['idle', 'connecting', 'handshaking'].includes(this.connectionState))) {
       return Promise.reject(new Error('WebSocket is not connected'));
     }
-    const id = crypto.randomUUID();
+    const id = String(this.nextRequestId++);
 
     return new Promise((resolve, reject) => {
       const abort = () => {

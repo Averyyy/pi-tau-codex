@@ -56,6 +56,10 @@ function clearLegacySidebarPreferences() {
   for (const key of LEGACY_PREFERENCE_KEYS) localStorage.removeItem(key);
 }
 
+function hasLegacySidebarPreferences() {
+  return LEGACY_PREFERENCE_KEYS.some((key) => localStorage.getItem(key) !== null);
+}
+
 export class SessionSidebar {
   constructor(container, onSessionSelect, mutationFetch, onSessionAction) {
     this.container = container;
@@ -102,15 +106,21 @@ export class SessionSidebar {
   }
 
   async bootstrapPreferences() {
-    const res = await this.mutationFetch('/api/sidebar-preferences', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'bootstrap', preferences: readLegacySidebarPreferences() }),
-    });
-    if (!res.ok) throw new Error((await res.json()).error || 'Failed to load sidebar preferences');
+    const res = await fetch('/api/sidebar-preferences');
     const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Failed to load sidebar preferences');
     this.applyPreferences(data.preferences);
-    clearLegacySidebarPreferences();
+    if (!hasLegacySidebarPreferences()) return;
+
+    try {
+      await this.queuePreferenceMutation({
+        type: 'bootstrap',
+        preferences: readLegacySidebarPreferences(),
+      }, false);
+      clearLegacySidebarPreferences();
+    } catch (error) {
+      console.error('[Sidebar] Failed to migrate legacy preferences:', error);
+    }
   }
 
   ensurePreferencesReady() {
@@ -191,7 +201,15 @@ export class SessionSidebar {
       .filter((project) => this.collapsedProjects.has(project.dirName) && !this.collapsedProjects.has(project.path))
       .map((project) => ({ projectPath: project.path, legacyKey: project.dirName }));
     if (mappings.length > 0) {
-      await this.queuePreferenceMutation({ type: 'normalize_collapsed_projects', mappings }, false);
+      for (const { projectPath, legacyKey } of mappings) {
+        this.collapsedProjects.delete(legacyKey);
+        this.collapsedProjects.add(projectPath);
+      }
+      try {
+        await this.queuePreferenceMutation({ type: 'normalize_collapsed_projects', mappings }, false);
+      } catch (error) {
+        console.error('[Sidebar] Failed to normalize collapsed projects:', error);
+      }
     }
   }
 

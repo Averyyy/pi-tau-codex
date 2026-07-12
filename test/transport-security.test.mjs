@@ -63,7 +63,8 @@ test('WebSocket policy uses an explicit read allowlist', () => {
   assert.equal(isWebSocketMutation('get_about'), false);
   assert.equal(isWebSocketMutation('set_enabled_models'), true);
   assert.equal(isWebSocketMutation('extension_ui_response'), true);
-  assert.equal(isWebSocketMutation('extension_tui_resize'), true);
+  assert.equal(isWebSocketMutation('extension_tui_resize'), false);
+  assert.equal(isWebSocketMutation('extension_tui_input'), true);
   assert.equal(isWebSocketMutation('prompt'), true);
   assert.equal(isWebSocketMutation('unknown_future_command'), true);
 });

@@ -8,6 +8,7 @@ const READ_ONLY_WS_COMMANDS = new Set([
   "get_provider_accounts",
   "get_session_stats",
   "get_state",
+  "extension_tui_resize",
   "mirror_sync_request",
 ]);
 

@@ -7,6 +7,37 @@ const { SessionSidebar } = await import(
   `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`,
 );
 
+const preferences = {
+  revision: 0,
+  favourites: [],
+  hiddenProjects: [],
+  projectNames: {},
+  projectOrder: [],
+  pinnedProjects: [],
+  collapsedProjects: [],
+  sections: {
+    favouritesOpen: true,
+    projectsOpen: true,
+    tasksOpen: true,
+    hiddenProjectsOpen: false,
+  },
+};
+
+function sidebarHarness(mutationFetch) {
+  return {
+    container: { innerHTML: '' },
+    mutationFetch,
+    preferenceWrites: Promise.resolve(),
+    preferencesReady: null,
+    bootstrapPreferences: SessionSidebar.prototype.bootstrapPreferences,
+    ensurePreferencesReady: SessionSidebar.prototype.ensurePreferencesReady,
+    queuePreferenceMutation: SessionSidebar.prototype.queuePreferenceMutation,
+    applyPreferences: SessionSidebar.prototype.applyPreferences,
+    normalizeCollapsedProjectKeys: SessionSidebar.prototype.normalizeCollapsedProjectKeys,
+    render() { this.rendered = true; },
+  };
+}
+
 test('an empty full-text result removes the previous result group', () => {
   let removed = false;
   SessionSidebar.prototype.renderSearchResults.call({
@@ -163,4 +194,118 @@ test('preference bootstrap can retry after an initial connection failure', async
   assert.equal(sidebar.preferencesReady, null);
   await SessionSidebar.prototype.ensurePreferencesReady.call(sidebar);
   assert.equal(calls, 2);
+});
+
+test('read-only first load gets preferences and sessions without a mutation', async () => {
+  const originalFetch = globalThis.fetch;
+  const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const requests = [];
+  let mutationCalls = 0;
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: { getItem: () => null },
+  });
+  globalThis.fetch = async (url) => {
+    requests.push(url);
+    return {
+      ok: true,
+      json: async () => url === '/api/sidebar-preferences'
+        ? { preferences }
+        : { projects: [], tasks: null },
+    };
+  };
+  const sidebar = sidebarHarness(async () => {
+    mutationCalls += 1;
+    throw new Error('Remote mutations require enabled Basic authentication');
+  });
+
+  try {
+    await SessionSidebar.prototype.loadSessions.call(sidebar, false);
+    assert.deepEqual(requests, ['/api/sidebar-preferences', '/api/sessions']);
+    assert.equal(mutationCalls, 0);
+    assert.equal(sidebar.rendered, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (storageDescriptor) Object.defineProperty(globalThis, 'localStorage', storageDescriptor);
+    else delete globalThis.localStorage;
+  }
+});
+
+test('failed legacy migration keeps its localStorage keys', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalConsoleError = console.error;
+  const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const storage = new Map([['tau-favourites', '["/legacy/session.jsonl"]']]);
+  const errors = [];
+  const requests = [];
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key) => storage.get(key) ?? null,
+      removeItem: (key) => storage.delete(key),
+    },
+  });
+  globalThis.fetch = async (url) => {
+    requests.push(url);
+    return {
+      ok: true,
+      json: async () => url === '/api/sidebar-preferences'
+        ? { preferences }
+        : { projects: [], tasks: null },
+    };
+  };
+  console.error = (...args) => errors.push(args);
+  const sidebar = sidebarHarness(async () => {
+    throw new Error('Remote mutations require enabled Basic authentication');
+  });
+
+  try {
+    await SessionSidebar.prototype.loadSessions.call(sidebar, false);
+    assert.deepEqual(requests, ['/api/sidebar-preferences', '/api/sessions']);
+    assert.equal(sidebar.rendered, true);
+    assert.equal(storage.has('tau-favourites'), true);
+    assert.match(errors[0][0], /Failed to migrate legacy preferences/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.error = originalConsoleError;
+    if (storageDescriptor) Object.defineProperty(globalThis, 'localStorage', storageDescriptor);
+    else delete globalThis.localStorage;
+  }
+});
+
+test('failed collapsed-project normalization still renders the migrated local state', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalConsoleError = console.error;
+  const errors = [];
+  let mutation;
+  console.error = (...args) => errors.push(args);
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => ({ projects: [{ path: '/repo', dirName: 'repo' }], tasks: null }),
+  });
+  const sidebar = {
+    container: { innerHTML: '' },
+    collapsedProjects: new Set(['repo']),
+    ensurePreferencesReady: async () => {},
+    normalizeCollapsedProjectKeys: SessionSidebar.prototype.normalizeCollapsedProjectKeys,
+    queuePreferenceMutation: async (value) => {
+      mutation = value;
+      throw new Error('Remote mutations require enabled Basic authentication');
+    },
+    render() { this.rendered = true; },
+  };
+
+  try {
+    await SessionSidebar.prototype.loadSessions.call(sidebar, false);
+    assert.deepEqual(mutation, {
+      type: 'normalize_collapsed_projects',
+      mappings: [{ projectPath: '/repo', legacyKey: 'repo' }],
+    });
+    assert.deepEqual([...sidebar.collapsedProjects], ['/repo']);
+    assert.equal(sidebar.rendered, true);
+    assert.match(errors[0][0], /Failed to normalize collapsed projects/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.error = originalConsoleError;
+  }
 });
