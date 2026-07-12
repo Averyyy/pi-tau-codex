@@ -27,8 +27,13 @@ export function isWebSocketCommandFrame(value) {
     && value.type.trim().length > 0;
 }
 
-export function createOneShotRelayPolicy(expectedToken) {
-  let token = typeof expectedToken === "string" && expectedToken ? expectedToken : null;
+export function createOneShotRelayPolicy(expectedToken, expectedCommand) {
+  const command = expectedCommand === "prompt" || expectedCommand === "set_browser_draft"
+    ? expectedCommand
+    : null;
+  let token = typeof expectedToken === "string" && expectedToken && command
+    ? expectedToken
+    : null;
   let commandUsed = false;
 
   return {
@@ -40,7 +45,7 @@ export function createOneShotRelayPolicy(expectedToken) {
     acceptCommand(type) {
       if (commandUsed) return false;
       commandUsed = true;
-      return type === "prompt";
+      return type === command;
     },
   };
 }

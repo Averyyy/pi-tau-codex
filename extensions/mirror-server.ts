@@ -40,6 +40,7 @@ import {
   createWindowsTerminalLaunch,
   requireLinuxExecutable,
   requireSupportedLinuxTerminal,
+  type RelayCommand,
 } from "./interactive-launch.ts";
 import {
   buildSessionInfo,
@@ -50,6 +51,18 @@ import {
   sendSessionExport,
   SessionActionError,
 } from "./session-actions.js";
+import {
+  assertCurrentSessionReference,
+  branchSession,
+  duplicateSession,
+  forkSession,
+  labelHistoricalSession,
+  MAX_BROWSER_DRAFT_BYTES,
+  normalizeBrowserDraft,
+  normalizeEntryLabel,
+  normalizeSessionEntryId,
+  readSessionTree,
+} from "./session-ops.js";
 import {
   createContextSettingsManager,
   readAboutInfo,
@@ -75,7 +88,9 @@ import {
 } from "./transport-security.js";
 
 let startupRelayToken = process.env.TAU_RELAY_TOKEN || undefined;
+let startupRelayCommand = process.env.TAU_RELAY_COMMAND || undefined;
 delete process.env.TAU_RELAY_TOKEN;
+delete process.env.TAU_RELAY_COMMAND;
 
 // Load tau settings from ~/.pi/agent/settings.json (falls back to env vars)
 function loadTauSettings(): { port: number; host: string; autoStart: boolean; user: string; pass: string; authEnabled?: boolean; projectsDir?: string } {
@@ -624,6 +639,7 @@ function launchInteractiveTerminal(
   projectPath: string,
   launchId: string,
   relayToken?: string,
+  relayCommand?: RelayCommand,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -631,7 +647,7 @@ function launchInteractiveTerminal(
       detached: true,
       stdio: "ignore",
       windowsHide: false,
-      env: createLaunchEnvironment(launchId, process.env, relayToken),
+      env: createLaunchEnvironment(launchId, process.env, relayToken, relayCommand),
     });
     child.once("error", reject);
     child.once("spawn", () => {
@@ -644,21 +660,28 @@ function launchInteractiveTerminal(
 async function launchPi(
   projectPath: string,
   launchId: string,
-  options: { piArgs: string[]; relayToken?: string },
+  options: { piArgs: string[]; relayToken?: string; relayCommand?: RelayCommand },
 ): Promise<void> {
   const args = options.piArgs;
   if (process.platform === "darwin") {
     const piPath = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
-    const relayEnvironment = options.relayToken
-      ? `TAU_RELAY_TOKEN=${shellQuote(options.relayToken)} `
+    const relayEnvironment = options.relayToken && options.relayCommand
+      ? `TAU_RELAY_TOKEN=${shellQuote(options.relayToken)} TAU_RELAY_COMMAND=${shellQuote(options.relayCommand)} `
       : "";
-    const command = `cd ${shellQuote(projectPath)} && unset TAU_RELAY_TOKEN && TAU_LAUNCH_ID=${shellQuote(launchId)} ${relayEnvironment}${shellQuote(piPath)} ${args.map(shellQuote).join(" ")}`;
+    const command = `cd ${shellQuote(projectPath)} && unset TAU_RELAY_TOKEN TAU_RELAY_COMMAND && TAU_LAUNCH_ID=${shellQuote(launchId)} ${relayEnvironment}${shellQuote(piPath)} ${args.map(shellQuote).join(" ")}`;
     execFileSync("osascript", ["-e", `tell application "Terminal" to do script ${JSON.stringify(`${command}; exit`)}`]);
     return;
   }
   if (process.platform === "win32") {
     const launch = createWindowsTerminalLaunch(projectPath, launchId, args, process.env);
-    await launchInteractiveTerminal(launch.command, launch.args, projectPath, launchId, options.relayToken);
+    await launchInteractiveTerminal(
+      launch.command,
+      launch.args,
+      projectPath,
+      launchId,
+      options.relayToken,
+      options.relayCommand,
+    );
     return;
   }
   if (process.platform === "linux") {
@@ -666,7 +689,14 @@ async function launchPi(
     const terminalExecutable = requireLinuxExecutable(terminal, process.env);
     const piExecutable = requireLinuxExecutable("pi", process.env);
     const launch = createLinuxTerminalLaunch(terminal, projectPath, piExecutable, args);
-    await launchInteractiveTerminal(terminalExecutable, launch.args, projectPath, launchId, options.relayToken);
+    await launchInteractiveTerminal(
+      terminalExecutable,
+      launch.args,
+      projectPath,
+      launchId,
+      options.relayToken,
+      options.relayCommand,
+    );
     return;
   }
   throw new Error(`Tau cannot open an interactive Pi terminal on ${process.platform}`);
@@ -687,7 +717,12 @@ class SessionLaunchBusyError extends Error {}
 function waitForLaunchedInstance(
   projectPath: string,
   launchId: string,
-  options: { piArgs: string[]; relayToken?: string; expectedSessionFile?: string },
+  options: {
+    piArgs: string[];
+    relayToken?: string;
+    relayCommand?: RelayCommand;
+    expectedSessionFile?: string;
+  },
 ): Promise<TauInstance> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -1338,8 +1373,10 @@ export default function (pi: ExtensionAPI) {
   let devReloadTimer: ReturnType<typeof setTimeout> | null = null;
   const clients = new Set<WebSocket>();
   const relayOnlyClients = new WeakSet<WebSocket>();
-  const relayPolicy = createOneShotRelayPolicy(startupRelayToken);
+  const relayPolicy = createOneShotRelayPolicy(startupRelayToken, startupRelayCommand);
   startupRelayToken = undefined;
+  startupRelayCommand = undefined;
+  let pendingInitialDraft: string | undefined;
   const clientSecurity = new WeakMap<WebSocket, {
     mutationToken: string;
     isLoopback: boolean;
@@ -1851,9 +1888,9 @@ export default function (pi: ExtensionAPI) {
   // Helper: send to one client
   // ═══════════════════════════════════════
   function sendTo(ws: WebSocket, data: any) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(data));
-    }
+    if (ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify(data));
+    return true;
   }
 
   function revokeClientSecurity(ws: WebSocket) {
@@ -2296,7 +2333,7 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // Build state snapshot for new connections
   // ═══════════════════════════════════════
-  async function buildStateSnapshot(ctx: ExtensionContext) {
+  function buildStateSnapshot(ctx: ExtensionContext) {
     // Get session entries for message history
     const entries = ctx.sessionManager.getEntries();
 
@@ -2466,6 +2503,14 @@ export default function (pi: ExtensionAPI) {
         }
 
         // ─── Prompting ───
+        case "set_browser_draft": {
+          if (!relayOnlyClients.has(ws)) throw new Error("Browser drafts may only be staged by a launch relay");
+          if (pendingInitialDraft !== undefined) throw new Error("A browser draft is already staged");
+          pendingInitialDraft = normalizeBrowserDraft(command.draft);
+          sendTo(ws, success("set_browser_draft"));
+          break;
+        }
+
         case "prompt": {
           const relayOnly = relayOnlyClients.has(ws);
           const owner = relayOnly
@@ -2744,6 +2789,27 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
+        case "set_entry_label": {
+          if (!ctx) {
+            sendTo(ws, error("set_entry_label", "No context available"));
+            break;
+          }
+          const sessionFile = resolveSessionOperationFile(command.sessionFile);
+          assertCurrentSessionReference(
+            sessionFile,
+            ctx.sessionManager.getSessionFile(),
+            canonicalSessionFile,
+          );
+          const entryId = normalizeSessionEntryId(command.entryId);
+          const label = normalizeEntryLabel(command.label);
+          if (!ctx.sessionManager.getEntry(entryId)) {
+            throw new SessionActionError(404, "Session entry not found");
+          }
+          pi.setLabel(entryId, label);
+          sendTo(ws, success("set_entry_label", { entryId, label: label ?? null }));
+          break;
+        }
+
         case "compact": {
           if (ctx) {
             // Broadcast compaction start to all clients
@@ -2765,8 +2831,7 @@ export default function (pi: ExtensionAPI) {
         // ─── Sync ───
         case "mirror_sync_request": {
           if (ctx) {
-            const snapshot = await buildStateSnapshot(ctx);
-            sendTo(ws, snapshot);
+            sendTo(ws, buildStateSnapshot(ctx));
           } else {
             sendTo(ws, { type: "mirror_sync", entries: [], model: null });
           }
@@ -2939,6 +3004,19 @@ export default function (pi: ExtensionAPI) {
         error?.code === "ENOENT" ? "Session not found" : "valid sessionFile required",
       );
     }
+  }
+
+  function resolveSessionOperationFile(requested: unknown): string {
+    const liveSessionFile = latestCtx?.sessionManager.getSessionFile();
+    if (
+      typeof requested === "string"
+      && requested
+      && requested === liveSessionFile
+      && !fs.existsSync(requested)
+    ) {
+      return requested;
+    }
+    return resolveApiSessionFile(requested);
   }
 
   function sendSessionActionFailure(res: http.ServerResponse, error: any) {
@@ -3221,6 +3299,85 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
+    if (urlPath.split("?", 1)[0] === "/api/session-tree" && req.method === "GET") {
+      try {
+        const treeUrl = new URL(`http://localhost${req.url}`);
+        const sessionFile = resolveSessionOperationFile(treeUrl.searchParams.get("sessionFile") || undefined);
+        const result = readSessionTree({
+          SessionManager,
+          sessionFile,
+          liveSessionManager: latestCtx?.sessionManager,
+          currentSessionVersion: CURRENT_SESSION_VERSION,
+          getRunningInstances,
+          resolveSessionFile: canonicalSessionFile,
+        });
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        sendSessionActionFailure(res, error);
+      }
+      return;
+    }
+
+    if (urlPath.startsWith("/api/session-ops/") && req.method === "POST") {
+      const operation = urlPath.slice("/api/session-ops/".length);
+      if (!["fork", "duplicate", "branch", "label"].includes(operation)) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unknown session operation" }));
+        return;
+      }
+      void (async () => {
+        try {
+          const allowedKeys = operation === "duplicate"
+            ? ["sessionFile"]
+            : operation === "label"
+              ? ["sessionFile", "entryId", "label"]
+              : ["sessionFile", "entryId"];
+          const payload: any = await readSessionActionBody(req, allowedKeys);
+          const sessionFile = operation === "label"
+            ? resolveApiSessionFile(payload.sessionFile)
+            : resolveSessionOperationFile(payload.sessionFile);
+          const common = {
+            SessionManager,
+            sessionFile,
+            currentSessionFile: latestCtx?.sessionManager.getSessionFile() || null,
+            currentSessionVersion: CURRENT_SESSION_VERSION,
+            getRunningInstances,
+            instancesDir: INSTANCES_DIR,
+            resolveSessionFile: canonicalSessionFile,
+          };
+          let result;
+          if (operation === "fork") {
+            result = forkSession({
+              ...common,
+              liveSessionManager: latestCtx?.sessionManager,
+              entryId: payload.entryId,
+            });
+          } else if (operation === "duplicate") {
+            result = duplicateSession({ ...common, liveSessionManager: latestCtx?.sessionManager });
+          } else if (operation === "branch") {
+            result = branchSession({
+              ...common,
+              liveSessionManager: latestCtx?.sessionManager,
+              entryId: payload.entryId,
+            });
+          } else {
+            result = labelHistoricalSession({
+              ...common,
+              entryId: payload.entryId,
+              label: payload.label,
+            });
+            sessionFileCache.delete(sessionFile);
+          }
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(result));
+        } catch (error) {
+          sendSessionActionFailure(res, error);
+        }
+      })();
+      return;
+    }
+
     if (urlPath === "/api/projects" && req.method === "GET") {
       serveProjectsList(res);
       return;
@@ -3255,55 +3412,60 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     }
 
     if ((urlPath === "/api/projects/launch" || urlPath === "/api/sessions/launch") && req.method === "POST") {
-      let body = "";
-      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-      req.on("end", async () => {
+      void (async () => {
         try {
-          const payload = JSON.parse(body);
+          const payload: any = await readSessionActionBody(
+            req,
+            ["path", "noProject", "sessionFile", "command", "draft", "trustMode"],
+            urlPath === "/api/sessions/launch"
+              ? MAX_BROWSER_DRAFT_BYTES * 6 + 16 * 1024
+              : Number.POSITIVE_INFINITY,
+          );
           const {
             path: projectPath,
             noProject,
             sessionFile: requestedSessionFile,
             command,
+            draft: requestedDraft,
             trustMode,
           } = payload;
+          if (command !== undefined && requestedDraft !== undefined) {
+            throw new SessionActionError(400, "command and draft are mutually exclusive");
+          }
           if (!noProject && (!projectPath || typeof projectPath !== "string")) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "path required" }));
-            return;
+            throw new SessionActionError(400, "path required");
           }
           if (command !== undefined && (
             urlPath !== "/api/projects/launch"
             || !command
             || typeof command !== "object"
+            || Array.isArray(command)
             || command.type !== "prompt"
           )) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "launch command must be a prompt" }));
-            return;
+            throw new SessionActionError(400, "launch command must be a prompt");
           }
+          if (requestedDraft !== undefined && urlPath !== "/api/sessions/launch") {
+            throw new SessionActionError(400, "draft is only valid for session launch");
+          }
+          const draft = requestedDraft === undefined
+            ? undefined
+            : normalizeBrowserDraft(requestedDraft);
           let sessionFile: string | undefined;
           if (urlPath === "/api/sessions/launch") {
             if (typeof requestedSessionFile !== "string") {
-              res.writeHead(400, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "valid sessionFile required" }));
-              return;
+              throw new SessionActionError(400, "valid sessionFile required");
             }
             try {
               sessionFile = resolveSessionFilePath(SESSIONS_DIR, requestedSessionFile, { allowAbsolute: true });
             } catch {
-              res.writeHead(400, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "valid sessionFile required" }));
-              return;
+              throw new SessionActionError(400, "valid sessionFile required");
             }
           }
           let piArgs: string[];
           try {
             piArgs = createPiLaunchArgs(trustMode, sessionFile);
           } catch (error) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
-            return;
+            throw new SessionActionError(400, error instanceof Error ? error.message : String(error));
           }
           // Resolve ~ in path
           const launchPath = noProject
@@ -3313,21 +3475,34 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
               : projectPath;
           const resolved = path.resolve(launchPath);
           if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Directory not found" }));
-            return;
+            throw new SessionActionError(400, "Directory not found");
           }
-          const relayToken = command ? randomUUID() : undefined;
+          const relayCommand: RelayCommand | undefined = command
+            ? "prompt"
+            : draft !== undefined
+              ? "set_browser_draft"
+              : undefined;
+          const relayToken = relayCommand ? randomUUID() : undefined;
           const launch = (launchId: string) => waitForLaunchedInstance(resolved, launchId, {
             piArgs,
-            ...(relayToken ? { relayToken } : {}),
+            ...(relayToken && relayCommand ? { relayToken, relayCommand } : {}),
             ...(sessionFile !== undefined ? { expectedSessionFile: sessionFile } : {}),
           });
           const launchResult = sessionFile
             ? await launchOrReuseSession(sessionFile, launch)
             : { instance: await launch(randomUUID()), reused: false };
           const { instance, reused } = launchResult;
+          if (draft !== undefined && reused) {
+            throw new SessionActionError(409, "Cannot stage a draft in an existing session");
+          }
           if (command) await relayCommandToInstance(instance, command, relayToken!);
+          if (draft !== undefined) {
+            await relayCommandToInstance(
+              instance,
+              { type: "set_browser_draft", draft },
+              relayToken!,
+            );
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({
             port: instance.port,
@@ -3337,11 +3512,17 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             reused,
           }));
         } catch (e: any) {
-          const status = e instanceof SessionLaunchBusyError ? 409 : 500;
+          const status = e instanceof SessionActionError
+            ? e.status
+            : e instanceof SyntaxError
+              ? 400
+              : e instanceof SessionLaunchBusyError
+                ? 409
+                : 500;
           res.writeHead(status, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: e.message }));
         }
-      });
+      })();
       return;
     }
 
@@ -3957,7 +4138,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     wss.on("connection", (ws, request) => {
       const relayOnly = relayOnlyClients.has(ws);
       if (relayOnly) {
-        console.log("[Mirror] Prompt relay connected");
+        console.log("[Mirror] Launch relay connected");
       } else {
         console.log("[Mirror] Browser client connected");
         const mutationToken = randomUUID();
@@ -3980,10 +4161,15 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         // The client clears transient extension chrome when it receives the
         // snapshot, so replay it only after that reset has completed.
         if (latestCtx) {
-          buildStateSnapshot(latestCtx).then((snapshot) => {
-            sendTo(ws, snapshot);
-            replayBrowserUIState(ws);
-          });
+          const snapshot = buildStateSnapshot(latestCtx);
+          const initialDraft = pendingInitialDraft;
+          if (sendTo(ws, {
+            ...snapshot,
+            ...(initialDraft !== undefined ? { initialDraft } : {}),
+          })) {
+            pendingInitialDraft = undefined;
+          }
+          replayBrowserUIState(ws);
         } else {
           replayBrowserUIState(ws);
         }
@@ -4012,16 +4198,16 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             type: "response",
             command: command.type,
             success: false,
-            error: "Prompt relay accepts exactly one prompt",
+            error: "Launch relay accepts exactly one expected command",
             id: command.id,
           });
-          ws.close(1008, "relay prompt required");
+          ws.close(1008, "expected relay command required");
           return;
         }
 
         void handleCommand(ws, command)
           .then(() => {
-            if (relayOnly) ws.close(1000, "prompt relayed");
+            if (relayOnly) ws.close(1000, "launch command relayed");
           })
           .catch((error) => {
             console.error("[Mirror] Unhandled command failure:", error);
@@ -4031,8 +4217,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       });
 
       if (relayOnly) {
-        ws.on("close", () => console.log("[Mirror] Prompt relay disconnected"));
-        ws.on("error", (error) => console.error("[Mirror] Prompt relay error:", error));
+        ws.on("close", () => console.log("[Mirror] Launch relay disconnected"));
+        ws.on("error", (error) => console.error("[Mirror] Launch relay error:", error));
         return;
       }
 

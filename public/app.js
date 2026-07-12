@@ -22,6 +22,13 @@ import {
   resolveSessionActionContext,
   sessionActionTitle,
 } from './session-actions.js';
+import {
+  createSessionTree,
+  requestSessionOperation,
+  sessionEntryPath,
+  sessionTreePath,
+  treeEntryTitle,
+} from './session-tree.js';
 
 
 // Initialize components
@@ -29,7 +36,7 @@ const wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + locatio
 const wsClient = new WebSocketClient(wsUrl);
 const mutationFetch = wsClient.mutationFetch.bind(wsClient);
 const state = new StateManager();
-const messageRenderer = new MessageRenderer(document.getElementById('messages'));
+const messageRenderer = new MessageRenderer(document.getElementById('messages'), handleMessageEntryAction);
 const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'));
 const dialogHandler = new DialogHandler(document.getElementById('dialog-container'), wsClient);
 
@@ -97,6 +104,7 @@ let liveInstances = []; // All running Tau instances [{port, sessionFile, cwd}]
 let currentProjectPath = '';
 let currentSessionEntries = [];
 let currentSession = null;
+let branchPreview = null;
 let sessionClosed = false;
 let authCapability = {
   available: false,
@@ -120,6 +128,14 @@ const sessionActions = createSessionActions({
   mutationFetch,
   request: (command) => wsClient.request(command),
   onRenamed: handleSessionRenamed,
+});
+const sessionTree = createSessionTree({
+  openPanel: sessionActions.openPanel,
+  getContext: () => getSessionActionContext(),
+  onPreview: enterBranchPreview,
+  onOperation: performSessionOperation,
+  request: (command) => wsClient.request(command),
+  mutationFetch,
 });
 sessionTitleBtn.disabled = true;
 
@@ -542,6 +558,7 @@ function handleCompactionEnd(event) {
 }
 
 function handleAgentStart() {
+  if (branchPreview) leaveBranchPreview();
   abortRequested = false;
   agentErrorShown = false;
   state.setStreaming(true);
@@ -1201,9 +1218,9 @@ const webSlashCommands = [
   { name: 'copy', description: 'Copy the latest assistant message', source: 'builtin', execution: 'web' },
   { name: 'changelog', description: 'Show changelog entries', source: 'builtin', execution: 'unsupported' },
   { name: 'hotkeys', description: 'Show web keyboard shortcuts', source: 'builtin', execution: 'web' },
-  { name: 'fork', description: 'Preview fork points (read-only in web)', source: 'builtin', execution: 'readonly' },
-  { name: 'clone', description: 'Duplicate the current session', source: 'builtin', execution: 'unsupported' },
-  { name: 'tree', description: 'Inspect the session tree (read-only in web)', source: 'builtin', execution: 'readonly' },
+  { name: 'fork', description: 'Edit and fork from a user message', source: 'builtin', execution: 'web' },
+  { name: 'clone', description: 'Duplicate the current session', source: 'builtin', execution: 'web' },
+  { name: 'tree', description: 'Inspect and open session branches', source: 'builtin', execution: 'web' },
   { name: 'trust', description: 'Save the project trust decision', source: 'builtin', execution: 'unsupported' },
   { name: 'login', description: 'Configure provider authentication', source: 'builtin', execution: 'rpc' },
   { name: 'logout', description: 'Remove provider authentication', source: 'builtin', execution: 'rpc' },
@@ -1229,22 +1246,19 @@ const localSlashCapabilities = Object.freeze({
   copy: { mode: 'web', enabled: true, label: 'web' },
   hotkeys: { mode: 'web', enabled: true, label: 'web' },
   fork: {
-    mode: 'readonly',
+    mode: 'web',
     enabled: true,
-    label: 'read-only',
-    reason: 'The web mirror can inspect fork points but cannot create a fork without a Pi fork RPC.',
+    label: 'web',
   },
   clone: {
-    mode: 'unsupported',
-    enabled: false,
-    label: 'unavailable',
-    reason: 'Session cloning is not exposed by the Tau web RPC.',
+    mode: 'web',
+    enabled: true,
+    label: 'web',
   },
   tree: {
-    mode: 'readonly',
+    mode: 'web',
     enabled: true,
-    label: 'read-only',
-    reason: 'The web mirror can inspect tree metadata but cannot switch branches without a Pi tree RPC.',
+    label: 'web',
   },
   trust: {
     mode: 'unsupported',
@@ -1655,11 +1669,16 @@ function runSlashCommand(text) {
     return true;
   }
   if (name === 'fork') {
-    void showForkPreview();
+    void openSessionTree();
+    return true;
+  }
+  if (name === 'clone') {
+    const context = requireSessionActionContext();
+    if (context) void performSessionOperation('duplicate', context);
     return true;
   }
   if (name === 'tree') {
-    void showSessionTreePreview();
+    void openSessionTree();
     return true;
   }
   if (name === 'copy') {
@@ -1679,46 +1698,6 @@ function runSlashCommand(text) {
 
   renderSlashCapabilityError(name, capability);
   return true;
-}
-
-async function getCurrentSessionEntriesForWeb() {
-  if (currentSessionEntries.length > 0) return currentSessionEntries;
-  const data = await rpcCommand({ type: 'get_messages' }, 'Loading session tree...');
-  if (sessionClosed) return null;
-  if (!data?.success) return null;
-  currentSessionEntries = Array.isArray(data.data?.entries) ? data.data.entries : [];
-  return currentSessionEntries;
-}
-
-function getSessionEntryText(entry) {
-  if (entry?.type !== 'message') return entry?.type || 'entry';
-  const content = entry.message?.content;
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content.filter((block) => block?.type === 'text').map((block) => block.text).join(' ');
-  }
-  return entry.message?.role || 'message';
-}
-
-function getSessionTreeInfo(entries) {
-  const nodes = entries.filter((entry) => (
-    entry && typeof entry.id === 'string' && Object.prototype.hasOwnProperty.call(entry, 'parentId')
-  ));
-  const byId = new Map(nodes.map((entry) => [entry.id, entry]));
-  const children = new Map();
-  for (const entry of nodes) {
-    if (!entry.parentId || !byId.has(entry.parentId)) continue;
-    const siblings = children.get(entry.parentId) || [];
-    siblings.push(entry);
-    children.set(entry.parentId, siblings);
-  }
-  return {
-    hasTreeMetadata: nodes.length > 0,
-    entries: nodes,
-    roots: nodes.filter((entry) => entry.parentId === null),
-    branchPoints: nodes.filter((entry) => (children.get(entry.id)?.length || 0) > 1),
-    userMessages: nodes.filter((entry) => entry.type === 'message' && entry.message?.role === 'user'),
-  };
 }
 
 function getLoadedSessionMatches(query) {
@@ -1755,54 +1734,150 @@ async function openResumeChooser(query = '') {
     : 'Resume chooser opened. Select a session in the sidebar.');
 }
 
-async function showSessionTreePreview() {
-  const entries = await getCurrentSessionEntriesForWeb();
-  if (sessionClosed) return;
-  if (!entries) return;
-  const info = getSessionTreeInfo(entries);
-  if (!info.hasTreeMetadata) {
-    renderAppError('Session tree metadata is unavailable in the current session. Pi /tree navigation is not exposed by the web mirror.');
-    return;
+async function openSessionTree(selectedEntryId = null, focusLabel = false) {
+  try {
+    await sessionTree.open(selectedEntryId, focusLabel);
+  } catch (error) {
+    if (!sessionClosed) renderAppError(error, 'Failed to open session tree');
   }
-
-  const lines = [
-    'Session tree (read-only in Tau web)',
-    `Entries: ${info.entries.length} · Roots: ${info.roots.length} · Branch points: ${info.branchPoints.length}`,
-  ];
-  if (info.branchPoints.length === 0) {
-    lines.push('No branch point was found in the current session.');
-  } else {
-    for (const entry of info.branchPoints.slice(-6)) {
-      const text = getSessionEntryText(entry).replace(/\s+/g, ' ').trim() || entry.type;
-      const children = info.entries.filter((candidate) => candidate.parentId === entry.id).length;
-      lines.push(`• ${text.slice(0, 100)} (${children} branches)`);
-    }
-  }
-  lines.push('Switching branches requires Pi TUI /tree; the web mirror has no tree navigation RPC.');
-  messageRenderer.renderSystemMessage(lines.join('\n'));
 }
 
-async function showForkPreview() {
-  const entries = await getCurrentSessionEntriesForWeb();
+const pendingSessionOperations = new Set();
+
+async function performSessionOperation(operation, context, entry = null, treeData = null) {
+  if (sessionClosed) return false;
+  const key = `${operation}:${context?.sessionFile || ''}:${entry?.id || ''}`;
+  if (pendingSessionOperations.has(key)) return false;
+  pendingSessionOperations.add(key);
+  try {
+    if (!context?.sessionFile) throw new Error('This session has not been persisted yet');
+    let path = [];
+    let hasAssistantAncestor = false;
+    if (operation === 'fork') {
+      path = treeData
+        ? sessionTreePath(treeData.roots, entry.id)
+        : sessionEntryPath(currentSessionEntries, entry.id);
+      if (path.length === 0) throw new Error('The selected message is not in the current session tree');
+      hasAssistantAncestor = path.slice(0, -1).some((ancestor) => (
+        ancestor.type === 'message' && ancestor.message?.role === 'assistant'
+      ));
+    }
+
+    sessionActions.close();
+    const needsTrust = operation !== 'fork' || hasAssistantAncestor;
+    const trustMode = needsTrust ? await chooseSessionLaunchTrustMode() : null;
+    if (sessionClosed || (needsTrust && !trustMode)) return false;
+
+    setStatusMessage(operation === 'duplicate' ? 'Duplicating session...' : 'Creating branch...');
+    const result = await requestSessionOperation(operation, {
+      sessionFile: context.sessionFile,
+      entryId: entry?.id,
+    }, mutationFetch);
+    if (sessionClosed) return false;
+
+    if (result.kind === 'new-task') {
+      if (operation !== 'fork' || hasAssistantAncestor) {
+        throw new Error('The server returned an invalid new-task branch');
+      }
+      await enterNewTaskWithDraft(result.cwd, result.draft);
+      return true;
+    }
+    if (result.kind !== 'session' || !result.sessionFile || !result.cwd) {
+      throw new Error('The server returned an invalid session branch');
+    }
+    if (!trustMode) throw new Error('The branch result no longer matches the selected history');
+    return await launchSessionInstance(result.sessionFile, result.cwd, {
+      draft: result.draft,
+      trustMode,
+    });
+  } catch (error) {
+    if (!sessionClosed) {
+      const message = renderAppError(error, 'Session operation failed');
+      setStatusMessage(message, 4000);
+    }
+    return false;
+  } finally {
+    pendingSessionOperations.delete(key);
+  }
+}
+
+async function handleMessageEntryAction(action, entry) {
   if (sessionClosed) return;
-  if (!entries) return;
-  const info = getSessionTreeInfo(entries);
-  if (!info.hasTreeMetadata) {
-    renderAppError('Fork points cannot be identified because this session has no tree metadata. Pi /fork is not exposed by the web mirror.');
+  if (action === 'label') {
+    await openSessionTree(entry.entryId, true);
     return;
   }
+  const context = requireSessionActionContext();
+  if (!context) return;
+  await performSessionOperation(action, context, {
+    id: entry.entryId,
+    parentId: entry.parentId,
+    type: 'message',
+    message: entry.message,
+  });
+}
 
-  const messages = info.userMessages.slice(-8);
-  const lines = [
-    'Fork preview (read-only in Tau web)',
-    `Available user-message points: ${info.userMessages.length}`,
-  ];
-  for (const [index, entry] of messages.entries()) {
-    const text = getSessionEntryText(entry).replace(/\s+/g, ' ').trim() || 'empty message';
-    lines.push(`${index + 1}. ${text.slice(0, 100)}`);
+function enterBranchPreview({ data, entries, target }) {
+  if (state.isStreaming) throw new Error('Wait for the current response before previewing a branch');
+  branchPreview = { sessionFile: data.sessionFile, entryId: target.id };
+  messageRenderer.clear();
+  toolCardRenderer.clear();
+
+  const banner = document.createElement('section');
+  banner.className = 'branch-preview-banner';
+  banner.setAttribute('aria-label', 'Branch preview');
+  const text = document.createElement('div');
+  const title = document.createElement('strong');
+  title.textContent = 'Branch preview';
+  const detail = document.createElement('span');
+  detail.textContent = treeEntryTitle(target);
+  text.append(title, detail);
+  const back = document.createElement('button');
+  back.type = 'button';
+  back.textContent = 'Back';
+  back.title = 'Return to current session';
+  back.addEventListener('click', () => leaveBranchPreview());
+  banner.append(text, back);
+  messagesContainer.appendChild(banner);
+  if (renderSessionHistory(entries, { trackUsage: false, entryActions: false }) === 0) {
+    messageRenderer.renderSystemMessage('This branch has no displayable messages yet.');
   }
-  lines.push('Creating a fork requires Pi TUI /fork; the web mirror has no fork RPC.');
-  messageRenderer.renderSystemMessage(lines.join('\n'));
+  updateMirrorInputState();
+}
+
+function leaveBranchPreview() {
+  if (!branchPreview) return;
+  branchPreview = null;
+  messageRenderer.clear();
+  toolCardRenderer.clear();
+  sessionTotalCost = 0;
+  lastInputTokens = 0;
+  renderSessionHistoryOrWelcome(currentSessionEntries);
+  updateMirrorInputState();
+}
+
+function applyComposerDraft(draft) {
+  if (typeof draft !== 'string') throw new Error('The server returned an invalid draft');
+  messageInput.value = draft;
+  messageInput.dispatchEvent(new Event('input'));
+}
+
+async function enterNewTaskWithDraft(cwd, draft) {
+  if (typeof cwd !== 'string' || !cwd) throw new Error('The server returned an invalid working directory');
+  await newSession();
+  const projectLoad = newSessionProjectLoad || startNewSessionProjectLoad();
+  await projectLoad;
+  if (sessionClosed) return;
+  if (cwd === newSessionTaskPath) {
+    selectedNewProject = null;
+  } else {
+    const exactProject = newSessionProjects.find((project) => project.path === cwd);
+    if (!exactProject) throw new Error(`Working directory is not available: ${cwd}`);
+    selectedNewProject = exactProject;
+  }
+  renderNewProjectLabel();
+  applyComposerDraft(draft);
+  messageInput.focus();
 }
 
 function copyLatestAssistantMessage() {
@@ -2376,6 +2451,8 @@ function handleSessionAction(action, { session, project }) {
     void handleSessionSelect(session, project);
   } else if (action === 'rename') {
     sessionActions.openRename(context);
+  } else if (action === 'duplicate') {
+    if (context) void performSessionOperation('duplicate', context);
   } else if (action === 'export') {
     sessionActions.openExport(context);
   } else if (action === 'info') {
@@ -2395,6 +2472,7 @@ connectionStatusBtn.addEventListener('click', () => {
 
 async function newSession() {
   if (sessionClosed) return;
+  branchPreview = null;
   newTrustMode.value = 'saved';
   sessionTotalCost = 0;
   lastInputTokens = 0;
@@ -2447,6 +2525,7 @@ async function handleSessionSelect(session, project) {
 
 async function switchSession(sessionFile, session = null, project = null) {
   try {
+    branchPreview = null;
     // Clear any streaming state from previous session to prevent bleed
     currentStreamingElement = null;
     currentStreamingThinking = '';
@@ -2531,6 +2610,7 @@ async function switchSession(sessionFile, session = null, project = null) {
 
 function handleMirrorSync(data) {
   console.log('[Mirror] Received state snapshot:', data.entries?.length, 'entries');
+  branchPreview = null;
   clearExtensionUIState();
   isMirrorMode = true;
 
@@ -2584,6 +2664,8 @@ function handleMirrorSync(data) {
 
   renderSessionHistoryOrWelcome(data.entries || [], pendingUserMessage);
 
+  if (Object.hasOwn(data, 'initialDraft')) applyComposerDraft(data.initialDraft);
+
   if (reusedLaunchNotice) {
     const notice = 'Connected to the existing instance. Trust mode only applies when starting a new instance.';
     messageRenderer.renderSystemMessage(notice);
@@ -2630,7 +2712,13 @@ instancePollTimer = setInterval(pollInstances, 5000);
 pollInstances();
 
 function getCurrentComposerState() {
-  return getComposerState({ isMirrorMode, viewingActiveSession, isLaunchingNewSession, sessionClosed });
+  return getComposerState({
+    isMirrorMode,
+    viewingActiveSession,
+    isLaunchingNewSession,
+    sessionClosed,
+    previewingBranch: Boolean(branchPreview),
+  });
 }
 
 // Keep every composer entry point aligned with the active session state.
@@ -2646,6 +2734,7 @@ function updateMirrorInputState() {
 function enterSessionClosedState() {
   if (sessionClosed) return;
   sessionClosed = true;
+  branchPreview = null;
   clearTimeout(sidebarRefreshTimer);
   clearTimeout(contextWindowTimer);
   clearTimeout(statusResetTimer);
@@ -2704,25 +2793,27 @@ function enterSessionClosedState() {
   messagesContainer.replaceChildren(closed);
 }
 
-async function launchSessionInstance(sessionFile, projectPath) {
+async function launchSessionInstance(sessionFile, projectPath, { draft, trustMode } = {}) {
   if (sessionClosed) return false;
   if (!projectPath) {
     renderAppError('Cannot resume session: missing project path');
     return false;
   }
-  const trustMode = await chooseSessionLaunchTrustMode();
+  const selectedTrustMode = trustMode || await chooseSessionLaunchTrustMode();
   if (sessionClosed) return false;
-  if (!trustMode) return false;
+  if (!selectedTrustMode) return false;
   document.querySelector('.input-area')?.classList.remove('mirror-readonly');
   messageInput.disabled = true;
   messageInput.placeholder = 'Opening session...';
   statusText.textContent = 'Opening session...';
 
   try {
+    const body = { path: projectPath, sessionFile, trustMode: selectedTrustMode };
+    if (typeof draft === 'string') body.draft = draft;
     const response = await mutationFetch('/api/sessions/launch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: projectPath, sessionFile, trustMode }),
+      body: JSON.stringify(body),
     });
     if (sessionClosed) return false;
     const data = await response.json();
@@ -2808,7 +2899,7 @@ function renderSessionHistoryOrWelcome(entries, pendingUserMessage = null) {
   }
 }
 
-function renderSessionHistory(entries) {
+function renderSessionHistory(entries, { trackUsage = true, entryActions = true } = {}) {
   console.log(`[History] Rendering ${entries.length} entries`);
   let userCount = 0, assistantCount = 0, toolCardCount = 0, toolResultCount = 0, renderedCount = 0;
 
@@ -2839,7 +2930,11 @@ function renderSessionHistory(entries) {
         : [];
       if (content || images.length > 0) {
         userCount++;
-        messageRenderer.renderUserMessage({ content: content || '', images: images.length > 0 ? images : undefined }, true);
+        messageRenderer.renderUserMessage(
+          { content: content || '', images: images.length > 0 ? images : undefined },
+          true,
+          entryActions ? { entryId: entry.id, parentId: entry.parentId, message: entry.message } : null,
+        );
         renderedCount++;
       }
     } else if (msg.role === 'assistant') {
@@ -2870,10 +2965,10 @@ function renderSessionHistory(entries) {
         renderedCount++;
 
         // Track cost and tokens from history
-        if (msg.usage?.cost?.total) {
+        if (trackUsage && msg.usage?.cost?.total) {
           sessionTotalCost += msg.usage.cost.total;
         }
-        if (msg.usage?.input) {
+        if (trackUsage && msg.usage?.input) {
           lastInputTokens = msg.usage.input + (msg.usage.cacheRead || 0);
           lastUsage = msg.usage;
         }
@@ -2906,9 +3001,11 @@ function renderSessionHistory(entries) {
   console.log(`[History] DOM tool-card count:`, document.querySelectorAll('.tool-card').length);
   console.log(`[History] DOM thinking-block count:`, document.querySelectorAll('.thinking-block').length);
 
-  updateCostDisplay();
-  updateTokenUsage();
-  fetchContextWindow();
+  if (trackUsage) {
+    updateCostDisplay();
+    updateTokenUsage();
+    fetchContextWindow();
+  }
 
   // Jump to bottom instantly (no smooth scroll animation)
   const messagesEl = document.getElementById('messages');

@@ -4,9 +4,24 @@
 
 import { renderMarkdown, renderUserMarkdown, sanitizeImageSource } from './markdown.js';
 
+export function hasDurableEntryActions(isHistory, entry) {
+  return Boolean(isHistory && typeof entry?.entryId === 'string' && entry.entryId);
+}
+
+export function rawMessageText(message) {
+  if (typeof message?.content === 'string') return message.content;
+  if (!Array.isArray(message?.content)) return '';
+  return message.content
+    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text)
+    .join('');
+}
+
 export class MessageRenderer {
-  constructor(container) {
+  constructor(container, onEntryAction = null) {
     this.container = container;
+    this.onEntryAction = onEntryAction;
+    this.entryMetadata = new Map();
     this.isNearBottom = true;
 
     // Track scroll position for smart auto-scroll
@@ -15,9 +30,37 @@ export class MessageRenderer {
       this.isNearBottom =
         this.container.scrollHeight - this.container.scrollTop - this.container.clientHeight < threshold;
     });
+    this.container.addEventListener('click', (event) => this._handleEntryAction(event));
+    this.container.addEventListener('keydown', (event) => {
+      const menu = event.target.closest?.('.message-entry-menu');
+      if (menu) {
+        const items = Array.from(menu.querySelectorAll('[role="menuitem"]'));
+        const index = items.indexOf(event.target);
+        let next = null;
+        if (event.key === 'ArrowDown') next = items[(index + 1) % items.length];
+        else if (event.key === 'ArrowUp') next = items[(index - 1 + items.length) % items.length];
+        else if (event.key === 'Home') next = items[0];
+        else if (event.key === 'End') next = items.at(-1);
+        if (next) {
+          event.preventDefault();
+          next.focus();
+          return;
+        }
+      }
+      if (event.key !== 'Escape') return;
+      const trigger = this._closeEntryMenus();
+      if (trigger) {
+        event.preventDefault();
+        trigger.focus();
+      }
+    });
+    document.addEventListener('click', (event) => {
+      if (!event.target.closest?.('.message-entry-actions')) this._closeEntryMenus();
+    });
   }
 
   clear() {
+    this.entryMetadata.clear();
     this.container.innerHTML = '';
   }
 
@@ -55,13 +98,19 @@ export class MessageRenderer {
     `;
   }
 
-  renderUserMessage(message, isHistory = false) {
+  renderUserMessage(message, isHistory = false, entry = null) {
     // Remove welcome message if present
     const welcome = this.container.querySelector('.welcome');
     if (welcome) welcome.remove();
 
     const div = document.createElement('div');
     div.className = `message user${isHistory ? ' history' : ''}`;
+
+    const durable = hasDurableEntryActions(isHistory, entry);
+    if (durable) {
+      div.dataset.entryId = entry.entryId;
+      this.entryMetadata.set(entry.entryId, entry);
+    }
 
     const content = document.createElement('div');
     content.className = 'message-content';
@@ -82,9 +131,54 @@ export class MessageRenderer {
       if (images.childElementCount > 0) content.prepend(images);
     }
 
-    div.innerHTML = '<button class="message-copy-btn" aria-label="Copy message"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>';
-    div.prepend(content);
-    this._setupCopyBtn(div);
+    if (durable) {
+      const actions = document.createElement('div');
+      actions.className = 'message-entry-actions';
+      const trigger = document.createElement('button');
+      trigger.type = 'button';
+      trigger.className = 'message-entry-trigger';
+      trigger.dataset.entryMenuTrigger = entry.entryId;
+      trigger.title = 'Message actions';
+      trigger.setAttribute('aria-label', 'More message actions');
+      trigger.setAttribute('aria-haspopup', 'menu');
+      trigger.setAttribute('aria-expanded', 'false');
+      trigger.textContent = '•••';
+      const menu = document.createElement('div');
+      menu.className = 'message-entry-menu hidden';
+      menu.setAttribute('role', 'menu');
+      menu.setAttribute('aria-label', 'Message actions');
+      const buttons = [
+        ['copy', '⎘', 'Copy'],
+        ['fork', '✎', 'Edit & fork'],
+        ['branch', '↗', 'Continue from here'],
+        ['label', '#', 'Add label'],
+      ];
+      for (const [action, icon, label] of buttons) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'message-entry-menu-item';
+        button.dataset.entryAction = action;
+        button.dataset.entryId = entry.entryId;
+        button.setAttribute('role', 'menuitem');
+        button.setAttribute('aria-label', label);
+        const iconElement = document.createElement('span');
+        iconElement.setAttribute('aria-hidden', 'true');
+        iconElement.textContent = icon;
+        button.append(iconElement, label);
+        menu.appendChild(button);
+      }
+      actions.append(trigger, menu);
+      div.append(content, actions);
+    } else {
+      const copy = document.createElement('button');
+      copy.type = 'button';
+      copy.className = 'message-copy-btn';
+      copy.title = 'Copy';
+      copy.setAttribute('aria-label', 'Copy message');
+      copy.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+      div.append(content, copy);
+      this._setupCopyBtn(div);
+    }
     this.container.appendChild(div);
     this._renderMath(div);
     if (!isHistory) this.scrollToBottom();
@@ -299,25 +393,85 @@ export class MessageRenderer {
       const content = messageEl.querySelector('.message-content');
       if (!content) return;
       const text = content.textContent;
-      // Fallback for non-HTTPS (LAN access)
-      const copyText = (t) => {
-        if (navigator.clipboard) return navigator.clipboard.writeText(t);
-        const ta = document.createElement('textarea');
-        ta.value = t;
-        ta.style.cssText = 'position:fixed;left:-9999px';
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        return Promise.resolve();
-      };
-      copyText(text).then(() => {
+      this._copyText(text).then(() => {
         btn.classList.add('copied');
         setTimeout(() => {
           btn.classList.remove('copied');
         }, 1500);
       });
     });
+  }
+
+  _handleEntryAction(event) {
+    const trigger = event.target.closest?.('[data-entry-menu-trigger]');
+    if (trigger && this.container.contains(trigger)) {
+      const menu = trigger.nextElementSibling;
+      const opening = menu.classList.contains('hidden');
+      this._closeEntryMenus();
+      if (opening) {
+        menu.classList.remove('hidden');
+        trigger.setAttribute('aria-expanded', 'true');
+        menu.querySelector('[role="menuitem"]')?.focus();
+      }
+      return;
+    }
+    const button = event.target.closest?.('[data-entry-action]');
+    if (!button || !this.container.contains(button)) return;
+    const entry = this.entryMetadata.get(button.dataset.entryId);
+    if (!entry || button.disabled) return;
+    const messageElement = button.closest('.message');
+    const controls = messageElement.querySelectorAll('[data-entry-action]');
+    this._closeEntryMenus();
+    if (button.dataset.entryAction === 'copy') {
+      const trigger = messageElement.querySelector('[data-entry-menu-trigger]');
+      this._copyText(rawMessageText(entry.message)).then(() => {
+        trigger.textContent = '✓';
+        trigger.title = 'Copied';
+        setTimeout(() => {
+          trigger.textContent = '•••';
+          trigger.title = 'Message actions';
+        }, 1500);
+      }, (error) => {
+        trigger.title = error.message;
+        console.error('[Messages] Copy failed:', error);
+      });
+      return;
+    }
+    if (!this.onEntryAction) return;
+    controls.forEach((control) => { control.disabled = true; });
+    const enable = () => controls.forEach((control) => { control.disabled = false; });
+    try {
+      Promise.resolve(this.onEntryAction(button.dataset.entryAction, entry)).then(enable, (error) => {
+        enable();
+        console.error('[Messages] Entry action failed:', error);
+      });
+    } catch (error) {
+      enable();
+      throw error;
+    }
+  }
+
+  _closeEntryMenus() {
+    let focusedTrigger = null;
+    for (const menu of this.container.querySelectorAll('.message-entry-menu:not(.hidden)')) {
+      const trigger = menu.previousElementSibling;
+      if (menu.contains(document.activeElement)) focusedTrigger = trigger;
+      menu.classList.add('hidden');
+      trigger?.setAttribute('aria-expanded', 'false');
+    }
+    return focusedTrigger;
+  }
+
+  _copyText(text) {
+    if (navigator.clipboard) return navigator.clipboard.writeText(text);
+    const input = document.createElement('textarea');
+    input.value = text;
+    input.style.cssText = 'position:fixed;left:-9999px';
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand('copy');
+    input.remove();
+    return Promise.resolve();
   }
 
   escapeHtml(text) {

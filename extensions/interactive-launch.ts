@@ -17,6 +17,8 @@ export type TerminalLaunch = {
   args: string[];
 };
 
+export type RelayCommand = "prompt" | "set_browser_draft";
+
 export function createPiLaunchArgs(trustMode: unknown, sessionFile?: string): string[] {
   let args: string[];
   if (trustMode === "saved") args = [];
@@ -33,10 +35,19 @@ export function createLaunchEnvironment(
   launchId: string,
   env: Record<string, string | undefined>,
   relayToken?: string,
+  relayCommand?: RelayCommand,
 ): Record<string, string | undefined> {
+  if (!!relayToken !== !!relayCommand) {
+    throw new Error("relayToken and relayCommand must be provided together");
+  }
   const launchEnvironment = { ...env, TAU_LAUNCH_ID: launchId };
-  if (relayToken) launchEnvironment.TAU_RELAY_TOKEN = relayToken;
-  else delete launchEnvironment.TAU_RELAY_TOKEN;
+  if (relayToken) {
+    launchEnvironment.TAU_RELAY_TOKEN = relayToken;
+    launchEnvironment.TAU_RELAY_COMMAND = relayCommand;
+  } else {
+    delete launchEnvironment.TAU_RELAY_TOKEN;
+    delete launchEnvironment.TAU_RELAY_COMMAND;
+  }
   return launchEnvironment;
 }
 

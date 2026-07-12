@@ -375,6 +375,7 @@ export class SessionSidebar {
     const items = [
       { icon: '↗', label: 'Open', action: () => this.onSessionAction('open', { session, project }) },
       { icon: '✎', label: 'Rename', action: () => this.onSessionAction('rename', { session, project }) },
+      { icon: '⎘', label: 'Duplicate', action: () => this.onSessionAction('duplicate', { session, project }) },
       { icon: '⇩', label: 'Export', action: () => this.onSessionAction('export', { session, project }) },
       { icon: 'ⓘ', label: 'Info', action: () => this.onSessionAction('info', { session, project }) },
       { icon: isFav ? '★' : '☆', label: isFav ? 'Unfavourite' : 'Favourite', action: () => this.toggleFavourite(session.filePath) },
@@ -401,9 +402,22 @@ export class SessionSidebar {
     }
 
     menu.addEventListener('keydown', (event) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      this.closeContextMenu();
+      const menuItems = Array.from(menu.querySelectorAll('[role="menuitem"]'));
+      const index = menuItems.indexOf(event.target);
+      let next = null;
+      if (event.key === 'ArrowDown') next = menuItems[(index + 1) % menuItems.length];
+      else if (event.key === 'ArrowUp') next = menuItems[(index - 1 + menuItems.length) % menuItems.length];
+      else if (event.key === 'Home') next = menuItems[0];
+      else if (event.key === 'End') next = menuItems.at(-1);
+      else if (event.key === 'Escape') {
+        event.preventDefault();
+        this.closeContextMenu();
+        return;
+      }
+      if (next) {
+        event.preventDefault();
+        next.focus();
+      }
     });
 
     this.positionContextMenu(menu, x, y);

@@ -21,11 +21,12 @@ test('an empty full-text result removes the previous result group', () => {
 test('a session context menu dismisses and suppresses the hover card', () => {
   let hidden = false;
   let menu;
+  let closeCount = 0;
   const actions = [];
   const sidebar = {
     contextMenu: null,
     hideSessionHoverCard: () => { hidden = true; },
-    closeContextMenu: () => {},
+    closeContextMenu: () => { closeCount += 1; },
     isFavourite: () => false,
     toggleFavourite: () => {},
     deleteSession: () => {},
@@ -51,7 +52,12 @@ test('a session context menu dismisses and suppresses the hover card', () => {
             ? this.children.find((child) => child.attributes?.role === 'menuitem')
             : null;
         },
-        focus() {},
+        querySelectorAll(selector) {
+          return selector === '[role="menuitem"]'
+            ? this.children.filter((child) => child.attributes?.role === 'menuitem')
+            : [];
+        },
+        focus() { this.focused = true; },
       };
       elements.push(element);
       return element;
@@ -69,14 +75,36 @@ test('a session context menu dismisses and suppresses the hover card', () => {
     assert.equal(hidden, true);
     assert.equal(menu.attributes.role, 'menu');
     const menuItems = menu.children.filter((child) => child.attributes?.role === 'menuitem');
-    assert.deepEqual(menuItems.slice(0, 4).map((item) => item.attributes['aria-label']), [
+    assert.deepEqual(menuItems.slice(0, 5).map((item) => item.attributes['aria-label']), [
       'Open Named session',
       'Rename Named session',
+      'Duplicate Named session',
       'Export Named session',
       'Info Named session',
     ]);
     menuItems[1].listeners.click({ stopPropagation: () => {} });
-    assert.deepEqual(actions, ['rename']);
+    menuItems[2].listeners.click({ stopPropagation: () => {} });
+    assert.deepEqual(actions, ['rename', 'duplicate']);
+
+    for (const item of menuItems) item.focused = false;
+    let prevented = false;
+    menu.listeners.keydown({
+      key: 'ArrowDown',
+      target: menuItems[0],
+      preventDefault: () => { prevented = true; },
+    });
+    assert.equal(prevented, true);
+    assert.equal(menuItems[1].focused, true);
+
+    menu.listeners.keydown({ key: 'ArrowUp', target: menuItems[0], preventDefault: () => {} });
+    assert.equal(menuItems.at(-1).focused, true);
+    menu.listeners.keydown({ key: 'Home', target: menuItems[3], preventDefault: () => {} });
+    assert.equal(menuItems[0].focused, true);
+    menu.listeners.keydown({ key: 'End', target: menuItems[0], preventDefault: () => {} });
+    assert.equal(menuItems.at(-1).focused, true);
+    const closesBeforeEscape = closeCount;
+    menu.listeners.keydown({ key: 'Escape', target: menuItems[0], preventDefault: () => {} });
+    assert.equal(closeCount, closesBeforeEscape + 1);
 
     sidebar.contextMenu = {};
     SessionSidebar.prototype.showSessionHoverCard.call(sidebar, null, '', '', null, false);

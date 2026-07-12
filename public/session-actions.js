@@ -179,6 +179,18 @@ export function createSessionActions({
     if (dialog.open) dialog.close();
   }
 
+  function openPanel(title, mode) {
+    const currentView = open(title, mode);
+    return {
+      body: bodyElement,
+      close,
+      isCurrent: () => currentView === viewId,
+      setStatus: (message, error = false) => {
+        if (currentView === viewId) setStatus(message, error);
+      },
+    };
+  }
+
   closeButton.addEventListener('click', close);
   dialog.addEventListener('close', () => { viewId += 1; });
 
@@ -367,6 +379,7 @@ export function createSessionActions({
     openExport,
     openHotkeys,
     openInfo,
+    openPanel,
     openRename,
     rename: (session, name) => renameSession({ ...session, name, request, mutationFetch })
       .then(async (result) => {

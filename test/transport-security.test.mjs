@@ -78,21 +78,29 @@ test('WebSocket command frames require a non-array object and non-empty type', (
   assert.equal(isWebSocketCommandFrame({ type: '   ' }), false);
 });
 
-test('relay token and prompt command are independently one-shot', () => {
-  const cleared = createOneShotRelayPolicy(undefined);
+test('relay token accepts exactly its expected launch command once', () => {
+  const cleared = createOneShotRelayPolicy(undefined, undefined);
   assert.equal(cleared.consumeToken('relay-token'), false);
 
-  const relay = createOneShotRelayPolicy('relay-token');
+  const relay = createOneShotRelayPolicy('relay-token', 'prompt');
   assert.equal(relay.consumeToken('wrong-token'), false);
   assert.equal(relay.consumeToken('relay-token'), true);
   assert.equal(relay.consumeToken('relay-token'), false);
   assert.equal(relay.acceptCommand('prompt'), true);
   assert.equal(relay.acceptCommand('prompt'), false);
 
-  const wrongCommand = createOneShotRelayPolicy('other-token');
+  const draftRelay = createOneShotRelayPolicy('draft-token', 'set_browser_draft');
+  assert.equal(draftRelay.consumeToken('draft-token'), true);
+  assert.equal(draftRelay.acceptCommand('set_browser_draft'), true);
+  assert.equal(draftRelay.acceptCommand('prompt'), false);
+
+  const wrongCommand = createOneShotRelayPolicy('other-token', 'set_browser_draft');
   assert.equal(wrongCommand.consumeToken('other-token'), true);
-  assert.equal(wrongCommand.acceptCommand('get_state'), false);
   assert.equal(wrongCommand.acceptCommand('prompt'), false);
+  assert.equal(wrongCommand.acceptCommand('set_browser_draft'), false);
+
+  const unknown = createOneShotRelayPolicy('other-token', 'get_state');
+  assert.equal(unknown.consumeToken('other-token'), false);
 });
 
 test('loopback policy accepts IPv4, IPv4-mapped IPv6, and IPv6 loopback only', () => {

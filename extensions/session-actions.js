@@ -20,11 +20,11 @@ export class SessionActionError extends Error {
   }
 }
 
-function fileState(stat) {
+export function sessionFileState(stat) {
   return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
 }
 
-function sameFileState(left, right) {
+export function sameSessionFileState(left, right) {
   return left.dev === right.dev
     && left.ino === right.ino
     && left.size === right.size
@@ -55,7 +55,7 @@ export function sameCanonicalSession(candidate, target, resolveSessionFile) {
   }
 }
 
-function assertNotLive(sessionFile, currentSessionFile, getRunningInstances, resolveSessionFile) {
+export function assertSessionNotLive(sessionFile, currentSessionFile, getRunningInstances, resolveSessionFile) {
   const owner = getRunningInstances().find((instance) =>
     sameCanonicalSession(instance.sessionFile, sessionFile, resolveSessionFile));
   if (sameCanonicalSession(currentSessionFile, sessionFile, resolveSessionFile) || owner) {
@@ -78,7 +78,7 @@ export function normalizeSessionName(name) {
   return normalized;
 }
 
-export function readSessionActionBody(request, allowedKeys) {
+export function readSessionActionBody(request, allowedKeys, bodyLimit = SESSION_ACTION_BODY_LIMIT) {
   return new Promise((resolve, reject) => {
     if (request.aborted || request.destroyed) {
       reject(new SessionActionError(400, "Request was aborted"));
@@ -92,7 +92,7 @@ export function readSessionActionBody(request, allowedKeys) {
       if (settled) return;
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       bytes += buffer.length;
-      if (bytes > SESSION_ACTION_BODY_LIMIT) {
+      if (bytes > bodyLimit) {
         settled = true;
         request.resume();
         reject(new SessionActionError(413, "Request body is too large"));
@@ -154,25 +154,25 @@ export function renameHistoricalSession({
   if (!reservation.acquired) throw new SessionActionError(409, "Session is busy");
 
   try {
-    assertNotLive(sessionFile, currentSessionFile, getRunningInstances, resolveSessionFile);
-    const initial = fileState(fs.statSync(sessionFile));
+    assertSessionNotLive(sessionFile, currentSessionFile, getRunningInstances, resolveSessionFile);
+    const initial = sessionFileState(fs.statSync(sessionFile));
     assertCurrentSessionVersion(sessionFile, currentSessionVersion);
-    if (!sameFileState(initial, fileState(fs.statSync(sessionFile)))) {
+    if (!sameSessionFileState(initial, sessionFileState(fs.statSync(sessionFile)))) {
       throw new SessionActionError(409, "Session changed during version check");
     }
     const manager = SessionManager.open(sessionFile);
-    if (!sameFileState(initial, fileState(fs.statSync(sessionFile)))) {
+    if (!sameSessionFileState(initial, sessionFileState(fs.statSync(sessionFile)))) {
       throw new SessionActionError(409, "Session changed while opening");
     }
 
-    assertNotLive(sessionFile, currentSessionFile, getRunningInstances, resolveSessionFile);
-    const beforeAppend = fileState(fs.statSync(sessionFile));
-    if (!sameFileState(initial, beforeAppend)) {
+    assertSessionNotLive(sessionFile, currentSessionFile, getRunningInstances, resolveSessionFile);
+    const beforeAppend = sessionFileState(fs.statSync(sessionFile));
+    if (!sameSessionFileState(initial, beforeAppend)) {
       throw new SessionActionError(409, "Session changed before rename");
     }
 
     manager.appendSessionInfo(normalizedName);
-    const afterAppend = fileState(fs.statSync(sessionFile));
+    const afterAppend = sessionFileState(fs.statSync(sessionFile));
     if (
       afterAppend.dev !== beforeAppend.dev
       || afterAppend.ino !== beforeAppend.ino
@@ -228,13 +228,13 @@ export function readSessionInfo({
   );
   let manager = liveSessionManager;
   if (!isLive) {
-    const initial = fileState(fs.statSync(sessionFile));
+    const initial = sessionFileState(fs.statSync(sessionFile));
     assertCurrentSessionVersion(sessionFile, currentSessionVersion);
-    if (!sameFileState(initial, fileState(fs.statSync(sessionFile)))) {
+    if (!sameSessionFileState(initial, sessionFileState(fs.statSync(sessionFile)))) {
       throw new SessionActionError(409, "Session changed during version check");
     }
     manager = SessionManager.open(sessionFile);
-    if (!sameFileState(initial, fileState(fs.statSync(sessionFile)))) {
+    if (!sameSessionFileState(initial, sessionFileState(fs.statSync(sessionFile)))) {
       throw new SessionActionError(409, "Session changed while opening");
     }
   }
@@ -310,9 +310,9 @@ export async function sendSessionExport(response, {
   try {
     if (response.destroyed || response.closed) controller.abort();
     if (controller.signal.aborted) return;
-    const sourceState = fileState(fs.statSync(sessionFile));
+    const sourceState = sessionFileState(fs.statSync(sessionFile));
     fs.copyFileSync(sessionFile, tempSessionFile);
-    if (!sameFileState(sourceState, fileState(fs.statSync(sessionFile)))) {
+    if (!sameSessionFileState(sourceState, sessionFileState(fs.statSync(sessionFile)))) {
       throw new SessionActionError(409, "Session changed while preparing export");
     }
     await runExecFile("pi", ["--export", tempSessionFile, outputFile], {

@@ -95,16 +95,36 @@ test("launch environment carries the exact launch id and one-shot relay token", 
   assert.deepEqual(
     createLaunchEnvironment(
       "new-id",
-      { PATH: "/usr/bin", TAU_LAUNCH_ID: "old-id", TAU_RELAY_TOKEN: "old-token" },
+      {
+        PATH: "/usr/bin",
+        TAU_LAUNCH_ID: "old-id",
+        TAU_RELAY_TOKEN: "old-token",
+        TAU_RELAY_COMMAND: "prompt",
+      },
       "new-token",
+      "set_browser_draft",
     ),
-    { PATH: "/usr/bin", TAU_LAUNCH_ID: "new-id", TAU_RELAY_TOKEN: "new-token" },
+    {
+      PATH: "/usr/bin",
+      TAU_LAUNCH_ID: "new-id",
+      TAU_RELAY_TOKEN: "new-token",
+      TAU_RELAY_COMMAND: "set_browser_draft",
+    },
   );
   assert.deepEqual(
     createLaunchEnvironment(
       "new-id",
-      { PATH: "/usr/bin", TAU_LAUNCH_ID: "old-id", TAU_RELAY_TOKEN: "old-token" },
+      {
+        PATH: "/usr/bin",
+        TAU_LAUNCH_ID: "old-id",
+        TAU_RELAY_TOKEN: "old-token",
+        TAU_RELAY_COMMAND: "prompt",
+      },
     ),
     { PATH: "/usr/bin", TAU_LAUNCH_ID: "new-id" },
+  );
+  assert.throws(
+    () => createLaunchEnvironment("new-id", {}, "token"),
+    /must be provided together/,
   );
 });

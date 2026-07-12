@@ -1,11 +1,19 @@
-export function getComposerState({ isMirrorMode, viewingActiveSession, isLaunchingNewSession, sessionClosed = false }) {
+export function getComposerState({
+  isMirrorMode,
+  viewingActiveSession,
+  isLaunchingNewSession,
+  sessionClosed = false,
+  previewingBranch = false,
+}) {
   if (sessionClosed) {
     return { disabled: true, placeholder: 'Session closed', readOnly: true };
   }
-  const readOnly = isMirrorMode && !viewingActiveSession;
+  const readOnly = previewingBranch || (isMirrorMode && !viewingActiveSession);
   const disabled = readOnly || isLaunchingNewSession;
   const placeholder = isLaunchingNewSession
     ? 'Opening new session...'
+    : previewingBranch
+      ? 'Previewing branch (read-only)'
     : readOnly
       ? 'Viewing historical session (read-only)'
       : 'Message...';
