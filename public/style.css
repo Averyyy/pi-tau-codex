@@ -931,6 +931,10 @@ body {
   -webkit-app-region: no-drag;
 }
 
+.context-usage {
+  position: relative;
+}
+
 .sidebar-toggle,
 .settings-btn {
   background: none;
@@ -990,6 +994,12 @@ body {
   display: none;
   transition: all 0.3s var(--ease);
   cursor: pointer;
+}
+
+button.token-usage {
+  appearance: none;
+  font: inherit;
+  text-align: left;
 }
 
 .token-usage:hover {
@@ -2852,6 +2862,16 @@ body.new-session-mode .input-area {
 
 .image-previews.hidden { display: none; }
 
+.file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 .image-preview {
   position: relative;
   width: 64px;
@@ -2930,6 +2950,12 @@ body.new-session-mode .input-area {
   flex-direction: column;
   gap: 6px;
   max-width: 900px;
+}
+
+.input-area > .extension-tui-widgets {
+  width: min(100%, var(--content-width));
+  max-width: var(--content-width);
+  margin-inline: auto;
 }
 
 .extension-status-row {
@@ -3038,6 +3064,15 @@ body.new-session-mode .input-area {
 .slash-item.active {
   background: var(--accent-subtle);
   color: var(--accent-text);
+}
+
+.slash-item.capability-disabled,
+.slash-item.capability-disabled:hover,
+.slash-item.capability-disabled.active {
+  background: transparent;
+  color: var(--text-dim);
+  cursor: not-allowed;
+  opacity: 0.72;
 }
 
 .slash-name {
@@ -3870,7 +3905,7 @@ body.new-session-mode .input-area {
 
   .file-sidebar {
     position: fixed;
-    inset: 0 0 0 auto;
+    inset: var(--toolbar-height) 0 0 auto;
     width: min(320px, 86vw);
     flex: 0 0 min(320px, 86vw);
     transform: translateX(0);
@@ -3893,9 +3928,24 @@ body.new-session-mode .input-area {
   }
 
   .image-preview-remove {
-    width: 24px;
-    height: 24px;
+    width: 32px;
+    height: 32px;
     opacity: 1;
+  }
+
+  .input-mic-btn {
+    right: 2px;
+    width: 44px;
+    height: 44px;
+  }
+
+  .file-item {
+    min-height: 44px;
+    padding: 10px 12px;
+  }
+
+  .context-menu-item {
+    min-height: 44px;
   }
 
   /* iOS-style session list */
@@ -4412,6 +4462,7 @@ body.new-session-mode .messages {
   :root {
     --control-size: 44px;
     --page-gutter: 16px;
+    --composer-submit-size: 44px;
   }
 
   .header {
@@ -4487,10 +4538,21 @@ body.new-session-mode .messages {
   .slash-item {
     grid-template-columns: 1fr;
     gap: 3px;
+    min-height: 44px;
   }
 
   .slash-source {
     display: none;
+  }
+
+  .sidebar-section-header {
+    min-height: 44px;
+  }
+
+  .project-menu-btn {
+    width: 44px;
+    height: 44px;
+    opacity: 1;
   }
 
 }

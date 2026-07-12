@@ -80,6 +80,12 @@ let viewingActiveSession = true; // Whether we're viewing the live session or a 
 let isMirrorMode = false; // Set when mirror_sync received
 let liveInstances = []; // All running Tau instances [{port, sessionFile, cwd}]
 let currentProjectPath = '';
+let currentSessionEntries = [];
+let authCapability = {
+  available: false,
+  configured: false,
+  enabled: false,
+};
 let sidebarRefreshTimer = null;
 let isLaunchingNewSession = false;
 let desktopSidebarCollapsed = sidebarEl.classList.contains('collapsed');
@@ -412,6 +418,13 @@ function handleRPCEvent(event) {
       break;
     case 'extension_error':
       messageRenderer.renderError(`Extension error: ${event.error}`);
+      break;
+    case 'auth_changed':
+      updateAuthCapability({
+        configured: authCapability.configured,
+        enabled: event.enabled,
+        available: true,
+      });
       break;
     case 'session_name':
       // Auto-title: update sidebar with new session name
@@ -1099,33 +1112,159 @@ const commands = [
 ];
 
 const webSlashCommands = [
-  { name: 'settings', description: 'Open settings', source: 'builtin' },
-  { name: 'model', description: 'Open model picker', source: 'builtin' },
-  { name: 'scoped-models', description: 'Enable or disable models for cycling', source: 'builtin' },
-  { name: 'compact', description: 'Compact context', source: 'builtin' },
-  { name: 'export', description: 'Export the current session as HTML', source: 'builtin' },
-  { name: 'import', description: 'Import and resume a session from a JSONL file', source: 'builtin' },
-  { name: 'share', description: 'Share the current session', source: 'builtin' },
-  { name: 'session', description: 'Show current session stats', source: 'builtin' },
-  { name: 'name', description: 'Rename this session', source: 'builtin' },
-  { name: 'new', description: 'Start a new session', source: 'builtin' },
-  { name: 'copy', description: 'Copy the latest assistant message', source: 'builtin' },
-  { name: 'changelog', description: 'Show changelog entries', source: 'builtin' },
-  { name: 'hotkeys', description: 'Show keyboard shortcuts', source: 'builtin' },
-  { name: 'fork', description: 'Create a new fork from a previous message', source: 'builtin' },
-  { name: 'clone', description: 'Duplicate the current session', source: 'builtin' },
-  { name: 'tree', description: 'Navigate the session tree', source: 'builtin' },
-  { name: 'trust', description: 'Save the project trust decision', source: 'builtin' },
-  { name: 'login', description: 'Configure provider authentication', source: 'builtin' },
-  { name: 'logout', description: 'Remove provider authentication', source: 'builtin' },
-  { name: 'resume', description: 'Resume a different session', source: 'builtin' },
-  { name: 'reload', description: 'Reload the web UI', source: 'builtin' },
-  { name: 'quit', description: 'Quit Pi', source: 'builtin' },
+  { name: 'settings', description: 'Open settings', source: 'builtin', execution: 'web' },
+  { name: 'model', description: 'Open model picker', source: 'builtin', execution: 'web' },
+  { name: 'scoped-models', description: 'Change the model cycling scope', source: 'builtin', execution: 'unsupported' },
+  { name: 'compact', description: 'Compact context', source: 'builtin', execution: 'web' },
+  { name: 'export', description: 'Export the current session as HTML', source: 'builtin', execution: 'web' },
+  { name: 'import', description: 'Import and resume a session from a JSONL file', source: 'builtin', execution: 'unsupported' },
+  { name: 'share', description: 'Share the current session', source: 'builtin', execution: 'unsupported' },
+  { name: 'session', description: 'Show current session stats', source: 'builtin', execution: 'web' },
+  { name: 'name', description: 'Rename this session', source: 'builtin', execution: 'web' },
+  { name: 'new', description: 'Start a new session', source: 'builtin', execution: 'web' },
+  { name: 'copy', description: 'Copy the latest assistant message', source: 'builtin', execution: 'web' },
+  { name: 'changelog', description: 'Show changelog entries', source: 'builtin', execution: 'unsupported' },
+  { name: 'hotkeys', description: 'Show web keyboard shortcuts', source: 'builtin', execution: 'web' },
+  { name: 'fork', description: 'Preview fork points (read-only in web)', source: 'builtin', execution: 'readonly' },
+  { name: 'clone', description: 'Duplicate the current session', source: 'builtin', execution: 'unsupported' },
+  { name: 'tree', description: 'Inspect the session tree (read-only in web)', source: 'builtin', execution: 'readonly' },
+  { name: 'trust', description: 'Save the project trust decision', source: 'builtin', execution: 'unsupported' },
+  { name: 'login', description: 'Configure provider authentication', source: 'builtin', execution: 'unsupported' },
+  { name: 'logout', description: 'Remove provider authentication', source: 'builtin', execution: 'unsupported' },
+  { name: 'resume', description: 'Resume a different session from the sidebar', source: 'builtin', execution: 'web' },
+  { name: 'reload', description: 'Reload the Tau web UI only', source: 'builtin', execution: 'web' },
+  { name: 'quit', description: 'Quit Pi', source: 'builtin', execution: 'unsupported' },
 ];
+
+const localSlashCapabilities = Object.freeze({
+  settings: { mode: 'web', enabled: true, label: 'web' },
+  model: { mode: 'web', enabled: true, label: 'web' },
+  'scoped-models': {
+    mode: 'unsupported',
+    enabled: false,
+    label: 'unavailable',
+    reason: 'Changing the model cycling scope is not exposed by the Tau web RPC.',
+  },
+  compact: { mode: 'web', enabled: true, label: 'web' },
+  export: { mode: 'web', enabled: true, label: 'web' },
+  session: { mode: 'web', enabled: true, label: 'web' },
+  name: { mode: 'web', enabled: true, label: 'web' },
+  new: { mode: 'web', enabled: true, label: 'web' },
+  copy: { mode: 'web', enabled: true, label: 'web' },
+  hotkeys: { mode: 'web', enabled: true, label: 'web' },
+  fork: {
+    mode: 'readonly',
+    enabled: true,
+    label: 'read-only',
+    reason: 'The web mirror can inspect fork points but cannot create a fork without a Pi fork RPC.',
+  },
+  clone: {
+    mode: 'unsupported',
+    enabled: false,
+    label: 'unavailable',
+    reason: 'Session cloning is not exposed by the Tau web RPC.',
+  },
+  tree: {
+    mode: 'readonly',
+    enabled: true,
+    label: 'read-only',
+    reason: 'The web mirror can inspect tree metadata but cannot switch branches without a Pi tree RPC.',
+  },
+  trust: {
+    mode: 'unsupported',
+    enabled: false,
+    label: 'unavailable',
+    reason: 'Project trust decisions are resolved by Pi before the web mirror and have no web RPC.',
+  },
+  login: {
+    mode: 'unsupported',
+    enabled: false,
+    label: 'unavailable',
+    reason: 'Provider authentication is not exposed by the Tau web RPC. The Settings auth toggle controls Tau web auth only.',
+  },
+  logout: {
+    mode: 'unsupported',
+    enabled: false,
+    label: 'unavailable',
+    reason: 'Provider authentication is not exposed by the Tau web RPC. The Settings auth toggle controls Tau web auth only.',
+  },
+  resume: { mode: 'web', enabled: true, label: 'web' },
+  reload: {
+    mode: 'web',
+    enabled: true,
+    label: 'web only',
+    reason: 'This reloads the Tau web UI; Pi keybindings, extensions, prompts, and themes are not reloaded.',
+  },
+  import: {
+    mode: 'unsupported',
+    enabled: false,
+    label: 'unavailable',
+    reason: 'Session import needs a server upload/import endpoint, which this mirror does not expose.',
+  },
+  share: {
+    mode: 'unsupported',
+    enabled: false,
+    label: 'unavailable',
+    reason: 'Session sharing needs a server share endpoint, which this mirror does not expose.',
+  },
+  changelog: {
+    mode: 'unsupported',
+    enabled: false,
+    label: 'unavailable',
+    reason: 'Pi changelog access is not exposed by the Tau web RPC.',
+  },
+  quit: {
+    mode: 'unsupported',
+    enabled: false,
+    label: 'unavailable',
+    reason: 'The web mirror cannot safely quit the Pi process.',
+  },
+});
 
 let slashCommands = [...webSlashCommands];
 let slashSelectedIndex = 0;
 let lastSlashQuery = null;
+
+function getSlashCommandName(command) {
+  return String(command?.name || '').trim().toLowerCase();
+}
+
+function getSlashCapability(command) {
+  const name = getSlashCommandName(command);
+  const local = localSlashCapabilities[name];
+  const backendAvailable = command?.available;
+  const backendExecution = command?.execution;
+  const backendReason = command?.reason;
+  if (local) {
+    return {
+      ...local,
+      backendAvailable,
+      backendExecution,
+      reason: local.reason || (!local.enabled && backendAvailable === false ? backendReason : undefined),
+    };
+  }
+
+  if (backendExecution === 'rpc' && backendAvailable !== false) {
+    return { mode: 'rpc', enabled: true, label: 'rpc', reason: backendReason };
+  }
+
+  return {
+    mode: 'unsupported',
+    enabled: false,
+    label: 'unavailable',
+    reason: backendReason || (command?.source === 'builtin'
+      ? 'This Pi builtin is not exposed by the Tau web RPC.'
+      : 'This extension command is registered by Pi but is not executable through the web mirror.'),
+    backendAvailable,
+    backendExecution,
+  };
+}
+
+function renderSlashCapabilityError(name, capability) {
+  const reason = capability?.reason || 'This command is not available in Tau web.';
+  renderAppError(`/${name} is unavailable: ${reason}`);
+  setStatusMessage(`/${name} unavailable`, 3500);
+}
 
 async function fetchSlashCommands() {
   const resp = await fetch('/api/rpc', {
@@ -1137,13 +1276,17 @@ async function fetchSlashCommands() {
   if (!data.success) throw new Error(getErrorMessage(data, 'Failed to load slash commands'));
   if (!Array.isArray(data.data?.commands)) throw new Error('Slash command registry is invalid');
 
-  const seen = new Set();
-  slashCommands = data.data.commands.filter((command) => {
-    const name = String(command.name || '').trim();
-    if (!name || seen.has(name)) return false;
-    seen.add(name);
-    return true;
-  });
+  const byName = new Map();
+  for (const command of webSlashCommands) {
+    byName.set(getSlashCommandName(command), command);
+  }
+  for (const command of data.data.commands) {
+    const name = getSlashCommandName(command);
+    if (!name) continue;
+    const local = byName.get(name);
+    byName.set(name, local ? { ...local, ...command, description: local.description || command.description } : command);
+  }
+  slashCommands = [...byName.values()];
 
   if (!slashMenu.classList.contains('hidden')) updateSlashMenu();
 }
@@ -1242,17 +1385,21 @@ function renderSlashMenu(items, fragment) {
   slashMenu.setAttribute('role', 'listbox');
   slashMenu.setAttribute('aria-label', 'Slash commands');
   items.forEach((command, index) => {
+    const capability = getSlashCapability(command);
     const item = document.createElement('button');
     item.type = 'button';
-    item.className = `slash-item${index === slashSelectedIndex ? ' active' : ''}`;
+    item.className = `slash-item${index === slashSelectedIndex ? ' active' : ''}${capability.enabled ? '' : ' capability-disabled'}`;
     item.id = `slash-command-${index}`;
     item.setAttribute('role', 'option');
     item.setAttribute('aria-selected', String(index === slashSelectedIndex));
+    item.setAttribute('aria-disabled', String(!capability.enabled));
     item.dataset.commandName = command.name;
+    item.dataset.capability = capability.mode;
+    item.title = capability.reason || `${command.description || ''} (${capability.label})`;
     item.innerHTML = `
       <span class="slash-name">/${escapeHtml(command.name)}</span>
       <span class="slash-desc">${escapeHtml(command.description || '')}</span>
-      <span class="slash-source">${escapeHtml(command.source || 'command')}</span>
+      <span class="slash-source">${escapeHtml(capability.label || command.source || 'command')}</span>
     `;
     item.addEventListener('mousedown', (event) => {
       event.preventDefault();
@@ -1316,6 +1463,14 @@ function executeSlashCommand(command, fragment = getSlashFragment()) {
     return false;
   }
 
+  const capability = getSlashCapability(command);
+  if (!capability.enabled) {
+    renderSlashCapabilityError(getSlashCommandName(command), capability);
+    clearMessageInput();
+    messageInput.focus();
+    return true;
+  }
+
   const handled = runSlashCommand(commandText);
   if (!handled) return false;
   clearMessageInput();
@@ -1377,29 +1532,32 @@ function runSlashCommand(text) {
   const [rawName, ...rest] = text.slice(1).split(/\s+/);
   const name = rawName.toLowerCase();
   const args = rest.join(' ').trim();
+  const command = findSlashCommand(name);
+  const capability = getSlashCapability(command || { name });
+
+  if (!capability.enabled) {
+    renderSlashCapabilityError(name, capability);
+    return true;
+  }
 
   if (name === 'settings') {
-    openSettings();
+    void openSettings();
     return true;
   }
   if (name === 'model') {
     openModelDropdown();
     return true;
   }
-  if (name === 'scoped-models') {
-    openModelDropdown();
-    return true;
-  }
   if (name === 'compact') {
-    rpcCommand({ type: 'compact' }, 'Compacting...');
+    void rpcCommand({ type: 'compact' }, 'Compacting...');
     return true;
   }
   if (name === 'export') {
-    rpcExportHtml();
+    void rpcExportHtml();
     return true;
   }
   if (name === 'session') {
-    showSessionStats();
+    void showSessionStats();
     return true;
   }
   if (name === 'hotkeys') {
@@ -1410,13 +1568,13 @@ function runSlashCommand(text) {
       'Shift+Enter  Insert a newline',
       'Escape  Abort streaming or close the active panel',
       'Arrow Up/Down  Move through slash commands',
-      'Tab  Execute the selected slash command',
+      'Tab  Execute the selected slash command (same dispatch as mouse/Enter)',
     ].join('\n'));
     return true;
   }
   if (name === 'name') {
     if (args) {
-      rpcCommand({ type: 'set_session_name', name: args }, 'Renaming...');
+      void rpcCommand({ type: 'set_session_name', name: args }, 'Renaming...');
     } else {
       messageRenderer.renderSystemMessage('Usage: /name New session name');
     }
@@ -1427,9 +1585,15 @@ function runSlashCommand(text) {
     return true;
   }
   if (name === 'resume') {
-    if (isMobile() && sidebarEl.classList.contains('collapsed')) toggleSidebar();
-    sessionSearchInput.focus();
-    messageRenderer.renderSystemMessage('Select a session from the sidebar to resume it.');
+    void openResumeChooser(args);
+    return true;
+  }
+  if (name === 'fork') {
+    void showForkPreview();
+    return true;
+  }
+  if (name === 'tree') {
+    void showSessionTreePreview();
     return true;
   }
   if (name === 'copy') {
@@ -1437,18 +1601,138 @@ function runSlashCommand(text) {
     return true;
   }
   if (name === 'reload') {
+    setStatusMessage('Reloading Tau web UI...', 1500);
     location.reload();
     return true;
   }
 
-  const registeredCommand = findSlashCommand(name);
-  if (registeredCommand && registeredCommand.source !== 'builtin') {
-    void executeRegisteredSlashCommand(registeredCommand, args);
+  if (command && capability.mode === 'rpc') {
+    void executeRegisteredSlashCommand(command, args);
     return true;
   }
 
-  messageRenderer.renderSystemMessage(`/${rawName || 'command'} is not available in Tau web. Use the Pi terminal for this command.`);
+  renderSlashCapabilityError(name, capability);
   return true;
+}
+
+async function getCurrentSessionEntriesForWeb() {
+  if (currentSessionEntries.length > 0) return currentSessionEntries;
+  const data = await rpcCommand({ type: 'get_messages' }, 'Loading session tree...');
+  if (!data?.success) return null;
+  currentSessionEntries = Array.isArray(data.data?.entries) ? data.data.entries : [];
+  return currentSessionEntries;
+}
+
+function getSessionEntryText(entry) {
+  if (entry?.type !== 'message') return entry?.type || 'entry';
+  const content = entry.message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.filter((block) => block?.type === 'text').map((block) => block.text).join(' ');
+  }
+  return entry.message?.role || 'message';
+}
+
+function getSessionTreeInfo(entries) {
+  const nodes = entries.filter((entry) => (
+    entry && typeof entry.id === 'string' && Object.prototype.hasOwnProperty.call(entry, 'parentId')
+  ));
+  const byId = new Map(nodes.map((entry) => [entry.id, entry]));
+  const children = new Map();
+  for (const entry of nodes) {
+    if (!entry.parentId || !byId.has(entry.parentId)) continue;
+    const siblings = children.get(entry.parentId) || [];
+    siblings.push(entry);
+    children.set(entry.parentId, siblings);
+  }
+  return {
+    hasTreeMetadata: nodes.length > 0,
+    entries: nodes,
+    roots: nodes.filter((entry) => entry.parentId === null),
+    branchPoints: nodes.filter((entry) => (children.get(entry.id)?.length || 0) > 1),
+    userMessages: nodes.filter((entry) => entry.type === 'message' && entry.message?.role === 'user'),
+  };
+}
+
+function getLoadedSessionMatches(query) {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return [];
+  const matches = [];
+  for (const project of sidebar.allGroups()) {
+    for (const session of project.sessions || []) {
+      const values = [session.filePath, session.id, session.name].filter(Boolean).map((value) => String(value).toLowerCase());
+      if (values.includes(normalized)) matches.push({ session, project });
+    }
+  }
+  return matches;
+}
+
+async function openResumeChooser(query = '') {
+  if (isMobile() && sidebarEl.classList.contains('collapsed')) toggleSidebar();
+  const normalized = query.trim();
+  sessionSearchInput.value = normalized;
+  sidebar.setSearchQuery(normalized);
+  await sidebar.loadSessions(false);
+
+  const exactMatches = getLoadedSessionMatches(normalized);
+  if (normalized && exactMatches.length === 1) {
+    await handleSessionSelect(exactMatches[0].session, exactMatches[0].project);
+    return;
+  }
+
+  sessionSearchInput.focus();
+  if (normalized) sessionSearchInput.select();
+  messageRenderer.renderSystemMessage(normalized
+    ? `Resume chooser filtered to "${normalized}". Select a session in the sidebar.`
+    : 'Resume chooser opened. Select a session in the sidebar.');
+}
+
+async function showSessionTreePreview() {
+  const entries = await getCurrentSessionEntriesForWeb();
+  if (!entries) return;
+  const info = getSessionTreeInfo(entries);
+  if (!info.hasTreeMetadata) {
+    renderAppError('Session tree metadata is unavailable in the current session. Pi /tree navigation is not exposed by the web mirror.');
+    return;
+  }
+
+  const lines = [
+    'Session tree (read-only in Tau web)',
+    `Entries: ${info.entries.length} · Roots: ${info.roots.length} · Branch points: ${info.branchPoints.length}`,
+  ];
+  if (info.branchPoints.length === 0) {
+    lines.push('No branch point was found in the current session.');
+  } else {
+    for (const entry of info.branchPoints.slice(-6)) {
+      const text = getSessionEntryText(entry).replace(/\s+/g, ' ').trim() || entry.type;
+      const children = info.entries.filter((candidate) => candidate.parentId === entry.id).length;
+      lines.push(`• ${text.slice(0, 100)} (${children} branches)`);
+    }
+  }
+  lines.push('Switching branches requires Pi TUI /tree; the web mirror has no tree navigation RPC.');
+  messageRenderer.renderSystemMessage(lines.join('\n'));
+}
+
+async function showForkPreview() {
+  const entries = await getCurrentSessionEntriesForWeb();
+  if (!entries) return;
+  const info = getSessionTreeInfo(entries);
+  if (!info.hasTreeMetadata) {
+    renderAppError('Fork points cannot be identified because this session has no tree metadata. Pi /fork is not exposed by the web mirror.');
+    return;
+  }
+
+  const messages = info.userMessages.slice(-8);
+  const lines = [
+    'Fork preview (read-only in Tau web)',
+    `Available user-message points: ${info.userMessages.length}`,
+  ];
+  for (const [index, entry] of messages.entries()) {
+    const text = getSessionEntryText(entry).replace(/\s+/g, ' ').trim() || 'empty message';
+    lines.push(`${index + 1}. ${text.slice(0, 100)}`);
+  }
+  lines.push('Creating a fork requires Pi TUI /fork; the web mirror has no fork RPC.');
+  messageRenderer.renderSystemMessage(lines.join('\n'));
 }
 
 function copyLatestAssistantMessage() {
@@ -1992,6 +2276,7 @@ sessionSearchInput.addEventListener('input', () => {
 async function newSession() {
   sessionTotalCost = 0;
   lastInputTokens = 0;
+  currentSessionEntries = [];
   updateCostDisplay();
   updateTokenUsage();
   state.reset();
@@ -2039,6 +2324,7 @@ async function switchSession(sessionFile, session = null, project = null) {
     currentStreamingText = '';
     
     state.reset();
+    currentSessionEntries = [];
     messageRenderer.clear();
     toolCardRenderer.clear();
 
@@ -2058,6 +2344,7 @@ async function switchSession(sessionFile, session = null, project = null) {
           console.log('[App] History entries:', data.entries?.length || 0);
 
           messageRenderer.clear();
+          currentSessionEntries = Array.isArray(data.entries) ? data.entries : [];
           renderSessionHistoryOrWelcome(data.entries || []);
         } catch (e) {
           console.error('[App] History fetch error:', e);
@@ -2131,6 +2418,7 @@ function handleMirrorSync(data) {
 
   // Track the active session
   mirrorActiveSessionFile = data.sessionFile || null;
+  currentSessionEntries = Array.isArray(data.entries) ? data.entries : [];
   sidebar.setActive(mirrorActiveSessionFile);
   currentProjectPath = data.cwd || currentProjectPath;
   viewingActiveSession = true;
@@ -2600,6 +2888,17 @@ const settingsSave = document.getElementById('settings-save');
 
 let webSettings = null;
 
+function updateAuthCapability(next) {
+  authCapability = { ...authCapability, ...next };
+  const configured = authCapability.configured === true;
+  authSection.style.display = configured ? '' : 'none';
+  toggleAuth.classList.toggle('on', configured && authCapability.enabled === true);
+  toggleAuth.disabled = !configured || authCapability.available === false;
+  toggleAuth.title = configured
+    ? (authCapability.available === false ? 'Tau web authentication is unavailable' : 'Require login for Tau web')
+    : 'Tau web authentication is not configured';
+}
+
 function buildThemeGrid() {
   themeGrid.innerHTML = '';
   const current = getCurrentTheme();
@@ -2696,13 +2995,16 @@ async function openSettings() {
   try {
     const authData = await rpcCommand({ type: 'get_auth' });
     if (authData?.success && authData.data?.configured) {
-      authSection.style.display = '';
-      toggleAuth.className = `settings-toggle${authData.data.enabled ? ' on' : ''}`;
+      updateAuthCapability({
+        configured: true,
+        enabled: authData.data.enabled === true,
+        available: true,
+      });
     } else {
-      authSection.style.display = 'none';
+      updateAuthCapability({ configured: false, enabled: false, available: false });
     }
   } catch {
-    authSection.style.display = 'none';
+    updateAuthCapability({ configured: false, enabled: false, available: false });
   }
 }
 

@@ -10,7 +10,10 @@
  * - Sends full state snapshot on client connect (messages, model, etc.)
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@mariozechner/pi-coding-agent";
 import { WebSocketServer, WebSocket } from "ws";
 import * as http from "node:http";
 import * as fs from "node:fs";
@@ -808,6 +811,113 @@ const BUILTIN_SLASH_COMMANDS = [
 
 const TAU_COMMAND_NAMES = new Set(["taustop", "taustart", "tau", "qr"]);
 
+type CommandExecution = "rpc" | "native" | "metadata-only" | "unsupported";
+
+type CommandCapability = {
+  execution: CommandExecution;
+  available: boolean;
+  reason?: string;
+  requires?: string[];
+};
+
+const SESSION_COMMAND_CONTEXT_REASON =
+  "Pi 0.80.3 exposes session replacement and tree actions only on ExtensionCommandContext; this mirror callback currently has no live command context";
+
+const BUILTIN_COMMAND_CAPABILITIES: Record<string, Omit<CommandCapability, "available">> = {
+  settings: {
+    execution: "unsupported",
+    reason: "Pi's built-in settings selector is owned by the interactive host and is not exposed through ExtensionAPI",
+  },
+  model: {
+    execution: "unsupported",
+    reason: "Pi's built-in model selector is owned by the interactive host; use the mirror model RPC instead",
+  },
+  "scoped-models": {
+    execution: "unsupported",
+    reason: "Pi's built-in scoped-model selector is owned by the interactive host and is not exposed through ExtensionAPI",
+  },
+  export: {
+    execution: "rpc",
+    reason: "The mirror uses the installed Pi CLI export path because ExtensionContext has no export action",
+  },
+  import: {
+    execution: "unsupported",
+    reason: "Pi 0.80.3 exposes importFromJsonl only on AgentSessionRuntime, not on ExtensionAPI or ExtensionCommandContext",
+    requires: ["inputPath"],
+  },
+  share: {
+    execution: "unsupported",
+    reason: "Pi's share flow is interactive-host-only and requires its private export/runtime host plus gh UI flow",
+  },
+  copy: {
+    execution: "unsupported",
+    reason: "Pi's clipboard command is interactive-host-only and is not exposed through ExtensionAPI",
+  },
+  name: {
+    execution: "rpc",
+    reason: "Use set_session_name through the mirror RPC",
+  },
+  session: {
+    execution: "rpc",
+    reason: "Use get_session_stats through the mirror RPC",
+  },
+  changelog: {
+    execution: "unsupported",
+    reason: "Pi's changelog view is interactive-host-only",
+  },
+  hotkeys: {
+    execution: "unsupported",
+    reason: "Pi's hotkeys view is interactive-host-only",
+  },
+  fork: {
+    execution: "native",
+    reason: SESSION_COMMAND_CONTEXT_REASON,
+    requires: ["entryId"],
+  },
+  clone: {
+    execution: "native",
+    reason: SESSION_COMMAND_CONTEXT_REASON,
+  },
+  tree: {
+    execution: "native",
+    reason: SESSION_COMMAND_CONTEXT_REASON,
+    requires: ["targetId"],
+  },
+  trust: {
+    execution: "unsupported",
+    reason: "Pi's trust selector writes through its private interactive host; ExtensionContext exposes only isProjectTrusted()",
+  },
+  login: {
+    execution: "unsupported",
+    reason: "Provider login requires Pi's interactive OAuth/API-key flow and is not exposed by the mirror",
+  },
+  logout: {
+    execution: "unsupported",
+    reason: "Provider logout is not exposed by the mirror; the Settings auth toggle controls Tau web auth only",
+  },
+  new: {
+    execution: "native",
+    reason: SESSION_COMMAND_CONTEXT_REASON,
+  },
+  compact: {
+    execution: "rpc",
+    reason: "Uses public ExtensionContext.compact()",
+  },
+  resume: {
+    execution: "native",
+    reason: SESSION_COMMAND_CONTEXT_REASON,
+    requires: ["sessionPath"],
+  },
+  reload: {
+    execution: "native",
+    reason: "Uses public ExtensionCommandContext.reload(); Pi reload tears down and recreates the extension runtime",
+  },
+  quit: {
+    execution: "unsupported",
+    reason: "Pi's quit command is interactive-host-owned; the mirror does not expose process shutdown as a slash command",
+  },
+};
+
 type ModelRegistryDiagnostics = {
   registryError?: string;
   authErrors?: string[];
@@ -820,15 +930,13 @@ function errorText(error: unknown): string {
 }
 
 function getModelRegistryDiagnostics(registry: any): ModelRegistryDiagnostics {
-  if (registry && typeof registry === "object") {
-    const cached = modelRegistryDiagnosticsCache.get(registry);
-    if (cached) return cached;
-  }
-
-  const diagnostics: ModelRegistryDiagnostics = {};
+  const cached = registry && typeof registry === "object"
+    ? modelRegistryDiagnosticsCache.get(registry)
+    : undefined;
+  const diagnostics: ModelRegistryDiagnostics = cached ? { ...cached } : {};
   if (typeof registry.getError === "function") {
     const registryError = registry.getError();
-    if (registryError) diagnostics.registryError = String(registryError);
+    diagnostics.registryError = registryError ? String(registryError) : undefined;
   }
 
   const drainErrors = registry.authStorage?.drainErrors;
@@ -837,7 +945,9 @@ function getModelRegistryDiagnostics(registry: any): ModelRegistryDiagnostics {
     const messages = Array.isArray(errors)
       ? errors.map(errorText).filter(Boolean)
       : [];
-    if (messages.length > 0) diagnostics.authErrors = messages;
+    if (messages.length > 0) {
+      diagnostics.authErrors = [...new Set([...(diagnostics.authErrors || []), ...messages])];
+    }
   }
   if (registry && typeof registry === "object") {
     modelRegistryDiagnosticsCache.set(registry, diagnostics);
@@ -921,12 +1031,24 @@ function getModelChoices(ctx: ExtensionContext): {
   };
 }
 
-function getSlashCommands(pi: ExtensionAPI) {
+function getSlashCommands(pi: ExtensionAPI, hasLiveCommandContext = false) {
   const commands = BUILTIN_SLASH_COMMANDS.map(([name, description]) => ({
     name,
     description,
     source: "builtin",
-    execution: TAU_COMMAND_NAMES.has(name) ? "rpc" : "unsupported",
+    ...(TAU_COMMAND_NAMES.has(name)
+      ? { execution: "rpc" as const, available: true }
+      : (() => {
+          const capability = BUILTIN_COMMAND_CAPABILITIES[name];
+          const available = capability?.execution === "rpc"
+            || (capability?.execution === "native" && hasLiveCommandContext);
+          return {
+            execution: capability?.execution || "unsupported",
+            available,
+            ...(capability?.reason ? { reason: capability.reason } : {}),
+            ...(capability?.requires ? { requires: capability.requires } : {}),
+          };
+        })()),
   }));
   const seen = new Set(commands.map((command) => command.name));
   const dynamicCommands = pi.getCommands();
@@ -940,7 +1062,13 @@ function getSlashCommands(pi: ExtensionAPI) {
       description: command.description || "Extension command",
       source: command.source || "extension",
       sourceInfo: command.sourceInfo,
-      execution: TAU_COMMAND_NAMES.has(name) ? "rpc" : "unsupported",
+      ...(TAU_COMMAND_NAMES.has(name)
+        ? { execution: "rpc" as const, available: true }
+        : {
+            execution: "metadata-only" as const,
+            available: false,
+            reason: "Pi 0.80.3 exposes third-party command metadata through getCommands(), but no public executeCommand API",
+          }),
     });
   }
 
