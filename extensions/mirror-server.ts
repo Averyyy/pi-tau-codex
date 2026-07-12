@@ -778,13 +778,103 @@ function getScopedModels(ctx: ExtensionContext, availableModels: any[]): any[] {
   return uniqueModels(scoped);
 }
 
+const BUILTIN_SLASH_COMMANDS = [
+  ["settings", "Open settings menu"],
+  ["model", "Select model"],
+  ["scoped-models", "Enable or disable models for cycling"],
+  ["export", "Export the current session"],
+  ["import", "Import and resume a session"],
+  ["share", "Share the current session"],
+  ["copy", "Copy the latest assistant message"],
+  ["name", "Set the session name"],
+  ["session", "Show session information and stats"],
+  ["changelog", "Show changelog entries"],
+  ["hotkeys", "Show keyboard shortcuts"],
+  ["fork", "Create a new fork from a previous message"],
+  ["clone", "Duplicate the current session"],
+  ["tree", "Navigate the session tree"],
+  ["trust", "Save the project trust decision"],
+  ["login", "Configure provider authentication"],
+  ["logout", "Remove provider authentication"],
+  ["new", "Start a new session"],
+  ["compact", "Compact the current session"],
+  ["resume", "Resume a different session"],
+  ["reload", "Reload Pi resources"],
+  ["quit", "Quit Pi"],
+] as const;
+
+function getModelAvailability(ctx: ExtensionContext, model: any) {
+  const registry: any = ctx.modelRegistry;
+  const available = typeof registry.hasConfiguredAuth === "function"
+    ? registry.hasConfiguredAuth(model)
+    : true;
+  const authStatus = typeof registry.getProviderAuthStatus === "function"
+    ? registry.getProviderAuthStatus(model.provider)
+    : undefined;
+  const reason = available
+    ? null
+    : authStatus?.source
+      ? `Configure authentication for ${model.provider}`
+      : "Provider authentication is not configured";
+
+  return {
+    available,
+    reason,
+    auth: authStatus
+      ? {
+          configured: authStatus.configured === true,
+          source: authStatus.source,
+          label: authStatus.label,
+        }
+      : undefined,
+  };
+}
+
+function annotateModelAvailability(ctx: ExtensionContext, model: any) {
+  return { ...model, availability: getModelAvailability(ctx, model) };
+}
+
+function stripModelAvailability(model: any) {
+  const { availability: _availability, ...plainModel } = model;
+  return plainModel;
+}
+
 function getModelChoices(ctx: ExtensionContext): { models: any[]; scopedModels: any[] } {
   const availableModels = ctx.modelRegistry.getAvailable();
   const scopedModels = getScopedModels(ctx, availableModels);
+  const models = uniqueModels([...scopedModels, ...availableModels]).map((model) =>
+    annotateModelAvailability(ctx, model),
+  );
+  const scopedRefs = new Set(scopedModels.map(modelRef));
   return {
-    models: uniqueModels([...scopedModels, ...availableModels]),
-    scopedModels,
+    models,
+    scopedModels: models.filter((model) => scopedRefs.has(modelRef(model))),
   };
+}
+
+function getSlashCommands(ctx: ExtensionContext) {
+  const commands = BUILTIN_SLASH_COMMANDS.map(([name, description]) => ({
+    name,
+    description,
+    source: "builtin",
+  }));
+  const seen = new Set(commands.map((command) => command.name));
+  const dynamicCommands = typeof (ctx as any).getCommands === "function"
+    ? (ctx as any).getCommands()
+    : [];
+
+  for (const command of dynamicCommands) {
+    const name = String(command.invocationName || command.name || "").trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    commands.push({
+      name,
+      description: command.description || "Extension command",
+      source: command.source || "extension",
+    });
+  }
+
+  return commands;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1542,6 +1632,38 @@ export default function (pi: ExtensionAPI) {
       // Forward event to all connected browser clients
       // Wrap in { type: "event", event: ... } to match the existing frontend protocol
       broadcast({ type: "event", event: { type: eventType, ...event } });
+
+      // Pi reports provider failures on the finalized assistant message. Keep a
+      // stable browser-facing event so the web client cannot get stuck showing
+      // only the optimistic user message. agent_end is emitted once after any
+      // retry sequence, so the browser gets one final error instead of one per
+      // failed retry.
+      if (eventType === "agent_end") {
+        const failedMessage = Array.isArray(event.messages)
+          ? [...event.messages].reverse().find((message: any) =>
+              message?.role === "assistant"
+              && message.stopReason === "error"
+              && message.errorMessage
+            )
+          : undefined;
+        if (failedMessage) {
+          broadcast({
+            type: "event",
+            event: {
+              type: "agent_error",
+              error: failedMessage.errorMessage,
+              stopReason: failedMessage.stopReason,
+            },
+          });
+        }
+      }
+
+      if (eventType === "auto_retry_end" && event.success === false && event.finalError) {
+        broadcast({
+          type: "event",
+          event: { type: "agent_error", error: event.finalError, retryExhausted: true },
+        });
+      }
     });
   }
 
@@ -1901,6 +2023,15 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
+        case "get_commands": {
+          if (!ctx) {
+            sendTo(ws, error("get_commands", "No context available"));
+            break;
+          }
+          sendTo(ws, success("get_commands", { commands: getSlashCommands(ctx) }));
+          break;
+        }
+
         case "set_model": {
           if (!ctx) {
             sendTo(ws, error("set_model", "No context available"));
@@ -1914,15 +2045,25 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, error("set_model", `Model not found: ${command.provider}/${command.modelId}`));
             break;
           }
-          const ok = await pi.setModel(model);
+          const modelForPi = stripModelAvailability(model);
+          const availability = getModelAvailability(ctx, modelForPi);
+          if (!availability.available) {
+            const response = error("set_model", availability.reason || "Model authentication is not configured") as any;
+            response.data = { model: { provider: model.provider, id: model.id }, availability };
+            sendTo(ws, response);
+            break;
+          }
+          const ok = await pi.setModel(modelForPi);
           if (!ok) {
-            sendTo(ws, error("set_model", "No API key for this model"));
+            const response = error("set_model", `Model authentication is not available for ${model.provider}`) as any;
+            response.data = { model: { provider: model.provider, id: model.id }, availability };
+            sendTo(ws, response);
             break;
           }
           sendTo(ws, success("set_model", {
-            model,
+            model: modelForPi,
             thinkingLevel: pi.getThinkingLevel(),
-            availableThinkingLevels: getSupportedThinkingLevels(model),
+            availableThinkingLevels: getSupportedThinkingLevels(modelForPi),
           }));
           break;
         }
@@ -1935,7 +2076,8 @@ export default function (pi: ExtensionAPI) {
             break;
           }
           const choices = getModelChoices(ctx);
-          const availModels = choices.scopedModels.length > 0 ? choices.scopedModels : choices.models;
+          const availModels = (choices.scopedModels.length > 0 ? choices.scopedModels : choices.models)
+            .filter((model: any) => model.availability?.available !== false);
           const currentModel = ctx.model;
           if (!currentModel || availModels.length <= 1) {
             sendTo(ws, success("cycle_model", null));
@@ -1945,11 +2087,16 @@ export default function (pi: ExtensionAPI) {
             (m: any) => m.provider === currentModel.provider && m.id === currentModel.id
           );
           const nextModel = availModels[(idx + 1) % availModels.length];
-          await pi.setModel(nextModel);
+          const nextModelForPi = stripModelAvailability(nextModel);
+          const ok = await pi.setModel(nextModelForPi);
+          if (!ok) {
+            sendTo(ws, error("cycle_model", `Model authentication is not available for ${nextModel.provider}`));
+            break;
+          }
           sendTo(ws, success("cycle_model", {
-            model: nextModel,
+            model: nextModelForPi,
             thinkingLevel: pi.getThinkingLevel(),
-            availableThinkingLevels: getSupportedThinkingLevels(nextModel),
+            availableThinkingLevels: getSupportedThinkingLevels(nextModelForPi),
           }));
           break;
         }

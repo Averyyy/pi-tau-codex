@@ -62,6 +62,7 @@ const extensionTuiBridge = new ExtensionTuiBridge(wsClient, extensionWidgetsAbov
 // State tracking
 let currentStreamingElement = null;
 let currentStreamingText = '';
+let agentErrorShown = false;
 let sessionTotalCost = 0;
 let lastInputTokens = 0;
 let contextWindowSize = 0;  // fetched from model info
@@ -211,7 +212,9 @@ wsClient.addEventListener('connected', () => {
   updateConnectionStatus('connected');
   // Fetch model context window size for token % display
   setTimeout(fetchContextWindow, 1000);
-
+  fetchSlashCommands().catch((error) => {
+    console.error('[App] Failed to load slash commands:', error);
+  });
 });
 
 wsClient.addEventListener('disconnected', () => {
@@ -248,7 +251,10 @@ function handleRPCEvent(event) {
       handleAgentStart();
       break;
     case 'agent_end':
-      handleAgentEnd();
+      handleAgentEnd(event);
+      break;
+    case 'agent_error':
+      handleAgentError(event);
       break;
     case 'message_start':
       handleMessageStart(event.message);
@@ -334,7 +340,16 @@ function handleAgentStart() {
   updateUI();
 }
 
-function handleAgentEnd() {
+function handleAgentEnd(event) {
+  const failedMessage = Array.isArray(event?.messages)
+    ? [...event.messages].reverse().find((message) => (
+      message?.role === 'assistant'
+      && message.stopReason === 'error'
+      && message.errorMessage
+    ))
+    : null;
+  if (failedMessage) handleAgentError({ error: failedMessage.errorMessage });
+
   state.setStreaming(false);
   showTypingIndicator(false);
   currentStreamingElement = null;
@@ -349,11 +364,29 @@ function handleAgentEnd() {
   }
 }
 
+function handleAgentError(event) {
+  if (agentErrorShown) return;
+  agentErrorShown = true;
+  const errorMessage = event?.error || 'Agent failed to respond';
+  document.querySelectorAll('#messages [data-message-id="streaming"]').forEach((element) => element.remove());
+  currentStreamingElement = null;
+  currentStreamingText = '';
+  currentStreamingThinking = '';
+  state.setStreaming(false);
+  showTypingIndicator(false);
+  messageRenderer.renderError(errorMessage);
+  updateUI();
+}
+
 let currentStreamingThinking = '';
 
 function handleMessageStart(message) {
-  if (message.role === 'user') scheduleSidebarRefresh();
+  if (message.role === 'user') {
+    agentErrorShown = false;
+    scheduleSidebarRefresh();
+  }
   if (message.role === 'assistant') {
+    if (agentErrorShown) return;
     currentStreamingText = '';
     currentStreamingThinking = '';
     currentStreamingElement = messageRenderer.renderAssistantMessage(
@@ -404,6 +437,7 @@ function handleMessageUpdate(event) {
 
 function handleMessageEnd(message) {
   if (message?.role === 'user') scheduleSidebarRefresh();
+  if (message?.role === 'assistant' && message.stopReason === 'error') return;
   if (currentStreamingElement) {
     // Pass usage info for cost display
     const usage = message?.usage || null;
@@ -815,9 +849,7 @@ function sendMessage() {
   if (!message && pendingImages.length === 0) return;
 
   if (pendingImages.length === 0 && runSlashCommand(message)) {
-    messageInput.value = '';
-    messageInput.style.height = 'auto';
-    hideSlashMenu();
+    clearMessageInput();
     return;
   }
 
@@ -827,9 +859,7 @@ function sendMessage() {
     filePaths: [...pendingFilePaths],
   } : null;
 
-  messageInput.value = '';
-  messageInput.style.height = 'auto';
-  hideSlashMenu();
+  clearMessageInput();
 
   const cmd = { type: 'prompt', message: message || '(see attached image)' };
 
@@ -845,6 +875,7 @@ function sendMessage() {
   renderAttachmentPreviews();
 
   if (isNewSessionMode) {
+    agentErrorShown = false;
     exitNewSessionMode();
     lastSentMessage = message;
     messageRenderer.renderUserMessage({ content: message, images: cmd.images });
@@ -863,6 +894,7 @@ function sendMessage() {
   }
 
   lastSentMessage = message;
+  agentErrorShown = false;
   messageRenderer.renderUserMessage({ content: message, images: cmd.images });
   wsClient.send(cmd);
 }
@@ -901,6 +933,7 @@ function escapeHtml(text) {
 function flushQueue() {
   if (messageQueue.length > 0 && !state.isStreaming) {
     const cmd = messageQueue.shift();
+    agentErrorShown = false;
     messageRenderer.renderUserMessage({ content: cmd.message, images: cmd.images });
     renderQueuedMessages();
     wsClient.send(cmd);
@@ -943,9 +976,29 @@ const webSlashCommands = [
   { name: 'reload', description: 'Reload the web UI', source: 'builtin' },
 ];
 
-const slashCommands = webSlashCommands;
+let slashCommands = [...webSlashCommands];
 let slashSelectedIndex = 0;
 let lastSlashQuery = null;
+
+async function fetchSlashCommands() {
+  const resp = await fetch('/api/rpc', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'get_commands' }),
+  });
+  const data = await resp.json();
+  if (!data.success || !Array.isArray(data.data?.commands)) return;
+
+  const seen = new Set();
+  slashCommands = data.data.commands.filter((command) => {
+    const name = String(command.name || '').trim();
+    if (!name || seen.has(name)) return false;
+    seen.add(name);
+    return true;
+  });
+
+  if (!slashMenu.classList.contains('hidden')) updateSlashMenu();
+}
 
 function openCommandPalette() {
   commandList.innerHTML = '';
@@ -1056,7 +1109,12 @@ function renderSlashMenu(items, fragment) {
     `;
     item.addEventListener('mousedown', (event) => {
       event.preventDefault();
-      selectSlashCommand(command, fragment);
+      event.stopPropagation();
+      executeSlashCommand(command, fragment);
+    });
+    item.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
     });
     slashMenu.appendChild(item);
   });
@@ -1076,10 +1134,21 @@ function hideSlashMenu() {
   messageInput.removeAttribute('aria-activedescendant');
 }
 
-function selectSlashCommand(command, fragment = getSlashFragment()) {
-  if (!fragment) return;
+function clearMessageInput() {
+  messageInput.value = '';
+  messageInput.style.height = 'auto';
+  hideSlashMenu();
+}
+
+function buildSlashCommandText(command, fragment) {
   const before = messageInput.value.slice(0, fragment.start);
   const after = messageInput.value.slice(fragment.end);
+  return { before, after, text: `${before}/${command.name}${after}` };
+}
+
+function selectSlashCommand(command, fragment = getSlashFragment()) {
+  if (!fragment) return;
+  const { before, after } = buildSlashCommandText(command, fragment);
   const insert = `/${command.name} `;
   messageInput.value = before + insert + after;
   const cursor = before.length + insert.length;
@@ -1087,6 +1156,24 @@ function selectSlashCommand(command, fragment = getSlashFragment()) {
   messageInput.dispatchEvent(new Event('input'));
   hideSlashMenu();
   messageInput.focus();
+}
+
+function executeSlashCommand(command, fragment = getSlashFragment()) {
+  if (!fragment) return false;
+  const { text } = buildSlashCommandText(command, fragment);
+  const commandText = text.trim();
+
+  // A slash token inside a normal prompt remains an autocomplete action.
+  if (!commandText.startsWith('/')) {
+    selectSlashCommand(command, fragment);
+    return false;
+  }
+
+  const handled = runSlashCommand(commandText);
+  if (!handled) return false;
+  clearMessageInput();
+  messageInput.focus();
+  return true;
 }
 
 function handleSlashMenuKeydown(event) {
@@ -1106,7 +1193,10 @@ function handleSlashMenuKeydown(event) {
     event.preventDefault();
     const commandName = items[slashSelectedIndex]?.dataset.commandName;
     const command = slashCommands.find((item) => item.name === commandName);
-    if (command) selectSlashCommand(command);
+    if (command) {
+      if (event.key === 'Enter') executeSlashCommand(command);
+      else selectSlashCommand(command);
+    }
     return true;
   }
 
@@ -1201,11 +1291,13 @@ async function rpcCommand(cmd, statusMsg) {
       setTimeout(() => { statusText.textContent = 'Connected'; }, 2000);
     } else {
       statusText.textContent = data.error || 'Failed';
+      messageRenderer.renderError(data.error || 'Command failed');
       setTimeout(() => { statusText.textContent = 'Connected'; }, 3000);
     }
     return data;
   } catch (e) {
     statusText.textContent = 'Error';
+    messageRenderer.renderError(e instanceof Error ? e.message : 'Command failed');
     setTimeout(() => { statusText.textContent = 'Connected'; }, 3000);
   }
 }
@@ -1282,7 +1374,7 @@ async function fetchModelInfo() {
       currentProjectPath = stateData.data.cwd;
     }
   } catch (e) {
-    // ignore
+    console.error('[App] Failed to load model info:', e);
   }
 }
 
@@ -1337,7 +1429,7 @@ function openModelDropdown() {
   function renderModels() {
     modelDropdownMenu.innerHTML = '';
     renderBack('Models');
-    let showAllModels = scopedModels.length === 0;
+    let showAllModels = scopedModels.length === 0 || !scopedModels.some((model) => model.availability?.available !== false);
     const search = document.createElement('input');
     search.className = 'model-dropdown-search';
     search.placeholder = 'Search models…';
@@ -1359,8 +1451,16 @@ function openModelDropdown() {
         if (query && !`${shortName} ${model.provider || ''}`.toLowerCase().includes(query)) continue;
         const item = document.createElement('button');
         item.type = 'button';
-        item.className = `model-dropdown-item${modelIsCurrent(model) ? ' active' : ''}`;
-        item.innerHTML = `<span>${escapeHtml(shortName)}<span class="model-dropdown-item-provider">${escapeHtml(model.provider || '')}</span></span>${modelIsCurrent(model) ? '<span>✓</span>' : ''}`;
+        const available = model.availability?.available !== false;
+        const availabilityReason = model.availability?.reason || 'Provider authentication is not configured';
+        item.disabled = !available;
+        item.className = `model-dropdown-item${modelIsCurrent(model) ? ' active' : ''}${available ? '' : ' unavailable'}`;
+        item.innerHTML = `<span>${escapeHtml(shortName)}<span class="model-dropdown-item-provider">${escapeHtml(model.provider || '')}</span>${available ? '' : `<span class="model-dropdown-item-availability">${escapeHtml(availabilityReason)}</span>`}</span>${modelIsCurrent(model) ? '<span>✓</span>' : ''}`;
+        if (!available) {
+          item.title = availabilityReason;
+          itemsContainer.appendChild(item);
+          continue;
+        }
         item.addEventListener('click', async () => {
           const data = await rpcCommand({ type: 'set_model', provider: model.provider, modelId: model.id }, `Switching to ${shortName}...`);
           if (!data?.success) return;
