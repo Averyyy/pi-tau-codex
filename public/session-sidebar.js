@@ -347,6 +347,7 @@ export class SessionSidebar {
 
   showContextMenu(e, session) {
     e.preventDefault();
+    this.hideSessionHoverCard();
     this.closeContextMenu();
 
     const isFav = this.isFavourite(session.filePath);
@@ -619,6 +620,7 @@ export class SessionSidebar {
   }
 
   showSessionHoverCard(item, title, time, project, isTask) {
+    if (this.contextMenu) return;
     this.hoverCard.innerHTML = `
       <div class="session-hover-title">${this.escapeHtml(title)}</div>
       <div class="session-hover-meta">${this.escapeHtml(time)}</div>
