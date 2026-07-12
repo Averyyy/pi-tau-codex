@@ -57,16 +57,17 @@ function clearLegacySidebarPreferences() {
 }
 
 export class SessionSidebar {
-  constructor(container, onSessionSelect) {
+  constructor(container, onSessionSelect, mutationFetch) {
     this.container = container;
     this.onSessionSelect = onSessionSelect;
+    this.mutationFetch = mutationFetch;
     this.activeSessionFile = null;
     this.projects = [];
     this.tasks = null;
     this.searchQuery = '';
     this.preferenceWrites = Promise.resolve();
     this.applyPreferences(defaultSidebarPreferences());
-    this.preferencesReady = this.bootstrapPreferences();
+    this.preferencesReady = null;
     this.contextMenu = null;
     this.projectDrag = null;
     this.hoverCard = document.createElement('div');
@@ -100,7 +101,7 @@ export class SessionSidebar {
   }
 
   async bootstrapPreferences() {
-    const res = await fetch('/api/sidebar-preferences', {
+    const res = await this.mutationFetch('/api/sidebar-preferences', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'bootstrap', preferences: readLegacySidebarPreferences() }),
@@ -111,9 +112,19 @@ export class SessionSidebar {
     clearLegacySidebarPreferences();
   }
 
+  ensurePreferencesReady() {
+    if (this.preferencesReady) return this.preferencesReady;
+    const pending = this.bootstrapPreferences();
+    this.preferencesReady = pending;
+    void pending.catch(() => {
+      if (this.preferencesReady === pending) this.preferencesReady = null;
+    });
+    return pending;
+  }
+
   queuePreferenceMutation(mutation, render = true) {
     const write = this.preferenceWrites.then(async () => {
-      const res = await fetch('/api/sidebar-preferences', {
+      const res = await this.mutationFetch('/api/sidebar-preferences', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(mutation),
@@ -160,7 +171,7 @@ export class SessionSidebar {
           '<div class="session-skeleton"><div class="session-skeleton-title"></div><div class="session-skeleton-meta"></div></div>'
         ).join('');
       }
-      await this.preferencesReady;
+      await this.ensurePreferencesReady();
       const res = await fetch('/api/sessions');
       if (!res.ok) throw new Error('Failed to load sessions');
       const data = await res.json();
@@ -425,7 +436,7 @@ export class SessionSidebar {
   async deleteSession(session) {
     if (!confirm(`Delete "${session.name || session.firstMessage || 'this session'}"?`)) return;
     try {
-      const res = await fetch('/api/sessions/delete', {
+      const res = await this.mutationFetch('/api/sessions/delete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filePath: session.filePath }),
@@ -573,7 +584,7 @@ export class SessionSidebar {
   }
 
   async openProjectFolder(project) {
-    const res = await fetch('/api/open', {
+    const res = await this.mutationFetch('/api/open', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ filePath: project.path }),

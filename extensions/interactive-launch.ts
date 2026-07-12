@@ -22,8 +22,12 @@ const LINUX_TERMINAL_HELP = `Set TAU_LINUX_TERMINAL to one of: ${SUPPORTED_LINUX
 export function createLaunchEnvironment(
   launchId: string,
   env: Record<string, string | undefined>,
+  relayToken?: string,
 ): Record<string, string | undefined> {
-  return { ...env, TAU_LAUNCH_ID: launchId };
+  const launchEnvironment = { ...env, TAU_LAUNCH_ID: launchId };
+  if (relayToken) launchEnvironment.TAU_RELAY_TOKEN = relayToken;
+  else delete launchEnvironment.TAU_RELAY_TOKEN;
+  return launchEnvironment;
 }
 
 export function requireSupportedLinuxTerminal(terminal: string | undefined): SupportedLinuxTerminal {

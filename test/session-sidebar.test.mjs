@@ -49,3 +49,22 @@ test('a session context menu dismisses and suppresses the hover card', () => {
     globalThis.document = originalDocument;
   }
 });
+
+test('preference bootstrap can retry after an initial connection failure', async () => {
+  let calls = 0;
+  const sidebar = {
+    preferencesReady: null,
+    bootstrapPreferences: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('connection unavailable');
+    },
+  };
+
+  await assert.rejects(
+    SessionSidebar.prototype.ensurePreferencesReady.call(sidebar),
+    /connection unavailable/,
+  );
+  assert.equal(sidebar.preferencesReady, null);
+  await SessionSidebar.prototype.ensurePreferencesReady.call(sidebar);
+  assert.equal(calls, 2);
+});

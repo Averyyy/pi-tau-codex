@@ -133,9 +133,9 @@ Tau supports optional HTTP Basic Auth (browser-native login popup).
 
 Or via environment variables: `TAU_USER=pi TAU_PASS=secret pi`
 
-**2. Toggle on/off** — once credentials are configured, a "Require login" toggle appears in Settings within the Tau web UI. Flip it on to start requiring authentication, off to open it back up. The setting persists across restarts.
+**2. Toggle on/off** — once credentials are configured, a "Require login" toggle appears in Settings within the Tau web UI. Enabling it reloads the page so the browser can request your credentials. Disabling it takes effect without a reload. The setting persists across restarts.
 
-Both HTTP and WebSocket connections are gated when enabled. The `/api/health` endpoint remains open for monitoring.
+With authentication disabled, LAN clients can read Tau state, but mutations are rejected; only a loopback client with a live connection token can write. With authentication enabled, HTTP and WebSocket access requires Basic Auth. The `/api/health` endpoint remains open for monitoring.
 
 ### Start / Stop
 

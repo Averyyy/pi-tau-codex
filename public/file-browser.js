@@ -38,11 +38,12 @@ function formatSize(bytes) {
 }
 
 export class FileBrowser {
-  constructor(container, pathEl, messageInput, onFileInserted = null) {
+  constructor(container, pathEl, messageInput, onFileInserted = null, mutationFetch) {
     this.container = container;
     this.pathEl = pathEl;
     this.messageInput = messageInput;
     this.onFileInserted = onFileInserted;
+    this.mutationFetch = mutationFetch;
     this.currentPath = null;
     this.pendingFileClick = null;
 
@@ -157,7 +158,7 @@ export class FileBrowser {
 
   async openNatively(filePath) {
     try {
-      await fetch('/api/open', {
+      await this.mutationFetch('/api/open', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ filePath }),

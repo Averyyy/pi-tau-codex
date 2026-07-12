@@ -17,7 +17,8 @@
     "url": "git+https://github.com/Averyyy/pi-tau-codex.git"
   },
   "scripts": {
-    "dev": "TAU_DEV=1 TAU_STATIC_DIR=$PWD/public pi --approve"
+    "dev": "TAU_DEV=1 TAU_STATIC_DIR=$PWD/public pi --approve",
+    "test": "node --test test/*.test.mjs"
   },
   "publishConfig": {
     "access": "public"
@@ -37,7 +38,7 @@
     "image": "https://raw.githubusercontent.com/deflating/tau/main/docs/images/dark.png"
   },
   "dependencies": {
-    "ws": "^8.16.0",
-    "qrcode": "^1.5.0"
+    "qrcode": "^1.5.0",
+    "ws": "^8.21.0"
   }
 }

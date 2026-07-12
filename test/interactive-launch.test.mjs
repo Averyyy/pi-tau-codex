@@ -77,9 +77,20 @@ test("Linux executable checks fail before the terminal is opened", async (t) => 
   assert.throws(() => requireLinuxExecutable("pi", {}), /PATH is not set/);
 });
 
-test("launch environment always carries the exact launch correlation id", () => {
+test("launch environment carries the exact launch id and one-shot relay token", () => {
   assert.deepEqual(
-    createLaunchEnvironment("new-id", { PATH: "/usr/bin", TAU_LAUNCH_ID: "old-id" }),
+    createLaunchEnvironment(
+      "new-id",
+      { PATH: "/usr/bin", TAU_LAUNCH_ID: "old-id", TAU_RELAY_TOKEN: "old-token" },
+      "new-token",
+    ),
+    { PATH: "/usr/bin", TAU_LAUNCH_ID: "new-id", TAU_RELAY_TOKEN: "new-token" },
+  );
+  assert.deepEqual(
+    createLaunchEnvironment(
+      "new-id",
+      { PATH: "/usr/bin", TAU_LAUNCH_ID: "old-id", TAU_RELAY_TOKEN: "old-token" },
+    ),
     { PATH: "/usr/bin", TAU_LAUNCH_ID: "new-id" },
   );
 });

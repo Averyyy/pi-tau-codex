@@ -18,6 +18,7 @@ import { FileBrowser, getFileIcon } from './file-browser.js';
 // Initialize components
 const wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws';
 const wsClient = new WebSocketClient(wsUrl);
+const mutationFetch = wsClient.mutationFetch.bind(wsClient);
 const state = new StateManager();
 const messageRenderer = new MessageRenderer(document.getElementById('messages'));
 const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'));
@@ -26,7 +27,8 @@ const dialogHandler = new DialogHandler(document.getElementById('dialog-containe
 // Session sidebar
 const sidebar = new SessionSidebar(
   document.getElementById('session-list'),
-  handleSessionSelect
+  handleSessionSelect,
+  mutationFetch,
 );
 
 // UI elements
@@ -180,7 +182,7 @@ const fileBrowser = new FileBrowser(fileList, fileSidebarPath, messageInput, (fi
   if (pendingFilePaths.some((item) => item.path === filePath)) return;
   pendingFilePaths.push({ path: filePath, name, ext });
   renderAttachmentPreviews();
-});
+}, mutationFetch);
 
 function syncMobileFileSidebar() {
   const mobile = mobileViewport.matches;
@@ -236,7 +238,7 @@ fetch('/api/health').then(r => r.json()).then(data => {
 
 document.getElementById('file-sidebar-finder').addEventListener('click', () => {
   if (fileBrowser.currentPath) {
-    fetch('/api/open', {
+    mutationFetch('/api/open', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ filePath: fileBrowser.currentPath }),
@@ -317,6 +319,9 @@ function showNewMessageBadge() {
 
 wsClient.addEventListener('connected', () => {
   updateConnectionStatus('connected');
+  sidebar.loadSessions().then(() => {
+    if (isMirrorMode) updateMirrorLiveIndicator();
+  });
   // Fetch model context window size for token % display
   setTimeout(fetchContextWindow, 1000);
   fetchSlashCommands().catch((error) => {
@@ -447,6 +452,19 @@ function handleRPCResponse(response) {
   if (response?.command === 'prompt') {
     clearStreamingUI({ flushQueue: false, reason: message });
   }
+}
+
+function requestRpc(command) {
+  return wsClient.request(command).catch((error) => {
+    const response = error?.response || {
+      type: 'response',
+      command: command.type,
+      success: false,
+      error: getErrorMessage(error, `${command.type || 'RPC command'} failed`),
+    };
+    handleRPCResponse(response);
+    return response;
+  });
 }
 
 function handleCompactionStart() {
@@ -1034,7 +1052,7 @@ function sendMessage() {
   lastSentMessage = message;
   agentErrorShown = false;
   messageRenderer.renderUserMessage({ content: message, images: cmd.images });
-  wsClient.send(cmd);
+  void requestRpc(cmd);
 }
 
 const queuedMessagesEl = document.getElementById('queued-messages');
@@ -1074,7 +1092,7 @@ function flushQueue() {
     agentErrorShown = false;
     messageRenderer.renderUserMessage({ content: cmd.message, images: cmd.images });
     renderQueuedMessages();
-    wsClient.send(cmd);
+    void requestRpc(cmd);
   }
 }
 
@@ -1083,7 +1101,7 @@ function abortCurrentAgent() {
 
   const connected = isWebSocketOpen();
   abortRequested = connected;
-  wsClient.send({ type: 'abort' });
+  void requestRpc({ type: 'abort' });
   const message = connected ? 'Aborted by user' : 'Abort failed: WebSocket is not connected';
   if (!connected) abortRequested = false;
   clearStreamingUI({ flushQueue: false, reason: message });
@@ -1267,13 +1285,7 @@ function renderSlashCapabilityError(name, capability) {
 }
 
 async function fetchSlashCommands() {
-  const resp = await fetch('/api/rpc', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'get_commands' }),
-  });
-  const data = await parseJsonResponse(resp, 'Failed to load slash commands');
-  if (!data.success) throw new Error(getErrorMessage(data, 'Failed to load slash commands'));
+  const data = await wsClient.request({ type: 'get_commands' });
   if (!Array.isArray(data.data?.commands)) throw new Error('Slash command registry is invalid');
 
   const byName = new Map();
@@ -1749,36 +1761,14 @@ function copyLatestAssistantMessage() {
 async function rpcCommand(cmd, statusMsg) {
   try {
     if (statusMsg) setStatusMessage(statusMsg);
-    const resp = await fetch('/api/rpc', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(cmd),
-    });
-    const data = await parseJsonResponse(resp, `${cmd.type || 'RPC command'} failed`);
-    if (data.success) {
-      setStatusMessage('Done', 2000);
-    } else {
-      const message = renderAppError(data, `${cmd.type || 'RPC command'} failed`);
-      setStatusMessage(message, 3000);
-    }
+    const data = await wsClient.request(cmd);
+    setStatusMessage('Done', 2000);
     return data;
   } catch (e) {
     const message = renderAppError(e, `${cmd.type || 'RPC command'} failed`);
     setStatusMessage(message, 3000);
-    return { success: false, error: message };
+    return e?.response || { success: false, error: message };
   }
-}
-
-async function parseJsonResponse(response, fallback) {
-  const body = await response.text();
-  let data;
-  try {
-    data = JSON.parse(body);
-  } catch {
-    throw new Error(`${fallback} (${response.status})`);
-  }
-  if (!response.ok) throw new Error(getErrorMessage(data, `${fallback} (${response.status})`));
-  return data;
 }
 
 async function rpcExportHtml() {
@@ -1821,13 +1811,9 @@ let availableThinkingLevels = ['off'];
 
 async function fetchModelInfo() {
   try {
-    const [modelsResp, stateResp] = await Promise.all([
-      fetch('/api/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'get_available_models' }) }),
-      fetch('/api/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'get_state' }) }),
-    ]);
     const [modelsData, stateData] = await Promise.all([
-      parseJsonResponse(modelsResp, 'Failed to load models'),
-      parseJsonResponse(stateResp, 'Failed to load model state'),
+      wsClient.request({ type: 'get_available_models' }),
+      wsClient.request({ type: 'get_state' }),
     ]);
 
     if (modelsData.success && modelsData.data?.models) {
@@ -2121,7 +2107,7 @@ function closeBranchDropdown() {
 }
 
 async function checkoutBranch(branch) {
-  const response = await fetch('/api/git/checkout', {
+  const response = await mutationFetch('/api/git/checkout', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ branch }),
@@ -2384,17 +2370,6 @@ async function switchSession(sessionFile, session = null, project = null) {
       } else {
         await launchSessionInstance(sessionFile, project?.path);
       }
-    } else {
-      const res = await fetch('/api/sessions/switch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionFile }),
-      });
-
-      if (!res.ok) {
-        const err = await res.json();
-        messageRenderer.renderError(`Failed to switch session: ${err.error}`);
-      }
     }
   } catch (error) {
     console.error('[App] Failed to switch session:', error);
@@ -2512,7 +2487,7 @@ async function launchSessionInstance(sessionFile, projectPath) {
   statusText.textContent = 'Opening session...';
 
   try {
-    const response = await fetch('/api/sessions/launch', {
+    const response = await mutationFetch('/api/sessions/launch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: projectPath, sessionFile }),
@@ -2547,10 +2522,12 @@ async function launchNewSessionWithPendingMessage(cmd) {
     await newSessionProjectLoad;
     statusText.textContent = 'Opening new session...';
 
-    const response = await fetch('/api/projects/launch', {
+    const response = await mutationFetch('/api/projects/launch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(selectedNewProject ? { path: selectedNewProject.path } : { noProject: true }),
+      body: JSON.stringify(selectedNewProject
+        ? { path: selectedNewProject.path, command: cmd }
+        : { noProject: true, command: cmd }),
     });
     const data = await response.json();
     if (!response.ok) {
@@ -2558,12 +2535,6 @@ async function launchNewSessionWithPendingMessage(cmd) {
       return { ok: false, error: data.error || 'Failed to open new session' };
     }
 
-    try {
-      await handoffPromptToInstance(data, cmd);
-    } catch (error) {
-      statusText.textContent = 'Connected';
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
     navigated = true;
     navigateToInstance(data);
     return { ok: true };
@@ -2579,34 +2550,6 @@ async function launchNewSessionWithPendingMessage(cmd) {
       updateMirrorInputState();
     }
   }
-}
-
-function handoffPromptToInstance(instance, cmd) {
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const socket = new WebSocket(`${protocol}//${location.hostname}:${instance.port}/ws`);
-  const id = `handoff-${Date.now()}`;
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      socket.close();
-      reject(new Error('New session did not accept the message'));
-    }, 5000);
-    socket.onmessage = (event) => {
-      const message = JSON.parse(event.data);
-      if (message.type === 'mirror_sync') {
-        socket.send(JSON.stringify({ ...cmd, id }));
-      } else if (message.type === 'response' && message.id === id) {
-        clearTimeout(timer);
-        socket.close();
-        if (message.success) resolve();
-        else reject(new Error(message.error || 'New session rejected the message'));
-      }
-    };
-    socket.onerror = () => {
-      clearTimeout(timer);
-      socket.close();
-      reject(new Error('Could not connect to the new session'));
-    };
-  });
 }
 
 // ═══════════════════════════════════════
@@ -2955,7 +2898,7 @@ async function saveWebSettings() {
     packages: JSON.parse(settingsPackagesJson.value || '[]'),
   };
 
-  const response = await fetch('/api/web-settings', {
+  const response = await mutationFetch('/api/web-settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -3038,6 +2981,7 @@ toggleAuth.addEventListener('click', async () => {
   const data = await rpcCommand({ type: 'set_auth', enabled: !isOn });
   if (data?.success) {
     toggleAuth.className = `settings-toggle${!isOn ? ' on' : ''}`;
+    if (!isOn) location.reload();
   }
 });
 
@@ -3417,9 +3361,6 @@ document.getElementById('tau-new-session-btn')?.addEventListener('click', () => 
 
 wsClient.connect();
 messageRenderer.renderWelcome();
-sidebar.loadSessions().then(() => {
-  if (isMirrorMode) updateMirrorLiveIndicator();
-});
 fetchGitState().catch(() => {});
 
 // Register service worker for PWA
