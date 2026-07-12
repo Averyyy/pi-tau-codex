@@ -11,7 +11,9 @@
  */
 
 import {
+  CURRENT_SESSION_VERSION,
   getPackageDir,
+  SessionManager,
   SettingsManager,
   VERSION,
   type ExtensionAPI,
@@ -39,8 +41,15 @@ import {
   requireLinuxExecutable,
   requireSupportedLinuxTerminal,
 } from "./interactive-launch.ts";
-import { exportSessionToHtml } from "./pi-export.js";
-import { aggregateSessionStats } from "./session-stats.js";
+import {
+  buildSessionInfo,
+  normalizeSessionName,
+  readSessionActionBody,
+  readSessionInfo,
+  renameHistoricalSession,
+  sendSessionExport,
+  SessionActionError,
+} from "./session-actions.js";
 import {
   createContextSettingsManager,
   readAboutInfo,
@@ -2719,28 +2728,19 @@ export default function (pi: ExtensionAPI) {
             break;
           }
           const sessionManager = ctx.sessionManager;
-          const header = sessionManager.getHeader();
-          sendTo(ws, success("get_session_stats", {
-            ...aggregateSessionStats(sessionManager.getEntries(), sessionManager.getTree()),
-            sessionId: sessionManager.getSessionId(),
-            sessionFile: sessionManager.getSessionFile(),
-            cwd: sessionManager.getCwd(),
-            parentSession: header?.parentSession,
-            model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null,
+          sendTo(ws, success("get_session_stats", buildSessionInfo({
+            manager: sessionManager,
+            model: ctx.model,
             thinkingLevel: pi.getThinkingLevel(),
-            contextUsage: ctx.getContextUsage() || null,
-          }));
+            contextUsage: ctx.getContextUsage(),
+          })));
           break;
         }
 
         case "set_session_name": {
-          const name = command.name?.trim();
-          if (!name) {
-            sendTo(ws, error("set_session_name", "Name cannot be empty"));
-            break;
-          }
+          const name = normalizeSessionName(command.name);
           pi.setSessionName(name);
-          sendTo(ws, success("set_session_name"));
+          sendTo(ws, success("set_session_name", { name: pi.getSessionName() || name }));
           break;
         }
 
@@ -2759,26 +2759,6 @@ export default function (pi: ExtensionAPI) {
             });
           }
           sendTo(ws, success("compact"));
-          break;
-        }
-
-        case "export_html": {
-          if (!ctx) {
-            sendTo(ws, error("export_html", "No context available"));
-            break;
-          }
-          if (command.outputPath !== undefined) {
-            sendTo(ws, error("export_html", "Browser-selected output paths are not supported"));
-            break;
-          }
-          try {
-            const sessionFile = ctx.sessionManager.getSessionFile();
-            if (!sessionFile) throw new Error("No session file to export");
-            const outputPath = await exportSessionToHtml(sessionFile, process.cwd());
-            sendTo(ws, success("export_html", { path: outputPath }));
-          } catch (e: any) {
-            sendTo(ws, error("export_html", e.message));
-          }
           break;
         }
 
@@ -2939,6 +2919,44 @@ export default function (pi: ExtensionAPI) {
       if (sessionEntry?.cwd) return sessionEntry.cwd;
     }
     return process.cwd();
+  }
+
+  const canonicalSessionFile = (sessionFile: string) =>
+    resolveSessionFilePath(SESSIONS_DIR, sessionFile, { allowAbsolute: true });
+
+  function resolveApiSessionFile(requested: unknown, useCurrent = false): string {
+    const candidate = requested === undefined && useCurrent
+      ? latestCtx?.sessionManager.getSessionFile()
+      : requested;
+    if (typeof candidate !== "string" || !candidate) {
+      throw new SessionActionError(400, "valid sessionFile required");
+    }
+    try {
+      return canonicalSessionFile(candidate);
+    } catch (error: any) {
+      throw new SessionActionError(
+        error?.code === "ENOENT" ? 404 : 400,
+        error?.code === "ENOENT" ? "Session not found" : "valid sessionFile required",
+      );
+    }
+  }
+
+  function sendSessionActionFailure(res: http.ServerResponse, error: any) {
+    if (res.destroyed) return;
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    const status = error instanceof SessionActionError
+      ? error.status
+      : error instanceof SyntaxError
+        ? 400
+        : 500;
+    res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({
+      error: error?.message || String(error),
+      ...(error?.ownerPort ? { ownerPort: error.ownerPort } : {}),
+    }));
   }
 
   function serveWebSettings(res: http.ServerResponse) {
@@ -3140,6 +3158,66 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     if (urlPath === "/api/instances") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ instances: getRunningInstances() }));
+      return;
+    }
+
+    if (urlPath === "/api/exports" && req.method === "POST") {
+      void (async () => {
+        try {
+          const payload: any = await readSessionActionBody(req, ["format", "sessionFile"]);
+          const sessionFile = resolveApiSessionFile(payload.sessionFile, true);
+          await sendSessionExport(res, { format: payload.format, sessionFile });
+        } catch (error) {
+          sendSessionActionFailure(res, error);
+        }
+      })();
+      return;
+    }
+
+    if (urlPath === "/api/sessions/name" && req.method === "POST") {
+      void (async () => {
+        try {
+          const payload: any = await readSessionActionBody(req, ["sessionFile", "name"]);
+          const sessionFile = resolveApiSessionFile(payload?.sessionFile);
+          const result = renameHistoricalSession({
+            SessionManager,
+            sessionFile,
+            name: payload?.name,
+            currentSessionFile: latestCtx?.sessionManager.getSessionFile() || null,
+            getRunningInstances,
+            instancesDir: INSTANCES_DIR,
+            resolveSessionFile: canonicalSessionFile,
+            currentSessionVersion: CURRENT_SESSION_VERSION,
+          });
+          sessionFileCache.delete(sessionFile);
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(result));
+        } catch (error) {
+          sendSessionActionFailure(res, error);
+        }
+      })();
+      return;
+    }
+
+    if (urlPath.split("?", 1)[0] === "/api/sessions/info" && req.method === "GET") {
+      try {
+        const infoUrl = new URL(`http://localhost${req.url}`);
+        const sessionFile = resolveApiSessionFile(infoUrl.searchParams.get("sessionFile") || undefined);
+        const result = readSessionInfo({
+          SessionManager,
+          sessionFile,
+          liveSessionManager: latestCtx?.sessionManager,
+          liveModel: latestCtx?.model || null,
+          liveThinking: latestCtx ? pi.getThinkingLevel() : undefined,
+          liveContextUsage: latestCtx?.getContextUsage() || null,
+          currentSessionVersion: CURRENT_SESSION_VERSION,
+          resolveSessionFile: canonicalSessionFile,
+        });
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        sendSessionActionFailure(res, error);
+      }
       return;
     }
 

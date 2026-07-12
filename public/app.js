@@ -10,11 +10,18 @@ import { DialogHandler } from './dialogs.js';
 import { ExtensionTuiBridge, renderAnsiText } from './extension-tui.js';
 import { SessionSidebar } from './session-sidebar.js';
 import { getSessionHistoryFallback } from './session-history.js';
-import { getComposerState } from './composer-state.js';
+import { disableSessionControls, getComposerState } from './composer-state.js';
 import { filterSlashCommands } from './slash-command-filter.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
 import { createSettingsParity } from './settings-parity.js';
+import { matchShortcut, visibleShortcuts } from './keymap.js';
+import {
+  actionTargetsDisplayedSession,
+  createSessionActions,
+  resolveSessionActionContext,
+  sessionActionTitle,
+} from './session-actions.js';
 
 
 // Initialize components
@@ -31,6 +38,7 @@ const sidebar = new SessionSidebar(
   document.getElementById('session-list'),
   handleSessionSelect,
   mutationFetch,
+  handleSessionAction,
 );
 
 // UI elements
@@ -43,6 +51,9 @@ const statusText = document.getElementById('status-text');
 const sidebarEl = document.getElementById('sidebar');
 const sidebarToggle = document.getElementById('sidebar-toggle');
 const sidebarOverlay = document.getElementById('sidebar-overlay');
+const sessionTitleBtn = document.getElementById('session-title-btn');
+const sessionTitleText = document.getElementById('session-title-text');
+const connectionStatusBtn = document.getElementById('connection-status-btn');
 
 const refreshSessionsBtn = document.getElementById('refresh-sessions-btn');
 const sessionSearchInput = document.getElementById('session-search-input');
@@ -85,21 +96,39 @@ let isMirrorMode = false; // Set when mirror_sync received
 let liveInstances = []; // All running Tau instances [{port, sessionFile, cwd}]
 let currentProjectPath = '';
 let currentSessionEntries = [];
+let currentSession = null;
+let sessionClosed = false;
 let authCapability = {
   available: false,
   configured: false,
   enabled: false,
 };
 let sidebarRefreshTimer = null;
+let contextWindowTimer = null;
+let instancePollTimer = null;
 let isLaunchingNewSession = false;
 let desktopSidebarCollapsed = sidebarEl.classList.contains('collapsed');
 let reusedLaunchNotice = new URL(location.href).searchParams.get('tauReused') === '1';
 const mobileViewport = window.matchMedia('(max-width: 768px)');
 
+const sessionActions = createSessionActions({
+  dialog: document.getElementById('session-actions-dialog'),
+  titleElement: document.getElementById('session-actions-title'),
+  bodyElement: document.getElementById('session-actions-body'),
+  statusElement: document.getElementById('session-actions-status'),
+  closeButton: document.getElementById('session-actions-close'),
+  mutationFetch,
+  request: (command) => wsClient.request(command),
+  onRenamed: handleSessionRenamed,
+});
+sessionTitleBtn.disabled = true;
+
 function scheduleSidebarRefresh() {
+  if (sessionClosed) return;
   clearTimeout(sidebarRefreshTimer);
   sidebarRefreshTimer = setTimeout(async () => {
     await sidebar.loadSessions(false);
+    if (sessionClosed) return;
     updateMirrorLiveIndicator();
   }, 250);
 }
@@ -124,6 +153,7 @@ function isWebSocketOpen() {
 }
 
 function setStatusMessage(message, resetAfter = 0) {
+  if (sessionClosed) return;
   clearTimeout(statusResetTimer);
   statusText.textContent = message;
   if (resetAfter <= 0) return;
@@ -140,7 +170,7 @@ function setStatusMessage(message, resetAfter = 0) {
 
 function renderAppError(error, fallback = 'Request failed') {
   const message = getErrorMessage(error, fallback);
-  messageRenderer.renderError(message);
+  if (!sessionClosed) messageRenderer.renderError(message);
   return message;
 }
 
@@ -263,6 +293,7 @@ syncMobileFileSidebar();
 // ═══════════════════════════════════════
 
 window.addEventListener('focus', () => {
+  if (sessionClosed) return;
   hasFocus = true;
   unreadCount = 0;
   document.title = originalTitle;
@@ -278,7 +309,7 @@ window.addEventListener('blur', () => {
 
 // Reconnect WebSocket when returning to the app (iOS suspends WS connections)
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && wsClient.ws?.readyState !== WebSocket.OPEN) {
+  if (!sessionClosed && document.visibilityState === 'visible' && wsClient.ws?.readyState !== WebSocket.OPEN) {
     console.log('[App] Returning to app, reconnecting...');
     wsClient.forceReconnect();
   }
@@ -321,12 +352,15 @@ function showNewMessageBadge() {
 // ═══════════════════════════════════════
 
 wsClient.addEventListener('connected', () => {
+  if (sessionClosed) return;
   updateConnectionStatus('connected');
   sidebar.loadSessions().then(() => {
+    if (sessionClosed) return;
     if (isMirrorMode) updateMirrorLiveIndicator();
   });
   // Fetch model context window size for token % display
-  setTimeout(fetchContextWindow, 1000);
+  clearTimeout(contextWindowTimer);
+  contextWindowTimer = setTimeout(fetchContextWindow, 1000);
   fetchSlashCommands().catch((error) => {
     console.error('[App] Failed to load slash commands:', error);
     renderAppError(error, 'Failed to load slash commands');
@@ -334,6 +368,7 @@ wsClient.addEventListener('connected', () => {
 });
 
 wsClient.addEventListener('disconnected', () => {
+  if (sessionClosed) return;
   dialogHandler.dismissCurrentDialog();
   clearExtensionUIState();
   if (state.isStreaming || currentStreamingElement) {
@@ -343,15 +378,18 @@ wsClient.addEventListener('disconnected', () => {
 });
 
 wsClient.addEventListener('reconnectFailed', () => {
+  if (sessionClosed) return;
   updateConnectionStatus('disconnected');
   messageRenderer.renderError('Connection lost. Please refresh the page.');
 });
 
 wsClient.addEventListener('rpcEvent', (e) => {
+  if (sessionClosed) return;
   handleRPCEvent(e.detail);
 });
 
 wsClient.addEventListener('serverError', (e) => {
+  if (sessionClosed) return;
   const message = renderAppError(e.detail, 'Server error');
   if (state.isStreaming || currentStreamingElement) {
     clearStreamingUI({ flushQueue: false, reason: message });
@@ -359,11 +397,13 @@ wsClient.addEventListener('serverError', (e) => {
 });
 
 wsClient.addEventListener('response', (e) => {
+  if (sessionClosed) return;
   handleRPCResponse(e.detail);
 });
 
 // Mirror mode: receive full state snapshot on connect
 wsClient.addEventListener('mirrorSync', (e) => {
+  if (sessionClosed) return;
   handleMirrorSync(e.detail);
 });
 
@@ -372,6 +412,7 @@ wsClient.addEventListener('mirrorSync', (e) => {
 // ═══════════════════════════════════════
 
 function handleRPCEvent(event) {
+  if (sessionClosed) return;
   switch (event.type) {
     case 'agent_start':
       handleAgentStart();
@@ -435,10 +476,17 @@ function handleRPCEvent(event) {
       });
       break;
     case 'session_name':
-      // Auto-title: update sidebar with new session name
       if (event.name) {
-        const activeItem = document.querySelector('.session-item.active .session-title');
-        if (activeItem) activeItem.textContent = event.name;
+        if (viewingActiveSession) {
+          currentSession = { ...(currentSession || {}), filePath: mirrorActiveSessionFile, name: event.name };
+          setSessionTitle(event.name);
+        }
+        document.querySelectorAll('.session-item').forEach((item) => {
+          if (item.dataset.filePath === mirrorActiveSessionFile) {
+            const title = item.querySelector('.session-title');
+            if (title) title.textContent = event.name;
+          }
+        });
       }
       scheduleSidebarRefresh();
       break;
@@ -446,6 +494,7 @@ function handleRPCEvent(event) {
 }
 
 function handleRPCResponse(response) {
+  if (sessionClosed) return;
   if (response?.success !== false) return;
 
   const message = renderAppError(
@@ -815,8 +864,8 @@ messageInput.addEventListener('keydown', (e) => {
     return;
   }
 
-  // Enter sends, Shift+Enter inserts newline
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+  const shortcut = matchShortcut(e, 'composer');
+  if (shortcut?.id === 'composer.send' && !e.isComposing) {
     e.preventDefault();
     sendMessage();
   }
@@ -1125,8 +1174,14 @@ const commandList = document.getElementById('command-list');
 
 const commands = [
   { icon: '/', label: 'Compact', desc: 'Compact context to save tokens', action: () => rpcCommand({ type: 'compact' }, 'Compacting...') },
-  { icon: '<>', label: 'Export HTML', desc: 'Export session as HTML file', action: () => rpcExportHtml() },
-  { icon: '#', label: 'Session Stats', desc: 'Show session statistics', action: () => showSessionStats() },
+  { icon: '<>', label: 'Export', desc: 'Export the current session', action: () => {
+    const context = requireSessionActionContext();
+    if (context) sessionActions.openExport(context);
+  } },
+  { icon: '#', label: 'Session Info', desc: 'Show session details', action: () => {
+    const context = requireSessionActionContext();
+    if (context) void sessionActions.openInfo(context);
+  } },
   { icon: '+', label: 'Expand All Tools', desc: 'Expand all tool cards', action: () => toolCardRenderer.expandAll() },
   { icon: '-', label: 'Collapse All Tools', desc: 'Collapse all tool cards', action: () => toolCardRenderer.collapseAll() },
 
@@ -1289,6 +1344,7 @@ function renderSlashCapabilityError(name, capability) {
 
 async function fetchSlashCommands() {
   const data = await wsClient.request({ type: 'get_commands' });
+  if (sessionClosed) return;
   if (!Array.isArray(data.data?.commands)) throw new Error('Slash command registry is invalid');
 
   const byName = new Map();
@@ -1492,16 +1548,17 @@ function handleSlashMenuKeydown(event) {
   if (slashMenu.classList.contains('hidden')) return false;
   const items = Array.from(slashMenu.querySelectorAll('.slash-item'));
   if (items.length === 0) return false;
+  const shortcut = matchShortcut(event, 'slash');
 
-  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+  if (shortcut?.id === 'slash.next' || shortcut?.id === 'slash.previous') {
     event.preventDefault();
-    const delta = event.key === 'ArrowDown' ? 1 : -1;
+    const delta = shortcut.id === 'slash.next' ? 1 : -1;
     slashSelectedIndex = (slashSelectedIndex + delta + items.length) % items.length;
     updateSlashMenu();
     return true;
   }
 
-  if (event.key === 'Enter' || event.key === 'Tab') {
+  if (shortcut?.id === 'slash.choose' || shortcut?.id === 'slash.choose-enter') {
     event.preventDefault();
     const commandName = items[slashSelectedIndex]?.dataset.commandName;
     const command = slashCommands.find((item) => String(item.name).toLowerCase() === String(commandName).toLowerCase());
@@ -1511,7 +1568,7 @@ function handleSlashMenuKeydown(event) {
     return true;
   }
 
-  if (event.key === 'Escape') {
+  if (shortcut?.id === 'slash.dismiss') {
     event.preventDefault();
     hideSlashMenu();
     return true;
@@ -1530,11 +1587,15 @@ function findSlashCommand(name) {
   return slashCommands.find((command) => String(command.name).toLowerCase() === name.toLowerCase());
 }
 
-function executeRegisteredSlashCommand(command, args) {
-  return rpcCommand(
+async function executeRegisteredSlashCommand(command, args) {
+  const response = await rpcCommand(
     { type: 'run_command', name: command.name, args },
     `Running /${command.name}...`,
   );
+  if (response?.success === true && response.data?.command === 'quit' && response.data.status === 'shutdown') {
+    enterSessionClosedState();
+  }
+  return response;
 }
 
 function runSlashCommand(text) {
@@ -1563,30 +1624,25 @@ function runSlashCommand(text) {
     return true;
   }
   if (name === 'export') {
-    void rpcExportHtml();
+    const context = requireSessionActionContext();
+    if (context) sessionActions.openExport(context);
     return true;
   }
   if (name === 'session') {
-    void showSessionStats();
+    const context = requireSessionActionContext();
+    if (context) void sessionActions.openInfo(context);
     return true;
   }
   if (name === 'hotkeys') {
-    messageRenderer.renderSystemMessage([
-      'Keyboard shortcuts',
-      '/  Focus the message input',
-      'Enter  Send message',
-      'Shift+Enter  Insert a newline',
-      'Escape  Abort streaming or close the active panel',
-      'Arrow Up/Down  Move through slash commands',
-      'Tab  Execute the selected slash command (same dispatch as mouse/Enter)',
-    ].join('\n'));
+    sessionActions.openHotkeys(visibleShortcuts());
     return true;
   }
   if (name === 'name') {
     if (args) {
-      void rpcCommand({ type: 'set_session_name', name: args }, 'Renaming...');
+      void renameCurrentSession(args);
     } else {
-      messageRenderer.renderSystemMessage('Usage: /name New session name');
+      const context = requireSessionActionContext();
+      if (context) sessionActions.openRename(context);
     }
     return true;
   }
@@ -1628,6 +1684,7 @@ function runSlashCommand(text) {
 async function getCurrentSessionEntriesForWeb() {
   if (currentSessionEntries.length > 0) return currentSessionEntries;
   const data = await rpcCommand({ type: 'get_messages' }, 'Loading session tree...');
+  if (sessionClosed) return null;
   if (!data?.success) return null;
   currentSessionEntries = Array.isArray(data.data?.entries) ? data.data.entries : [];
   return currentSessionEntries;
@@ -1683,6 +1740,7 @@ async function openResumeChooser(query = '') {
   sessionSearchInput.value = normalized;
   sidebar.setSearchQuery(normalized);
   await sidebar.loadSessions(false);
+  if (sessionClosed) return;
 
   const exactMatches = getLoadedSessionMatches(normalized);
   if (normalized && exactMatches.length === 1) {
@@ -1699,6 +1757,7 @@ async function openResumeChooser(query = '') {
 
 async function showSessionTreePreview() {
   const entries = await getCurrentSessionEntriesForWeb();
+  if (sessionClosed) return;
   if (!entries) return;
   const info = getSessionTreeInfo(entries);
   if (!info.hasTreeMetadata) {
@@ -1725,6 +1784,7 @@ async function showSessionTreePreview() {
 
 async function showForkPreview() {
   const entries = await getCurrentSessionEntriesForWeb();
+  if (sessionClosed) return;
   if (!entries) return;
   const info = getSessionTreeInfo(entries);
   if (!info.hasTreeMetadata) {
@@ -1769,32 +1829,16 @@ async function rpcCommand(cmd, statusMsg) {
   }
 }
 
-async function rpcExportHtml() {
-  const data = await rpcCommand({ type: 'export_html' }, 'Exporting...');
-  if (data?.success && data.data?.path) {
-    setStatusMessage(`Exported: ${data.data.path}`, 4000);
-  }
-}
-
-async function showSessionStats() {
-  const data = await rpcCommand({ type: 'get_session_stats' }, 'Loading stats...');
-  if (data?.success && data.data) {
-    const s = data.data;
-    const lines = [
-      'Session Stats',
-      `Session: ${s.sessionId}`,
-      `Path: ${s.sessionFile || 'Not persisted'}`,
-      `Working directory: ${s.cwd}`,
-      `Messages: ${s.totalMessages} (${s.userMessages} user, ${s.assistantMessages} assistant)`,
-      `Tools: ${s.toolCalls} calls, ${s.toolResults} results`,
-      `Compactions: ${s.compactions} · Branch points: ${s.branchPoints}`,
-      `Tokens: ${s.tokens.total.toLocaleString()} (${s.tokens.input.toLocaleString()} input, ${s.tokens.output.toLocaleString()} output, ${s.tokens.cacheRead.toLocaleString()} cache read, ${s.tokens.cacheWrite.toLocaleString()} cache write)`,
-      `Cost: $${s.cost.total.toFixed(4)}`,
-    ];
-    if (s.model) lines.push(`Model: ${s.model.provider}/${s.model.id} · Thinking: ${s.thinkingLevel}`);
-    if (s.contextUsage) lines.push(`Context: ${s.contextUsage.tokens === null ? 'unknown' : s.contextUsage.tokens.toLocaleString()} / ${s.contextUsage.contextWindow.toLocaleString()} tokens`);
-    if (s.parentSession) lines.push(`Parent: ${s.parentSession}`);
-    messageRenderer.renderSystemMessage(lines.join('\n'));
+async function renameCurrentSession(name) {
+  const context = requireSessionActionContext();
+  if (!context) return;
+  try {
+    setStatusMessage('Renaming...');
+    await sessionActions.rename(context, name);
+    setStatusMessage('Renamed', 2000);
+  } catch (error) {
+    const message = renderAppError(error, 'Failed to rename session');
+    setStatusMessage(message, 3000);
   }
 }
 
@@ -1819,6 +1863,7 @@ async function fetchModelInfo() {
       wsClient.request({ type: 'get_available_models' }),
       wsClient.request({ type: 'get_state' }),
     ]);
+    if (sessionClosed) return;
 
     if (modelsData.success && modelsData.data?.models) {
       availableModels = modelsData.data.models;
@@ -2067,7 +2112,9 @@ let currentGitState = { isRepo: false, currentBranch: '', branches: [] };
 
 async function fetchGitState() {
   const response = await fetch('/api/git');
+  if (sessionClosed) return;
   const data = await response.json();
+  if (sessionClosed) return;
   currentGitState = data;
   renderGitState();
 }
@@ -2116,9 +2163,11 @@ async function checkoutBranch(branch) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ branch }),
   });
+  if (sessionClosed) return;
   const data = await response.json();
+  if (sessionClosed) return;
   if (!response.ok || !data.ok) {
-    messageRenderer.renderError(data.error || 'Failed to switch branch');
+    renderAppError(data.error || 'Failed to switch branch');
     return;
   }
   currentGitState = data;
@@ -2136,8 +2185,13 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
-  // Escape — Abort streaming, or close sidebar on mobile
-  if (e.key === 'Escape') {
+  const shortcut = matchShortcut(e, 'global');
+
+  if (shortcut?.id === 'ui.dismiss') {
+    if (document.getElementById('session-actions-dialog').open) {
+      sessionActions.close();
+      return;
+    }
     // Close palettes/panels first
     if (!settingsPanel.classList.contains('hidden')) {
       closeSettings();
@@ -2163,8 +2217,7 @@ document.addEventListener('keydown', (e) => {
     }
   }
 
-  // / — Focus message input (when not already in an input)
-  if (e.key === '/' && !isInInput()) {
+  if (shortcut?.id === 'commands.focus' && !isInInput() && !sessionClosed) {
     e.preventDefault();
     openSlashMenu();
   }
@@ -2214,6 +2267,7 @@ refreshSessionsBtn.addEventListener('click', () => {
   }
   refreshSessionsBtn.classList.add('spinning');
   sidebar.loadSessions().then(() => {
+    if (sessionClosed) return;
     setTimeout(() => refreshSessionsBtn.classList.remove('spinning'), 600);
     if (isMirrorMode) updateMirrorLiveIndicator();
   });
@@ -2263,7 +2317,84 @@ sessionSearchInput.addEventListener('input', () => {
   sidebar.setSearchQuery(sessionSearchInput.value);
 });
 
+function setSessionTitle(title) {
+  if (sessionClosed) return;
+  const value = title || 'Untitled session';
+  sessionTitleText.textContent = value;
+  sessionTitleBtn.title = `Rename ${value}`;
+}
+
+function getSessionActionContext(session) {
+  return resolveSessionActionContext({
+    session,
+    currentSession,
+    mirrorActiveSessionFile,
+    viewingActiveSession,
+    isNewSessionMode,
+  });
+}
+
+function requireSessionActionContext() {
+  const context = getSessionActionContext();
+  if (context) return context;
+  messageRenderer.renderSystemMessage('Start the new session before using session actions.');
+  return null;
+}
+
+async function handleSessionRenamed(session) {
+  if (sessionClosed) return;
+  if (actionTargetsDisplayedSession({
+    sessionFile: session.sessionFile,
+    active: session.active,
+    currentSessionFile: currentSession?.filePath || null,
+    viewingActiveSession,
+  })) {
+    currentSession = {
+      ...(currentSession || {}),
+      filePath: session.sessionFile,
+      name: session.name,
+    };
+    setSessionTitle(session.name);
+  }
+  if (session.sessionFile) {
+    document.querySelectorAll('.session-item').forEach((item) => {
+      if (item.dataset.filePath === session.sessionFile) {
+        const title = item.querySelector('.session-title');
+        if (title) title.textContent = session.name;
+      }
+    });
+  }
+  await sidebar.loadSessions(false);
+  if (sessionClosed) return;
+  if (currentSession?.filePath) sidebar.setActive(currentSession.filePath);
+}
+
+function handleSessionAction(action, { session, project }) {
+  if (sessionClosed) return;
+  const context = getSessionActionContext(session);
+  if (action === 'open') {
+    void handleSessionSelect(session, project);
+  } else if (action === 'rename') {
+    sessionActions.openRename(context);
+  } else if (action === 'export') {
+    sessionActions.openExport(context);
+  } else if (action === 'info') {
+    void sessionActions.openInfo(context);
+  }
+}
+
+sessionTitleBtn.addEventListener('click', () => {
+  if (sessionClosed) return;
+  const context = requireSessionActionContext();
+  if (context) sessionActions.openRename(context);
+});
+
+connectionStatusBtn.addEventListener('click', () => {
+  if (!sessionClosed) void sessionActions.openConnect();
+});
+
 async function newSession() {
+  if (sessionClosed) return;
   newTrustMode.value = 'saved';
   sessionTotalCost = 0;
   lastInputTokens = 0;
@@ -2278,6 +2409,8 @@ async function newSession() {
   toolCardRenderer.clear();
   messageRenderer.renderWelcome();
   sidebar.clearActive();
+  currentSession = null;
+  setSessionTitle('New session');
   viewingActiveSession = true;
   updateMirrorInputState();
   enterNewSessionMode();
@@ -2288,17 +2421,22 @@ async function newSession() {
 }
 
 async function handleSessionSelect(session, project) {
+  if (sessionClosed) return;
   if (!session) {
     await newSession();
     return;
   }
   exitNewSessionMode();
+  currentSession = session;
+  sessionTitleBtn.disabled = false;
+  setSessionTitle(sessionActionTitle(session));
   sidebar.setActive(session.filePath);
   sessionTotalCost = 0;
   lastInputTokens = 0;
   updateCostDisplay();
   updateTokenUsage();
   await switchSession(session.filePath, session, project);
+  if (sessionClosed) return;
 
   // Close sidebar on mobile after selecting
   if (isMobile()) {
@@ -2330,14 +2468,17 @@ async function switchSession(sessionFile, session = null, project = null) {
         try {
           const sessionPath = encodeURIComponent(`${dirName}/${file}`);
           const res = await fetch(`/api/sessions/${sessionPath}`);
+          if (sessionClosed) return;
           console.log('[App] History fetch status:', res.status);
           const data = await res.json();
+          if (sessionClosed) return;
           console.log('[App] History entries:', data.entries?.length || 0);
 
           messageRenderer.clear();
           currentSessionEntries = Array.isArray(data.entries) ? data.entries : [];
           renderSessionHistoryOrWelcome(data.entries || []);
         } catch (e) {
+          if (sessionClosed) return;
           console.error('[App] History fetch error:', e);
         }
       } else {
@@ -2346,6 +2487,7 @@ async function switchSession(sessionFile, session = null, project = null) {
     } else {
       messageRenderer.renderWelcome();
     }
+    if (sessionClosed) return;
 
     // In mirror mode, check if this session is live on any instance
     if (isMirrorMode) {
@@ -2377,8 +2519,9 @@ async function switchSession(sessionFile, session = null, project = null) {
       }
     }
   } catch (error) {
+    if (sessionClosed) return;
     console.error('[App] Failed to switch session:', error);
-    messageRenderer.renderError('Failed to switch session');
+    renderAppError(error, 'Failed to switch session');
   }
 }
 
@@ -2399,6 +2542,12 @@ function handleMirrorSync(data) {
   // Track the active session
   mirrorActiveSessionFile = data.sessionFile || null;
   currentSessionEntries = Array.isArray(data.entries) ? data.entries : [];
+  currentSession = {
+    filePath: mirrorActiveSessionFile,
+    name: data.sessionName || null,
+  };
+  sessionTitleBtn.disabled = false;
+  setSessionTitle(data.sessionName || 'Untitled session');
   sidebar.setActive(mirrorActiveSessionFile);
   currentProjectPath = data.cwd || currentProjectPath;
   viewingActiveSession = true;
@@ -2463,10 +2612,13 @@ function updateMirrorLiveIndicator() {
 
 // Poll for running instances to mark all live sessions
 async function pollInstances() {
+  if (sessionClosed) return;
   try {
     const res = await fetch('/api/instances');
+    if (sessionClosed) return;
     if (res.ok) {
       const data = await res.json();
+      if (sessionClosed) return;
       liveInstances = data.instances || [];
       updateMirrorLiveIndicator();
     }
@@ -2474,11 +2626,11 @@ async function pollInstances() {
 }
 
 // Poll every 5 seconds
-setInterval(pollInstances, 5000);
+instancePollTimer = setInterval(pollInstances, 5000);
 pollInstances();
 
 function getCurrentComposerState() {
-  return getComposerState({ isMirrorMode, viewingActiveSession, isLaunchingNewSession });
+  return getComposerState({ isMirrorMode, viewingActiveSession, isLaunchingNewSession, sessionClosed });
 }
 
 // Keep every composer entry point aligned with the active session state.
@@ -2491,12 +2643,75 @@ function updateMirrorInputState() {
   inputArea?.classList.toggle('mirror-readonly', composerState.readOnly);
 }
 
+function enterSessionClosedState() {
+  if (sessionClosed) return;
+  sessionClosed = true;
+  clearTimeout(sidebarRefreshTimer);
+  clearTimeout(contextWindowTimer);
+  clearTimeout(statusResetTimer);
+  clearInterval(instancePollTimer);
+  sidebarRefreshTimer = null;
+  contextWindowTimer = null;
+  statusResetTimer = null;
+  instancePollTimer = null;
+  messageQueue = [];
+  state.reset();
+  showTypingIndicator(false);
+  sessionActions.close();
+  dialogHandler.dismissCurrentDialog();
+  clearExtensionUIState();
+  sidebar.closeContextMenu();
+  sidebar.hideSessionHoverCard();
+  closeCommandPalette();
+  hideSlashMenu();
+  closeModelDropdown();
+  closeBranchDropdown();
+  closeSettings();
+  if (sessionLaunchDialog.open) sessionLaunchDialog.close();
+  sidebarEl.classList.add('collapsed');
+  sidebarOverlay.classList.remove('visible');
+  fileSidebar.classList.add('collapsed');
+  syncMobileFileSidebar();
+  wsClient.disconnect();
+
+  document.body.classList.remove('new-session-mode');
+  document.body.classList.add('session-closed');
+  sessionTitleText.textContent = '';
+  sessionTitleBtn.disabled = true;
+  statusText.textContent = '';
+  statusIndicator.className = 'status-indicator';
+  connectionStatusBtn.disabled = true;
+  sessionCostEl.textContent = '';
+  tokenUsageEl.textContent = '';
+  contextViz.classList.add('hidden');
+  scrollBottomBtn.classList.add('hidden');
+  scrollBottomBadge.classList.add('hidden');
+  abortBtn.classList.add('hidden');
+  sendBtn.classList.remove('hidden');
+  disableSessionControls(document);
+  for (const region of [sidebarEl, document.querySelector('.header'), settingsPanel, fileSidebar, document.querySelector('.input-area')]) {
+    if (region) region.inert = true;
+  }
+  updateMirrorInputState();
+
+  const closed = document.createElement('section');
+  closed.className = 'session-closed-state';
+  const heading = document.createElement('h1');
+  heading.textContent = 'Session closed';
+  const detail = document.createElement('p');
+  detail.textContent = 'The Pi session has ended.';
+  closed.append(heading, detail);
+  messagesContainer.replaceChildren(closed);
+}
+
 async function launchSessionInstance(sessionFile, projectPath) {
+  if (sessionClosed) return false;
   if (!projectPath) {
-    messageRenderer.renderError('Cannot resume session: missing project path');
+    renderAppError('Cannot resume session: missing project path');
     return false;
   }
   const trustMode = await chooseSessionLaunchTrustMode();
+  if (sessionClosed) return false;
   if (!trustMode) return false;
   document.querySelector('.input-area')?.classList.remove('mirror-readonly');
   messageInput.disabled = true;
@@ -2509,9 +2724,11 @@ async function launchSessionInstance(sessionFile, projectPath) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: projectPath, sessionFile, trustMode }),
     });
+    if (sessionClosed) return false;
     const data = await response.json();
+    if (sessionClosed) return false;
     if (!response.ok) {
-      messageRenderer.renderError(data.error || 'Failed to open session');
+      renderAppError(data.error || 'Failed to open session');
       statusText.textContent = 'Connected';
       updateMirrorInputState();
       return false;
@@ -2520,7 +2737,8 @@ async function launchSessionInstance(sessionFile, projectPath) {
     navigateToInstance(data, data.reused === true);
     return true;
   } catch (error) {
-    messageRenderer.renderError(error instanceof Error ? error.message : 'Failed to open session');
+    if (sessionClosed) return false;
+    renderAppError(error, 'Failed to open session');
     statusText.textContent = 'Connected';
     updateMirrorInputState();
     return false;
@@ -2528,6 +2746,7 @@ async function launchSessionInstance(sessionFile, projectPath) {
 }
 
 async function launchNewSessionWithPendingMessage(cmd) {
+  if (sessionClosed) return { ok: false, error: 'Session closed' };
   if (isLaunchingNewSession) return { ok: false, error: 'New session is already opening' };
   isLaunchingNewSession = true;
   messageInput.disabled = true;
@@ -2537,6 +2756,7 @@ async function launchNewSessionWithPendingMessage(cmd) {
   try {
     if (!newSessionProjectLoad) startNewSessionProjectLoad();
     await newSessionProjectLoad;
+    if (sessionClosed) return { ok: false, error: 'Session closed' };
     statusText.textContent = 'Opening new session...';
 
     const response = await mutationFetch('/api/projects/launch', {
@@ -2546,7 +2766,9 @@ async function launchNewSessionWithPendingMessage(cmd) {
         ? { path: selectedNewProject.path, command: cmd, trustMode: newTrustMode.value }
         : { noProject: true, command: cmd, trustMode: newTrustMode.value }),
     });
+    if (sessionClosed) return { ok: false, error: 'Session closed' };
     const data = await response.json();
+    if (sessionClosed) return { ok: false, error: 'Session closed' };
     if (!response.ok) {
       statusText.textContent = 'Connected';
       return { ok: false, error: data.error || 'Failed to open new session' };
@@ -2556,11 +2778,12 @@ async function launchNewSessionWithPendingMessage(cmd) {
     navigateToInstance(data);
     return { ok: true };
   } catch (error) {
+    if (sessionClosed) return { ok: false, error: 'Session closed' };
     console.error('[App] Failed to launch new session:', error);
     statusText.textContent = 'Connected';
     return { ok: false, error: error instanceof Error ? error.message : 'Failed to open new session' };
   } finally {
-    if (!navigated) {
+    if (!navigated && !sessionClosed) {
       isLaunchingNewSession = false;
       messageInput.disabled = false;
       sendBtn.disabled = false;
@@ -2771,6 +2994,7 @@ async function fetchContextWindow() {
 let tailscaleUrl = '';
 
 function updateConnectionStatus(status) {
+  if (sessionClosed) return;
   statusIndicator.className = `status-indicator ${status}`;
 
   if (status === 'connected') {
@@ -2779,6 +3003,7 @@ function updateConnectionStatus(status) {
     // Fetch tailscale info on first connect
     if (!tailscaleUrl) {
       fetch('/api/health').then(r => r.json()).then(data => {
+        if (sessionClosed) return;
         if (data.tailscaleUrl) {
           tailscaleUrl = data.tailscaleUrl;
           statusText.textContent = 'Connected • TS';
@@ -2792,6 +3017,7 @@ function updateConnectionStatus(status) {
 }
 
 function updateUI({ flushPending = true } = {}) {
+  if (sessionClosed) return;
   const isStreaming = state.isStreaming;
 
   if (isStreaming) {
@@ -2820,6 +3046,7 @@ function updateUI({ flushPending = true } = {}) {
 // ═══════════════════════════════════════
 
 wsClient.addEventListener('sessionSwitch', () => {
+  if (sessionClosed) return;
   console.log('[App] Session switched');
 });
 
@@ -2934,7 +3161,7 @@ async function saveWebSettings() {
 
 settingsReload.addEventListener('click', () => {
   Promise.all([loadWebSettings(), settingsParity.load()]).catch((error) => {
-    messageRenderer.renderError(error.message);
+    renderAppError(error);
   });
 });
 
@@ -2944,7 +3171,7 @@ settingsSave.addEventListener('click', () => {
     await settingsParity.save();
     setStatusMessage('Settings saved', 2000);
   })().catch((error) => {
-    messageRenderer.renderError(error.message);
+    renderAppError(error);
   });
 });
 
@@ -2953,7 +3180,7 @@ async function openSettings() {
   settingsPanel.classList.remove('hidden');
   settingsOverlay.classList.remove('hidden');
   loadWebSettings().catch((error) => {
-    messageRenderer.renderError(error.message);
+    renderAppError(error);
   });
   void settingsParity.load();
   fetchGitState();
@@ -3003,6 +3230,7 @@ const authSection = document.getElementById('settings-auth-section');
 toggleAuth.addEventListener('click', async () => {
   const isOn = toggleAuth.classList.contains('on');
   const data = await rpcCommand({ type: 'set_auth', enabled: !isOn });
+  if (sessionClosed) return;
   if (data?.success) {
     toggleAuth.className = `settings-toggle${!isOn ? ' on' : ''}`;
     if (!isOn) location.reload();
@@ -3246,7 +3474,9 @@ function renderNewProjectLabel() {
 
 async function loadNewSessionProjects() {
   const response = await fetch('/api/projects');
+  if (sessionClosed) return;
   const data = await response.json();
+  if (sessionClosed) return;
   newSessionProjects = data.projects || [];
   newSessionTaskPath = data.taskPath || '';
   selectedNewProject = currentProjectPath === newSessionTaskPath
@@ -3269,6 +3499,7 @@ function startNewSessionProjectLoad() {
 }
 
 function navigateToInstance(instance, reused = false) {
+  if (sessionClosed) return;
   const url = new URL(location.href);
   url.port = String(instance.port);
   if (reused) url.searchParams.set('tauReused', '1');
@@ -3334,6 +3565,7 @@ function renderNewProjectMenu(filter = '') {
 
 async function openNewProjectMenu() {
   if (newSessionProjects.length === 0) await loadNewSessionProjects();
+  if (sessionClosed) return;
   renderNewProjectMenu();
   newProjectMenu.classList.remove('hidden');
 }
@@ -3343,12 +3575,14 @@ function closeNewProjectMenu() {
 }
 
 function restoreNewSessionDraft(draft, error) {
+  if (sessionClosed) return;
   state.reset();
   lastSentMessage = null;
   messageRenderer.clear();
   toolCardRenderer.clear();
   sidebar.clearActive();
   isNewSessionMode = true;
+  sessionTitleBtn.disabled = true;
   document.body.classList.add('new-session-mode');
   newSessionTools.classList.remove('hidden');
   messageRenderer.renderWelcome();
@@ -3368,6 +3602,7 @@ function restoreNewSessionDraft(draft, error) {
 
 function enterNewSessionMode() {
   isNewSessionMode = true;
+  sessionTitleBtn.disabled = true;
   document.body.classList.add('new-session-mode');
   newSessionTools.classList.remove('hidden');
   renderNewSessionWelcome();
@@ -3377,6 +3612,7 @@ function enterNewSessionMode() {
 
 function exitNewSessionMode() {
   isNewSessionMode = false;
+  sessionTitleBtn.disabled = !currentSession;
   document.body.classList.remove('new-session-mode');
   newSessionTools.classList.add('hidden');
   closeNewProjectMenu();

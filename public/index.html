@@ -59,6 +59,9 @@
             </button>
             <div class="model-dropdown-menu hidden" id="model-dropdown-menu"></div>
           </div>
+          <button type="button" class="session-title-btn" id="session-title-btn" title="Rename session" aria-label="Rename current session" aria-haspopup="dialog" aria-controls="session-actions-dialog">
+            <span id="session-title-text">New session</span>
+          </button>
         </div>
         <div class="header-right">
           <div class="pill session-cost" id="session-cost" title="Session cost"></div>
@@ -74,10 +77,10 @@
               </div>
             </div>
           </div>
-          <div class="status">
+          <button type="button" class="status" id="connection-status-btn" title="Connection details" aria-label="Connection details" aria-haspopup="dialog" aria-controls="session-actions-dialog">
             <span class="status-indicator" id="status-indicator"></span>
             <span class="status-text" id="status-text">Connecting...</span>
-          </div>
+          </button>
           <button type="button" class="icon-btn" id="file-sidebar-toggle" title="Files" aria-label="Toggle file browser" aria-controls="file-sidebar">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
           </button>
@@ -204,6 +207,15 @@
         <button value="launch">Open session</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog class="session-actions-dialog" id="session-actions-dialog" aria-labelledby="session-actions-title">
+    <header class="session-actions-header">
+      <h2 id="session-actions-title">Session</h2>
+      <button type="button" class="session-actions-close" id="session-actions-close" title="Close" aria-label="Close session panel">×</button>
+    </header>
+    <div class="session-actions-body" id="session-actions-body"></div>
+    <div class="session-actions-status" id="session-actions-status" role="status" hidden></div>
   </dialog>
 
   <!-- Settings Overlay -->

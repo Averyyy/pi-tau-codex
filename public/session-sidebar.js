@@ -57,10 +57,11 @@ function clearLegacySidebarPreferences() {
 }
 
 export class SessionSidebar {
-  constructor(container, onSessionSelect, mutationFetch) {
+  constructor(container, onSessionSelect, mutationFetch, onSessionAction) {
     this.container = container;
     this.onSessionSelect = onSessionSelect;
     this.mutationFetch = mutationFetch;
+    this.onSessionAction = onSessionAction;
     this.activeSessionFile = null;
     this.projects = [];
     this.tasks = null;
@@ -356,24 +357,41 @@ export class SessionSidebar {
   // Context Menu
   // ═══════════════════════════════════════
 
-  showContextMenu(e, session) {
+  showContextMenu(e, session, project) {
     e.preventDefault();
+    this.openSessionMenu(session, project, e.clientX, e.clientY);
+  }
+
+  openSessionMenu(session, project, x, y) {
     this.hideSessionHoverCard();
     this.closeContextMenu();
 
     const isFav = this.isFavourite(session.filePath);
     const menu = document.createElement('div');
     menu.className = 'session-context-menu';
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', `Actions for ${session.name || session.firstMessage || 'untitled session'}`);
 
     const items = [
+      { icon: '↗', label: 'Open', action: () => this.onSessionAction('open', { session, project }) },
+      { icon: '✎', label: 'Rename', action: () => this.onSessionAction('rename', { session, project }) },
+      { icon: '⇩', label: 'Export', action: () => this.onSessionAction('export', { session, project }) },
+      { icon: 'ⓘ', label: 'Info', action: () => this.onSessionAction('info', { session, project }) },
       { icon: isFav ? '★' : '☆', label: isFav ? 'Unfavourite' : 'Favourite', action: () => this.toggleFavourite(session.filePath) },
       { icon: '🗑', label: 'Delete', action: () => this.deleteSession(session) },
     ];
 
     for (const item of items) {
-      const row = document.createElement('div');
+      const row = document.createElement('button');
+      row.type = 'button';
       row.className = 'context-menu-item';
-      row.innerHTML = `<span class="context-menu-icon">${item.icon}</span>${item.label}`;
+      row.setAttribute('role', 'menuitem');
+      row.setAttribute('aria-label', `${item.label} ${session.name || session.firstMessage || 'untitled session'}`);
+      const icon = document.createElement('span');
+      icon.className = 'context-menu-icon';
+      icon.setAttribute('aria-hidden', 'true');
+      icon.textContent = item.icon;
+      row.append(icon, item.label);
       row.addEventListener('click', (ev) => {
         ev.stopPropagation();
         this.closeContextMenu();
@@ -382,7 +400,31 @@ export class SessionSidebar {
       menu.appendChild(row);
     }
 
-    this.positionContextMenu(menu, e.clientX, e.clientY);
+    menu.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      this.closeContextMenu();
+    });
+
+    this.positionContextMenu(menu, x, y);
+    menu.querySelector('[role="menuitem"]')?.focus();
+  }
+
+  createSessionActionsButton(session, project) {
+    const title = session.name || session.firstMessage || 'untitled session';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'session-actions-trigger';
+    button.textContent = '•••';
+    button.title = `Actions for ${title}`;
+    button.setAttribute('aria-label', `Actions for ${title}`);
+    button.setAttribute('aria-haspopup', 'menu');
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const rect = button.getBoundingClientRect();
+      this.openSessionMenu(session, project, rect.right, rect.bottom + 4);
+    });
+    return button;
   }
 
   showProjectMenu(e, project) {
@@ -618,12 +660,13 @@ export class SessionSidebar {
       </div>
       <div class="session-meta">${time}</div>
     `;
+    item.querySelector('.session-title-row')?.appendChild(this.createSessionActionsButton(session, project));
 
     item.addEventListener('click', () => {
       this.hideSessionHoverCard();
       this.onSessionSelect(session, project);
     });
-    item.addEventListener('contextmenu', (e) => this.showContextMenu(e, session));
+    item.addEventListener('contextmenu', (e) => this.showContextMenu(e, session, project));
     item.addEventListener('pointerenter', () => this.showSessionHoverCard(item, title, time, project, isTask));
     item.addEventListener('pointerleave', () => this.hideSessionHoverCard());
 
