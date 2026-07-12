@@ -43,14 +43,22 @@ import {
   type RelayCommand,
 } from "./interactive-launch.ts";
 import {
+  assertCurrentSessionVersion,
   buildSessionInfo,
   normalizeSessionName,
   readSessionActionBody,
   readSessionInfo,
   renameHistoricalSession,
+  sameSessionFileState,
   sendSessionExport,
+  sessionFileState,
   SessionActionError,
 } from "./session-actions.js";
+import {
+  inspectSessionImport,
+  installSessionImport,
+  readSessionImportBody,
+} from "./session-import.js";
 import {
   assertCurrentSessionReference,
   branchSession,
@@ -75,6 +83,7 @@ import {
   completeSessionLaunchReservation,
 } from "./session-launch-reservation.js";
 import { resolveSessionFilePath } from "./session-file-paths.ts";
+import { readShareCapability, shareSessionAsGist } from "./session-share.js";
 import { getWebParityCommand } from "./web-parity.ts";
 import {
   createOneShotRelayPolicy,
@@ -168,6 +177,7 @@ function findPublicDir(): string {
 const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const PI_AGENT_DIR = process.env.PI_CODING_AGENT_DIR || path.join(USER_HOME, ".pi", "agent");
 const SESSIONS_DIR = process.env.PI_CODING_AGENT_SESSION_DIR || path.join(PI_AGENT_DIR, "sessions");
+const CONFIGURED_SESSION_DIR = process.env.PI_CODING_AGENT_SESSION_DIR ? SESSIONS_DIR : undefined;
 const INSTANCES_DIR = path.join(USER_HOME, ".pi", "tau-instances");
 const PI_SETTINGS_PATH = path.join(PI_AGENT_DIR, "settings.json");
 const PI_AGENTS_PATH = path.join(PI_AGENT_DIR, "AGENTS.md");
@@ -3034,6 +3044,8 @@ export default function (pi: ExtensionAPI) {
     res.end(JSON.stringify({
       error: error?.message || String(error),
       ...(error?.ownerPort ? { ownerPort: error.ownerPort } : {}),
+      ...(error?.code ? { code: error.code } : {}),
+      ...(error?.fallback ? { fallback: error.fallback } : {}),
     }));
   }
 
@@ -3236,6 +3248,72 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     if (urlPath === "/api/instances") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ instances: getRunningInstances() }));
+      return;
+    }
+
+    const importMatch = urlPath.split("?", 1)[0].match(/^\/api\/sessions\/import\/(inspect|install)$/);
+    if (importMatch && req.method === "POST") {
+      void (async () => {
+        try {
+          const importUrl = new URL(`http://localhost${req.url}`);
+          const queryKeys = [...importUrl.searchParams.keys()];
+          if (queryKeys.some((key) => key !== "projectPath") || importUrl.searchParams.getAll("projectPath").length > 1) {
+            throw new SessionActionError(400, "Only one projectPath query parameter is supported", {
+              code: "INVALID_SESSION_IMPORT",
+            });
+          }
+          const projectPath = importUrl.searchParams.has("projectPath")
+            ? importUrl.searchParams.get("projectPath")!
+            : undefined;
+          const body = await readSessionImportBody(req);
+          const common = {
+            body,
+            SessionManager,
+            currentSessionVersion: CURRENT_SESSION_VERSION,
+            projectPath,
+          };
+          const result = importMatch[1] === "inspect"
+            ? inspectSessionImport(common)
+            : installSessionImport({
+                ...common,
+                sessionDir: CONFIGURED_SESSION_DIR,
+                storageRoot: SESSIONS_DIR,
+                instancesDir: INSTANCES_DIR,
+              });
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(result));
+        } catch (error) {
+          sendSessionActionFailure(res, error);
+        }
+      })();
+      return;
+    }
+
+    if (urlPath === "/api/share/capability" && req.method === "GET") {
+      void readShareCapability().then((result) => {
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify(result));
+      }, (error) => sendSessionActionFailure(res, error));
+      return;
+    }
+
+    if (urlPath === "/api/share" && req.method === "POST") {
+      void (async () => {
+        try {
+          const payload: any = await readSessionActionBody(req, ["sessionFile"]);
+          const sessionFile = resolveApiSessionFile(payload.sessionFile);
+          const initial = sessionFileState(fs.statSync(sessionFile));
+          assertCurrentSessionVersion(sessionFile, CURRENT_SESSION_VERSION);
+          if (!sameSessionFileState(initial, sessionFileState(fs.statSync(sessionFile)))) {
+            throw new SessionActionError(409, "Session changed during version check");
+          }
+          const result = await shareSessionAsGist({ sessionFile });
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(result));
+        } catch (error) {
+          sendSessionActionFailure(res, error);
+        }
+      })();
       return;
     }
 

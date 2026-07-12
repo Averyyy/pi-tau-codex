@@ -75,16 +75,18 @@ test('a session context menu dismisses and suppresses the hover card', () => {
     assert.equal(hidden, true);
     assert.equal(menu.attributes.role, 'menu');
     const menuItems = menu.children.filter((child) => child.attributes?.role === 'menuitem');
-    assert.deepEqual(menuItems.slice(0, 5).map((item) => item.attributes['aria-label']), [
+    assert.deepEqual(menuItems.slice(0, 6).map((item) => item.attributes['aria-label']), [
       'Open Named session',
       'Rename Named session',
       'Duplicate Named session',
       'Export Named session',
+      'Share Named session',
       'Info Named session',
     ]);
     menuItems[1].listeners.click({ stopPropagation: () => {} });
     menuItems[2].listeners.click({ stopPropagation: () => {} });
-    assert.deepEqual(actions, ['rename', 'duplicate']);
+    menuItems[4].listeners.click({ stopPropagation: () => {} });
+    assert.deepEqual(actions, ['rename', 'duplicate', 'share']);
 
     for (const item of menuItems) item.focused = false;
     let prevented = false;

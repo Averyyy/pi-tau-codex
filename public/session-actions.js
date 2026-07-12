@@ -131,7 +131,7 @@ export function sessionInfoRows(info) {
   return rows.filter(([, value]) => value !== undefined && value !== null && value !== '');
 }
 
-async function copyText(text, { clipboard, documentRef }) {
+export async function copyText(text, { clipboard, documentRef }) {
   if (clipboard?.writeText) return clipboard.writeText(text);
   const input = documentRef.createElement('textarea');
   input.value = text;

@@ -19,9 +19,12 @@ import { matchShortcut, visibleShortcuts } from './keymap.js';
 import {
   actionTargetsDisplayedSession,
   createSessionActions,
+  downloadBlob,
+  exportSession,
   resolveSessionActionContext,
   sessionActionTitle,
 } from './session-actions.js';
+import { createSessionTransfer, installSessionImport } from './session-transfer.js';
 import {
   createSessionTree,
   requestSessionOperation,
@@ -136,6 +139,12 @@ const sessionTree = createSessionTree({
   onOperation: performSessionOperation,
   request: (command) => wsClient.request(command),
   mutationFetch,
+});
+const sessionTransfer = createSessionTransfer({
+  openPanel: sessionActions.openPanel,
+  mutationFetch,
+  onImport: importAndOpenSession,
+  onDownloadHtml: downloadSessionHtml,
 });
 sessionTitleBtn.disabled = true;
 
@@ -1210,8 +1219,8 @@ const webSlashCommands = [
   { name: 'scoped-models', description: 'Change the model cycling scope', source: 'builtin', execution: 'unsupported' },
   { name: 'compact', description: 'Compact context', source: 'builtin', execution: 'web' },
   { name: 'export', description: 'Export the current session as HTML', source: 'builtin', execution: 'web' },
-  { name: 'import', description: 'Import and resume a session from a JSONL file', source: 'builtin', execution: 'unsupported' },
-  { name: 'share', description: 'Share the current session', source: 'builtin', execution: 'unsupported' },
+  { name: 'import', description: 'Import and resume a session from a JSONL file', source: 'builtin', execution: 'web' },
+  { name: 'share', description: 'Share the current session', source: 'builtin', execution: 'web' },
   { name: 'session', description: 'Show current session stats', source: 'builtin', execution: 'web' },
   { name: 'name', description: 'Rename this session', source: 'builtin', execution: 'web' },
   { name: 'new', description: 'Start a new session', source: 'builtin', execution: 'web' },
@@ -1240,6 +1249,8 @@ const localSlashCapabilities = Object.freeze({
   },
   compact: { mode: 'web', enabled: true, label: 'web' },
   export: { mode: 'web', enabled: true, label: 'web' },
+  import: { mode: 'web', enabled: true, label: 'web' },
+  share: { mode: 'web', enabled: true, label: 'web' },
   session: { mode: 'web', enabled: true, label: 'web' },
   name: { mode: 'web', enabled: true, label: 'web' },
   new: { mode: 'web', enabled: true, label: 'web' },
@@ -1284,18 +1295,6 @@ const localSlashCapabilities = Object.freeze({
     enabled: true,
     label: 'web',
     reason: 'This reloads only the Tau web UI.',
-  },
-  import: {
-    mode: 'unsupported',
-    enabled: false,
-    label: 'unavailable',
-    reason: 'Session import needs a server upload/import endpoint, which this mirror does not expose.',
-  },
-  share: {
-    mode: 'unsupported',
-    enabled: false,
-    label: 'unavailable',
-    reason: 'Session sharing needs a server share endpoint, which this mirror does not expose.',
   },
   changelog: {
     mode: 'unsupported',
@@ -1640,6 +1639,15 @@ function runSlashCommand(text) {
   if (name === 'export') {
     const context = requireSessionActionContext();
     if (context) sessionActions.openExport(context);
+    return true;
+  }
+  if (name === 'import') {
+    sessionTransfer.openImport();
+    return true;
+  }
+  if (name === 'share') {
+    const context = requireSessionActionContext();
+    if (context) void sessionTransfer.openShare(context);
     return true;
   }
   if (name === 'session') {
@@ -2334,6 +2342,7 @@ sidebarOverlay.addEventListener('click', () => {
 
 const newSessionBtn = document.getElementById('new-session-btn');
 newSessionBtn.addEventListener('click', () => newSession());
+document.getElementById('import-session-btn').addEventListener('click', () => sessionTransfer.openImport());
 
 refreshSessionsBtn.addEventListener('click', () => {
   if (isMobile()) {
@@ -2455,6 +2464,8 @@ function handleSessionAction(action, { session, project }) {
     if (context) void performSessionOperation('duplicate', context);
   } else if (action === 'export') {
     sessionActions.openExport(context);
+  } else if (action === 'share') {
+    if (context) void sessionTransfer.openShare(context);
   } else if (action === 'info') {
     void sessionActions.openInfo(context);
   }
@@ -2791,6 +2802,29 @@ function enterSessionClosedState() {
   detail.textContent = 'The Pi session has ended.';
   closed.append(heading, detail);
   messagesContainer.replaceChildren(closed);
+}
+
+async function importAndOpenSession({ file, projectPath }) {
+  sessionActions.close();
+  const trustMode = await chooseSessionLaunchTrustMode();
+  if (sessionClosed || !trustMode) return false;
+  try {
+    const imported = await installSessionImport(file, projectPath, mutationFetch);
+    if (sessionClosed) return false;
+    return await launchSessionInstance(imported.sessionFile, imported.cwd, { trustMode });
+  } catch (error) {
+    if (!sessionClosed) renderAppError(error, 'Failed to import session');
+    return false;
+  }
+}
+
+async function downloadSessionHtml(context) {
+  const result = await exportSession({
+    format: 'html',
+    sessionFile: context.sessionFile,
+    mutationFetch,
+  });
+  downloadBlob(result.blob, result.filename);
 }
 
 async function launchSessionInstance(sessionFile, projectPath, { draft, trustMode } = {}) {

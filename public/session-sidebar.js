@@ -377,6 +377,7 @@ export class SessionSidebar {
       { icon: '✎', label: 'Rename', action: () => this.onSessionAction('rename', { session, project }) },
       { icon: '⎘', label: 'Duplicate', action: () => this.onSessionAction('duplicate', { session, project }) },
       { icon: '⇩', label: 'Export', action: () => this.onSessionAction('export', { session, project }) },
+      { icon: '↗', label: 'Share', action: () => this.onSessionAction('share', { session, project }) },
       { icon: 'ⓘ', label: 'Info', action: () => this.onSessionAction('info', { session, project }) },
       { icon: isFav ? '★' : '☆', label: isFav ? 'Unfavourite' : 'Favourite', action: () => this.toggleFavourite(session.filePath) },
       { icon: '🗑', label: 'Delete', action: () => this.deleteSession(session) },

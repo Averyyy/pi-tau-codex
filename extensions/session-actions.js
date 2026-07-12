@@ -301,15 +301,38 @@ export async function sendSessionExport(response, {
   }
   if (format !== "html") throw new SessionActionError(400, "format must be html or jsonl");
 
-  const tempDir = fs.mkdtempSync(path.join(tempRoot, "tau-export-"));
-  const tempSessionFile = path.join(tempDir, "session.jsonl");
-  const outputFile = path.join(tempDir, "session.html");
   const controller = new AbortController();
   const abort = () => controller.abort();
   response.once("close", abort);
   try {
     if (response.destroyed || response.closed) controller.abort();
-    if (controller.signal.aborted) return;
+    await withSessionHtmlExport({
+      sessionFile,
+      runExecFile,
+      tempRoot,
+      signal: controller.signal,
+    }, async (outputFile) => {
+      if (response.destroyed || response.closed) return;
+      const stat = fs.statSync(outputFile);
+      response.writeHead(200, attachmentHeaders(sessionFile, "html", stat.size));
+      await pipeline(fs.createReadStream(outputFile), response);
+    });
+  } finally {
+    response.off("close", abort);
+  }
+}
+
+export async function withSessionHtmlExport({
+  sessionFile,
+  runExecFile = execFileAsync,
+  tempRoot = os.tmpdir(),
+  signal,
+}, useOutput) {
+  const tempDir = fs.mkdtempSync(path.join(tempRoot, "tau-export-"));
+  const tempSessionFile = path.join(tempDir, "session.jsonl");
+  const outputFile = path.join(tempDir, "session.html");
+  try {
+    if (signal?.aborted) return;
     const sourceState = sessionFileState(fs.statSync(sessionFile));
     fs.copyFileSync(sessionFile, tempSessionFile);
     if (!sameSessionFileState(sourceState, sessionFileState(fs.statSync(sessionFile)))) {
@@ -319,14 +342,10 @@ export async function sendSessionExport(response, {
       cwd: tempDir,
       encoding: "utf8",
       timeout: 30_000,
-      signal: controller.signal,
+      ...(signal ? { signal } : {}),
     });
-    if (response.destroyed) return;
-    const stat = fs.statSync(outputFile);
-    response.writeHead(200, attachmentHeaders(sessionFile, "html", stat.size));
-    await pipeline(fs.createReadStream(outputFile), response);
+    return await useOutput(outputFile);
   } finally {
-    response.off("close", abort);
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 }

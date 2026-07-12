@@ -6,6 +6,7 @@ const source = await readFile(new URL('../public/session-actions.js', import.met
 const {
   actionTargetsDisplayedSession,
   attachmentFilename,
+  copyText,
   downloadBlob,
   exportSession,
   renameSession,
@@ -150,4 +151,28 @@ test('export parses attachment names and downloads with guaranteed URL cleanup',
   });
   assert.equal(clicked, true);
   assert.equal(revoked, 'blob:session');
+});
+
+test('copy falls back to the document command when Clipboard API is unavailable', async () => {
+  let textarea;
+  let command;
+  await copyText('https://example.test/gist', {
+    clipboard: null,
+    documentRef: {
+      body: { appendChild: (node) => { textarea = node; } },
+      createElement: () => ({
+        setAttribute() {},
+        select() { this.selected = true; },
+        remove() { this.removed = true; },
+      }),
+      execCommand: (value) => {
+        command = value;
+        return true;
+      },
+    },
+  });
+  assert.equal(textarea.value, 'https://example.test/gist');
+  assert.equal(textarea.selected, true);
+  assert.equal(textarea.removed, true);
+  assert.equal(command, 'copy');
 });
