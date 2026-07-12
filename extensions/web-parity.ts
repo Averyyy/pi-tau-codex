@@ -410,8 +410,14 @@ async function handleQuit(args: string, ctx: ExtensionContext, _pi: ExtensionAPI
 	if (args.trim()) {
 		throw new Error("Usage: /tau-quit");
 	}
-	// Let the mirror flush the command response before Pi exits.
-	setImmediate(() => ctx.shutdown());
+	const confirmed = await ctx.ui.confirm(
+		"Quit Pi?",
+		"This will stop the current Pi session.",
+		{ signal: ctx.signal },
+	);
+	if (!confirmed) {
+		return { command: "quit", status: "ok" };
+	}
 	return { command: "quit", status: "shutdown" };
 }
 
@@ -456,7 +462,8 @@ export default function webParityExtension(pi: ExtensionAPI): void {
 		pi.registerCommand(command.tuiName, {
 			description: command.description,
 			handler: async (args, ctx) => {
-				await command.handler(args, ctx, pi);
+				const result = await command.handler(args, ctx, pi);
+				if (result?.status === "shutdown") ctx.shutdown();
 			},
 		});
 	}

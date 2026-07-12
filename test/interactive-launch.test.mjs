@@ -7,10 +7,24 @@ import test from "node:test";
 import {
   createLaunchEnvironment,
   createLinuxTerminalLaunch,
+  createPiLaunchArgs,
   createWindowsTerminalLaunch,
   requireLinuxExecutable,
   requireSupportedLinuxTerminal,
 } from "../extensions/interactive-launch.ts";
+
+test("launch trust mode maps to exact Pi arguments with session arguments last", () => {
+  assert.deepEqual(createPiLaunchArgs("saved"), []);
+  assert.deepEqual(createPiLaunchArgs("approve-once"), ["--approve"]);
+  assert.deepEqual(createPiLaunchArgs("deny-once"), ["--no-approve"]);
+  assert.deepEqual(createPiLaunchArgs("deny-once", "/tmp/session.jsonl"), [
+    "--no-approve",
+    "--session",
+    "/tmp/session.jsonl",
+  ]);
+  assert.throws(() => createPiLaunchArgs(undefined), /trustMode must be/);
+  assert.throws(() => createPiLaunchArgs("approve"), /trustMode must be/);
+});
 
 test("Windows launch uses a visible PowerShell terminal and preserves literal paths", () => {
   const launch = createWindowsTerminalLaunch(

@@ -17,6 +17,16 @@ export type TerminalLaunch = {
   args: string[];
 };
 
+export function createPiLaunchArgs(trustMode: unknown, sessionFile?: string): string[] {
+  let args: string[];
+  if (trustMode === "saved") args = [];
+  else if (trustMode === "approve-once") args = ["--approve"];
+  else if (trustMode === "deny-once") args = ["--no-approve"];
+  else throw new Error("trustMode must be saved, approve-once, or deny-once");
+  if (sessionFile) args.push("--session", sessionFile);
+  return args;
+}
+
 const LINUX_TERMINAL_HELP = `Set TAU_LINUX_TERMINAL to one of: ${SUPPORTED_LINUX_TERMINALS.join(", ")}. For example: TAU_LINUX_TERMINAL=gnome-terminal pi`;
 
 export function createLaunchEnvironment(

@@ -147,12 +147,24 @@
           </div>
         </form>
         <div class="new-session-tools hidden" id="new-session-tools">
-          <button type="button" class="new-project-btn" id="new-project-btn">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
-            <span id="new-project-label">项目</span>
-            <svg width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </button>
-          <div class="new-project-menu hidden" id="new-project-menu"></div>
+          <div class="new-session-options">
+            <div class="new-project-picker">
+              <button type="button" class="new-project-btn" id="new-project-btn">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
+                <span id="new-project-label">项目</span>
+                <svg width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <div class="new-project-menu hidden" id="new-project-menu"></div>
+            </div>
+            <label class="new-trust-control">
+              <span>Trust</span>
+              <select id="new-trust-mode" aria-label="Project trust for new session">
+                <option value="saved">Use saved decision</option>
+                <option value="approve-once">Approve once</option>
+                <option value="deny-once">Deny once</option>
+              </select>
+            </label>
+          </div>
         </div>
         <div class="extension-widgets below" id="extension-widgets-below"></div>
       </div>
@@ -174,6 +186,25 @@
       <div class="file-list" id="file-list"></div>
     </aside>
   </div>
+
+  <dialog class="dialog launch-dialog" id="session-launch-dialog" aria-labelledby="session-launch-title">
+    <form method="dialog">
+      <div class="dialog-title" id="session-launch-title">Open historical session</div>
+      <div class="dialog-message">Choose the project trust mode for the new Pi instance.</div>
+      <label class="dialog-field">
+        <span>Trust</span>
+        <select class="dialog-select" id="session-launch-trust-mode">
+          <option value="saved">Use saved decision</option>
+          <option value="approve-once">Approve once</option>
+          <option value="deny-once">Deny once</option>
+        </select>
+      </label>
+      <div class="dialog-actions">
+        <button value="cancel">Cancel</button>
+        <button value="launch">Open session</button>
+      </div>
+    </form>
+  </dialog>
 
   <!-- Settings Overlay -->
   <div class="settings-overlay hidden" id="settings-overlay"></div>
@@ -256,7 +287,7 @@
           </div>
         </div>
         <div class="settings-footer">
-          <button type="button" class="settings-secondary" id="settings-reload">Reload</button>
+          <button type="button" class="settings-secondary" id="settings-reload">Revert changes</button>
           <button type="button" class="settings-primary" id="settings-save">Save</button>
         </div>
       </div>

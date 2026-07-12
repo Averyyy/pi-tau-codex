@@ -11,6 +11,7 @@ import { ExtensionTuiBridge, renderAnsiText } from './extension-tui.js';
 import { SessionSidebar } from './session-sidebar.js';
 import { getSessionHistoryFallback } from './session-history.js';
 import { getComposerState } from './composer-state.js';
+import { filterSlashCommands } from './slash-command-filter.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
 
@@ -91,6 +92,7 @@ let authCapability = {
 let sidebarRefreshTimer = null;
 let isLaunchingNewSession = false;
 let desktopSidebarCollapsed = sidebarEl.classList.contains('collapsed');
+let reusedLaunchNotice = new URL(location.href).searchParams.get('tauReused') === '1';
 const mobileViewport = window.matchMedia('(max-width: 768px)');
 
 function scheduleSidebarRefresh() {
@@ -1150,7 +1152,7 @@ const webSlashCommands = [
   { name: 'login', description: 'Configure provider authentication', source: 'builtin', execution: 'rpc' },
   { name: 'logout', description: 'Remove provider authentication', source: 'builtin', execution: 'rpc' },
   { name: 'resume', description: 'Resume a different session from the sidebar', source: 'builtin', execution: 'web' },
-  { name: 'reload', description: 'Reload the Tau web UI only', source: 'builtin', execution: 'web' },
+  { name: 'reload-web', description: 'Reload the Tau web UI', source: 'tau', execution: 'web' },
   { name: 'quit', description: 'Quit Pi', source: 'builtin', execution: 'rpc' },
 ];
 
@@ -1207,11 +1209,11 @@ const localSlashCapabilities = Object.freeze({
     reason: 'Uses the Tau web-parity extension and Pi public auth storage API.',
   },
   resume: { mode: 'web', enabled: true, label: 'web' },
-  reload: {
+  'reload-web': {
     mode: 'web',
     enabled: true,
-    label: 'web only',
-    reason: 'This reloads the Tau web UI; Pi keybindings, extensions, prompts, and themes are not reloaded.',
+    label: 'web',
+    reason: 'This reloads only the Tau web UI.',
   },
   import: {
     mode: 'unsupported',
@@ -1376,12 +1378,7 @@ async function updateSlashMenu(force = false) {
     lastSlashQuery = fragment.query;
   }
 
-  const filtered = slashCommands
-    .filter((command) => {
-      const name = String(command.name || '').toLowerCase();
-      const desc = String(command.description || '').toLowerCase();
-      return !fragment.query || name.includes(fragment.query) || desc.includes(fragment.query);
-    });
+  const filtered = filterSlashCommands(slashCommands, fragment.query);
 
   if (filtered.length === 0) {
     hideSlashMenu();
@@ -1612,7 +1609,7 @@ function runSlashCommand(text) {
     copyLatestAssistantMessage();
     return true;
   }
-  if (name === 'reload') {
+  if (name === 'reload-web') {
     setStatusMessage('Reloading Tau web UI...', 1500);
     location.reload();
     return true;
@@ -1783,13 +1780,19 @@ async function showSessionStats() {
   if (data?.success && data.data) {
     const s = data.data;
     const lines = [
-      `📊 Session Stats`,
+      'Session Stats',
+      `Session: ${s.sessionId}`,
+      `Path: ${s.sessionFile || 'Not persisted'}`,
+      `Working directory: ${s.cwd}`,
       `Messages: ${s.totalMessages} (${s.userMessages} user, ${s.assistantMessages} assistant)`,
-      `Tool calls: ${s.toolCalls}`,
+      `Tools: ${s.toolCalls} calls, ${s.toolResults} results`,
+      `Compactions: ${s.compactions} · Branch points: ${s.branchPoints}`,
+      `Tokens: ${s.tokens.total.toLocaleString()} (${s.tokens.input.toLocaleString()} input, ${s.tokens.output.toLocaleString()} output, ${s.tokens.cacheRead.toLocaleString()} cache read, ${s.tokens.cacheWrite.toLocaleString()} cache write)`,
+      `Cost: $${s.cost.total.toFixed(4)}`,
     ];
-    if (s.tokens) {
-      lines.push(`Context: ~${(s.tokens.input / 1000).toFixed(1)}k tokens`);
-    }
+    if (s.model) lines.push(`Model: ${s.model.provider}/${s.model.id} · Thinking: ${s.thinkingLevel}`);
+    if (s.contextUsage) lines.push(`Context: ${s.contextUsage.tokens === null ? 'unknown' : s.contextUsage.tokens.toLocaleString()} / ${s.contextUsage.contextWindow.toLocaleString()} tokens`);
+    if (s.parentSession) lines.push(`Parent: ${s.parentSession}`);
     messageRenderer.renderSystemMessage(lines.join('\n'));
   }
 }
@@ -2260,6 +2263,7 @@ sessionSearchInput.addEventListener('input', () => {
 });
 
 async function newSession() {
+  newTrustMode.value = 'saved';
   sessionTotalCost = 0;
   lastInputTokens = 0;
   currentSessionEntries = [];
@@ -2430,6 +2434,16 @@ function handleMirrorSync(data) {
 
   renderSessionHistoryOrWelcome(data.entries || [], pendingUserMessage);
 
+  if (reusedLaunchNotice) {
+    const notice = 'Connected to the existing instance. Trust mode only applies when starting a new instance.';
+    messageRenderer.renderSystemMessage(notice);
+    setStatusMessage(notice, 5000);
+    const url = new URL(location.href);
+    url.searchParams.delete('tauReused');
+    history.replaceState(null, '', url);
+    reusedLaunchNotice = false;
+  }
+
   updateCostDisplay();
   updateTokenUsage();
   updateUI();
@@ -2481,6 +2495,8 @@ async function launchSessionInstance(sessionFile, projectPath) {
     messageRenderer.renderError('Cannot resume session: missing project path');
     return false;
   }
+  const trustMode = await chooseSessionLaunchTrustMode();
+  if (!trustMode) return false;
   document.querySelector('.input-area')?.classList.remove('mirror-readonly');
   messageInput.disabled = true;
   messageInput.placeholder = 'Opening session...';
@@ -2490,7 +2506,7 @@ async function launchSessionInstance(sessionFile, projectPath) {
     const response = await mutationFetch('/api/sessions/launch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: projectPath, sessionFile }),
+      body: JSON.stringify({ path: projectPath, sessionFile, trustMode }),
     });
     const data = await response.json();
     if (!response.ok) {
@@ -2500,7 +2516,7 @@ async function launchSessionInstance(sessionFile, projectPath) {
       return false;
     }
 
-    navigateToInstance(data);
+    navigateToInstance(data, data.reused === true);
     return true;
   } catch (error) {
     messageRenderer.renderError(error instanceof Error ? error.message : 'Failed to open session');
@@ -2526,8 +2542,8 @@ async function launchNewSessionWithPendingMessage(cmd) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(selectedNewProject
-        ? { path: selectedNewProject.path, command: cmd }
-        : { noProject: true, command: cmd }),
+        ? { path: selectedNewProject.path, command: cmd, trustMode: newTrustMode.value }
+        : { noProject: true, command: cmd, trustMode: newTrustMode.value }),
     });
     const data = await response.json();
     if (!response.ok) {
@@ -3185,11 +3201,25 @@ const newSessionTools = document.getElementById('new-session-tools');
 const newProjectBtn = document.getElementById('new-project-btn');
 const newProjectLabel = document.getElementById('new-project-label');
 const newProjectMenu = document.getElementById('new-project-menu');
+const newTrustMode = document.getElementById('new-trust-mode');
+const sessionLaunchDialog = document.getElementById('session-launch-dialog');
+const sessionLaunchTrustMode = document.getElementById('session-launch-trust-mode');
 let isNewSessionMode = false;
 let newSessionProjects = [];
 let selectedNewProject = null;
 let newSessionTaskPath = '';
 let newSessionProjectLoad = null;
+
+function chooseSessionLaunchTrustMode() {
+  sessionLaunchTrustMode.value = 'saved';
+  sessionLaunchDialog.returnValue = '';
+  sessionLaunchDialog.showModal();
+  return new Promise((resolve) => {
+    sessionLaunchDialog.addEventListener('close', () => {
+      resolve(sessionLaunchDialog.returnValue === 'launch' ? sessionLaunchTrustMode.value : null);
+    }, { once: true });
+  });
+}
 
 function projectShortName(project) {
   if (!project?.path) return '不使用项目';
@@ -3230,9 +3260,11 @@ function startNewSessionProjectLoad() {
   return load;
 }
 
-function navigateToInstance(instance) {
+function navigateToInstance(instance, reused = false) {
   const url = new URL(location.href);
   url.port = String(instance.port);
+  if (reused) url.searchParams.set('tauReused', '1');
+  else url.searchParams.delete('tauReused');
   location.href = url.toString();
 }
 

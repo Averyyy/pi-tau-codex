@@ -31,10 +31,17 @@ import {
 import {
   createLaunchEnvironment,
   createLinuxTerminalLaunch,
+  createPiLaunchArgs,
   createWindowsTerminalLaunch,
   requireLinuxExecutable,
   requireSupportedLinuxTerminal,
 } from "./interactive-launch.ts";
+import { exportSessionToHtml } from "./pi-export.js";
+import { aggregateSessionStats } from "./session-stats.js";
+import {
+  acquireSessionLaunchReservation,
+  completeSessionLaunchReservation,
+} from "./session-launch-reservation.js";
 import { resolveSessionFilePath } from "./session-file-paths.ts";
 import { getWebParityCommand } from "./web-parity.ts";
 import {
@@ -471,15 +478,19 @@ function writeInstanceFile(info: TauInstance) {
 }
 
 function registerInstance(port: number, sessionFile: string, cwd: string) {
+  const launchId = process.env.TAU_LAUNCH_ID || undefined;
   const info: TauInstance = {
     port,
     pid: process.pid,
     sessionFile,
     cwd,
     startedAt: new Date().toISOString(),
-    launchId: process.env.TAU_LAUNCH_ID || undefined,
+    launchId,
   };
   writeInstanceFile(info);
+  if (launchId) {
+    completeSessionLaunchReservation(INSTANCES_DIR, { launchId, sessionFile });
+  }
 }
 
 function updateInstanceSession(sessionFile: string) {
@@ -614,10 +625,9 @@ function launchInteractiveTerminal(
 async function launchPi(
   projectPath: string,
   launchId: string,
-  options: { sessionFile?: string; relayToken?: string } = {},
+  options: { piArgs: string[]; relayToken?: string },
 ): Promise<void> {
-  const args = ["--approve"];
-  if (options.sessionFile) args.push("--session", options.sessionFile);
+  const args = options.piArgs;
   if (process.platform === "darwin") {
     const piPath = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
     const relayEnvironment = options.relayToken
@@ -643,13 +653,23 @@ async function launchPi(
   throw new Error(`Tau cannot open an interactive Pi terminal on ${process.platform}`);
 }
 
+class LaunchPiRejectedError extends Error {
+  readonly rejection: Error;
+
+  constructor(rejection: unknown) {
+    const error = rejection instanceof Error ? rejection : new Error(String(rejection));
+    super(error.message);
+    this.rejection = error;
+  }
+}
+
+class SessionLaunchBusyError extends Error {}
+
 function waitForLaunchedInstance(
   projectPath: string,
-  options: { sessionFile?: string; relayToken?: string } = {},
+  launchId: string,
+  options: { piArgs: string[]; relayToken?: string; expectedSessionFile?: string },
 ): Promise<TauInstance> {
-  fs.mkdirSync(INSTANCES_DIR, { recursive: true });
-  const launchId = randomUUID();
-
   return new Promise((resolve, reject) => {
     let settled = false;
     let watcher: fs.FSWatcher | null = null;
@@ -671,34 +691,170 @@ function waitForLaunchedInstance(
       for (const name of names) {
         const file = path.join(INSTANCES_DIR, name);
         if (!fs.existsSync(file)) continue;
-        const instance = JSON.parse(fs.readFileSync(file, "utf8")) as TauInstance;
-        if (instance.launchId === launchId) {
-          finish(undefined, instance);
-          return;
+        let instance: any;
+        try {
+          instance = JSON.parse(fs.readFileSync(file, "utf8"));
+        } catch {
+          continue;
         }
+        if (!instance || typeof instance !== "object" || instance.launchId !== launchId) continue;
+        if (typeof instance.sessionFile !== "string") {
+          throw new Error(`Invalid Tau instance registration: ${file}`);
+        }
+        if (
+          options.expectedSessionFile !== undefined &&
+          instance.sessionFile !== options.expectedSessionFile
+        ) {
+          continue;
+        }
+        if (
+          !Number.isSafeInteger(instance.port) ||
+          instance.port <= 0 ||
+          !Number.isSafeInteger(instance.pid) ||
+          instance.pid <= 0 ||
+          typeof instance.cwd !== "string" ||
+          typeof instance.startedAt !== "string"
+        ) {
+          throw new Error(`Invalid Tau instance registration: ${file}`);
+        }
+        finish(undefined, instance as TauInstance);
+        return;
       }
     };
 
-    watcher = fs.watch(INSTANCES_DIR, (_eventType, filename) => {
+    try {
+      fs.mkdirSync(INSTANCES_DIR, { recursive: true });
+      watcher = fs.watch(INSTANCES_DIR, (_eventType, filename) => {
+        try {
+          inspectRegistration(filename);
+        } catch (error) {
+          finish(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+      watcher.on("error", (error) => finish(error));
+      inspectRegistration();
+    } catch (error) {
+      finish(new LaunchPiRejectedError(error));
+      return;
+    }
+    if (settled) return;
+
+    void launchPi(projectPath, launchId, options).then(
+      () => {
+        if (settled) return;
+        timeout = setTimeout(() => {
+          try {
+            inspectRegistration();
+            if (!settled) {
+              finish(new SessionLaunchBusyError(
+                `Tau instance did not register within ${LAUNCH_TIMEOUT_MS / 1000} seconds`,
+              ));
+            }
+          } catch (error) {
+            finish(error instanceof Error ? error : new Error(String(error)));
+          }
+        }, LAUNCH_TIMEOUT_MS);
+      },
+      (error) => finish(new LaunchPiRejectedError(error)),
+    );
+  });
+}
+
+function findRunningSessionInstance(sessionFile: string): TauInstance | undefined {
+  return getRunningInstances().find((instance) => instance.sessionFile === sessionFile);
+}
+
+function waitForSessionLaunch(
+  sessionFile: string,
+  reservationPath: string,
+  timeoutMs: number,
+): Promise<TauInstance | null> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let watcher: fs.FSWatcher | null = null;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const finish = (instance: TauInstance | null, error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      watcher?.close();
+      if (error) reject(error);
+      else resolve(instance);
+    };
+    const inspect = () => {
+      const instance = findRunningSessionInstance(sessionFile);
+      if (instance) finish(instance);
+      else if (!fs.existsSync(reservationPath)) finish(null);
+    };
+
+    watcher = fs.watch(INSTANCES_DIR, () => {
       try {
-        inspectRegistration(filename);
+        inspect();
       } catch (error) {
-        finish(error instanceof Error ? error : new Error(String(error)));
+        finish(null, error instanceof Error ? error : new Error(String(error)));
       }
     });
-    watcher.on("error", (error) => finish(error));
+    watcher.on("error", (error) => finish(null, error));
     timeout = setTimeout(() => {
-      finish(new Error(`Tau instance did not register within ${LAUNCH_TIMEOUT_MS / 1000} seconds`));
-    }, LAUNCH_TIMEOUT_MS);
+      try {
+        inspect();
+        if (!settled) {
+          finish(null, new SessionLaunchBusyError("Session launch is already in progress"));
+        }
+      } catch (error) {
+        finish(null, error instanceof Error ? error : new Error(String(error)));
+      }
+    }, timeoutMs);
 
     try {
-      void launchPi(projectPath, launchId, options).catch((error) => {
-        finish(error instanceof Error ? error : new Error(String(error)));
-      });
+      inspect();
     } catch (error) {
-      finish(error instanceof Error ? error : new Error(String(error)));
+      finish(null, error instanceof Error ? error : new Error(String(error)));
     }
   });
+}
+
+async function launchOrReuseSession(
+  sessionFile: string,
+  launch: (launchId: string) => Promise<TauInstance>,
+): Promise<{ instance: TauInstance; reused: boolean }> {
+  const deadline = Date.now() + LAUNCH_TIMEOUT_MS;
+
+  while (true) {
+    const running = findRunningSessionInstance(sessionFile);
+    if (running) return { instance: running, reused: true };
+
+    const launchId = randomUUID();
+    const reservation = acquireSessionLaunchReservation(INSTANCES_DIR, {
+      launchId,
+      ownerPid: process.pid,
+      sessionFile,
+    });
+    if (reservation.acquired) {
+      const raced = findRunningSessionInstance(sessionFile);
+      if (raced) {
+        reservation.release();
+        return { instance: raced, reused: true };
+      }
+      try {
+        const instance = await launch(launchId);
+        return { instance, reused: false };
+      } catch (error) {
+        if (error instanceof LaunchPiRejectedError) {
+          reservation.release();
+          throw error.rejection;
+        }
+        throw error;
+      }
+    }
+
+    const instance = await waitForSessionLaunch(
+      sessionFile,
+      reservation.path,
+      Math.max(0, deadline - Date.now()),
+    );
+    if (instance) return { instance, reused: true };
+  }
 }
 
 function relayCommandToInstance(
@@ -886,7 +1042,7 @@ const BUILTIN_SLASH_COMMANDS = [
   ["quit", "Quit Pi"],
 ] as const;
 
-const TAU_COMMAND_NAMES = new Set(["taustop", "taustart", "tau", "qr"]);
+const TAU_COMMAND_NAMES = new Set(["taustop", "tau-stop", "taustart", "tau-start", "tau", "qr"]);
 
 type CommandExecution = "rpc" | "native" | "metadata-only" | "unsupported";
 
@@ -1860,7 +2016,7 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // /tau-stop and /tau-start commands
   // ═══════════════════════════════════════
-  registerTauCommand("taustop", {
+  const stopTauCommand: TauCommand = {
     description: "Stop the Tau mirror server",
     handler: async (_args, ctx) => {
       if (!server) {
@@ -1870,11 +2026,13 @@ export default function (pi: ExtensionAPI) {
       stopServer();
       ctx.ui.setStatus("mirror", "");
       ctx.ui.notify("Tau mirror server stopped", "info");
-      console.log("[Mirror] Server stopped via /taustop");
+      console.log("[Mirror] Server stopped via Tau command");
     },
-  });
+  };
+  registerTauCommand("taustop", stopTauCommand);
+  registerTauCommand("tau-stop", stopTauCommand);
 
-  registerTauCommand("taustart", {
+  const startTauCommand: TauCommand = {
     description: "Start the Tau mirror server",
     handler: async (_args, ctx) => {
       if (server) {
@@ -1884,7 +2042,9 @@ export default function (pi: ExtensionAPI) {
       startServer(ctx);
       ctx.ui.notify("Tau mirror server starting...", "info");
     },
-  });
+  };
+  registerTauCommand("taustart", startTauCommand);
+  registerTauCommand("tau-start", startTauCommand);
 
   // ═══════════════════════════════════════
   // /qr command — show QR code to connect
@@ -2261,7 +2421,16 @@ export default function (pi: ExtensionAPI) {
               ? handler(args, latestCtx!)
               : webParityCommand!.handler(args, latestCtx!, pi);
             const result = await (owner ? runWithBrowserUIOwner(owner, run) : run());
-            sendTo(ws, success("run_command", result));
+            const response = success("run_command", result);
+            if (webParityCommand?.name === "quit" && result?.status === "shutdown") {
+              const shutdownContext = latestCtx;
+              ws.send(JSON.stringify(response), (sendError) => {
+                if (sendError) console.error("[Mirror] Quit acknowledgement failed:", sendError);
+                else shutdownContext?.shutdown();
+              });
+            } else {
+              sendTo(ws, response);
+            }
           } catch (commandError) {
             sendTo(ws, error("run_command", errorText(commandError)));
           } finally {
@@ -2495,23 +2664,17 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, error("get_session_stats", "No context available"));
             break;
           }
-          const usage = ctx.getContextUsage();
-          const entries = ctx.sessionManager.getEntries();
-          let userMessages = 0, assistantMessages = 0, toolCalls = 0;
-          for (const e of entries) {
-            if (e.type === "message") {
-              if (e.message?.role === "user") userMessages++;
-              else if (e.message?.role === "assistant") assistantMessages++;
-              else if (e.message?.role === "toolResult") toolCalls++;
-            }
-          }
+          const sessionManager = ctx.sessionManager;
+          const header = sessionManager.getHeader();
           sendTo(ws, success("get_session_stats", {
-            sessionFile: ctx.sessionManager.getSessionFile(),
-            userMessages,
-            assistantMessages,
-            toolCalls,
-            totalMessages: entries.length,
-            tokens: usage ? { input: usage.tokens, total: usage.tokens } : null,
+            ...aggregateSessionStats(sessionManager.getEntries(), sessionManager.getTree()),
+            sessionId: sessionManager.getSessionId(),
+            sessionFile: sessionManager.getSessionFile(),
+            cwd: sessionManager.getCwd(),
+            parentSession: header?.parentSession,
+            model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null,
+            thinkingLevel: pi.getThinkingLevel(),
+            contextUsage: ctx.getContextUsage() || null,
           }));
           break;
         }
@@ -2550,17 +2713,15 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, error("export_html", "No context available"));
             break;
           }
+          if (command.outputPath !== undefined) {
+            sendTo(ws, error("export_html", "Browser-selected output paths are not supported"));
+            break;
+          }
           try {
             const sessionFile = ctx.sessionManager.getSessionFile();
             if (!sessionFile) throw new Error("No session file to export");
-            const { execSync } = require("node:child_process");
-            const args = command.outputPath
-              ? `"${sessionFile}" "${command.outputPath}"`
-              : `"${sessionFile}"`;
-            const output = execSync(`pi --export ${args}`, { cwd: process.cwd(), timeout: 30000, encoding: "utf-8" });
-            // pi prints the output path
-            const result = output.trim().split("\n").pop() || sessionFile.replace(".jsonl", ".html");
-            sendTo(ws, success("export_html", { path: result }));
+            const outputPath = await exportSessionToHtml(sessionFile, process.cwd());
+            sendTo(ws, success("export_html", { path: outputPath }));
           } catch (e: any) {
             sendTo(ws, error("export_html", e.message));
           }
@@ -2972,6 +3133,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             noProject,
             sessionFile: requestedSessionFile,
             command,
+            trustMode,
           } = payload;
           if (!noProject && (!projectPath || typeof projectPath !== "string")) {
             res.writeHead(400, { "Content-Type": "application/json" });
@@ -3003,6 +3165,14 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
               return;
             }
           }
+          let piArgs: string[];
+          try {
+            piArgs = createPiLaunchArgs(trustMode, sessionFile);
+          } catch (error) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+            return;
+          }
           // Resolve ~ in path
           const launchPath = noProject
             ? USER_HOME
@@ -3016,10 +3186,15 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             return;
           }
           const relayToken = command ? randomUUID() : undefined;
-          const instance = await waitForLaunchedInstance(resolved, {
-            ...(urlPath === "/api/sessions/launch" ? { sessionFile } : {}),
+          const launch = (launchId: string) => waitForLaunchedInstance(resolved, launchId, {
+            piArgs,
             ...(relayToken ? { relayToken } : {}),
+            ...(sessionFile !== undefined ? { expectedSessionFile: sessionFile } : {}),
           });
+          const launchResult = sessionFile
+            ? await launchOrReuseSession(sessionFile, launch)
+            : { instance: await launch(randomUUID()), reused: false };
+          const { instance, reused } = launchResult;
           if (command) await relayCommandToInstance(instance, command, relayToken!);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({
@@ -3027,9 +3202,11 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             pid: instance.pid,
             cwd: instance.cwd,
             sessionFile: instance.sessionFile,
+            reused,
           }));
         } catch (e: any) {
-          res.writeHead(500, { "Content-Type": "application/json" });
+          const status = e instanceof SessionLaunchBusyError ? 409 : 500;
+          res.writeHead(status, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: e.message }));
         }
       });
