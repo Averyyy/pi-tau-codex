@@ -12,7 +12,9 @@
 
 import {
   CURRENT_SESSION_VERSION,
+  DefaultPackageManager,
   getPackageDir,
+  resolveModelScopeWithDiagnostics,
   SessionManager,
   SettingsManager,
   VERSION,
@@ -76,8 +78,16 @@ import {
   readAboutInfo,
   readEnabledModelScope,
   readProviderAccounts,
+  validateDefaultModelSelection,
   writeEnabledModelScope,
 } from "./settings-parity.js";
+import {
+  createPackageMutationQueue,
+  createPiPackageRuntime,
+  listPiPackages,
+  mutatePiPackage,
+  readMcpCapability,
+} from "./package-parity.js";
 import {
   acquireSessionLaunchReservation,
   completeSessionLaunchReservation,
@@ -1403,6 +1413,7 @@ export default function (pi: ExtensionAPI) {
 
   // Store latest context reference for use in command handlers
   let latestCtx: ExtensionContext | null = null;
+  const runPiPackageMutation = createPackageMutationQueue();
   type TauCommand = {
     description?: string;
     handler: (args: string, ctx: ExtensionContext) => Promise<void> | void;
@@ -2163,7 +2174,6 @@ export default function (pi: ExtensionAPI) {
     "message_start", "message_update", "message_end",
     "tool_execution_start", "tool_execution_update", "tool_execution_end",
     "auto_compaction_start", "auto_compaction_end",
-    "auto_retry_start", "auto_retry_end",
     "model_select",
   ] as const;
 
@@ -2178,40 +2188,14 @@ export default function (pi: ExtensionAPI) {
       // Forward event to all connected browser clients
       // Wrap in { type: "event", event: ... } to match the existing frontend protocol
       broadcast({ type: "event", event: { type: eventType, ...event } });
-
-      // Pi reports provider failures on the finalized assistant message. Keep a
-      // stable browser-facing event so the web client cannot get stuck showing
-      // only the optimistic user message. agent_end is emitted once after any
-      // retry sequence, so the browser gets one final error instead of one per
-      // failed retry.
-      if (eventType === "agent_end") {
-        const failedMessage = Array.isArray(event.messages)
-          ? [...event.messages].reverse().find((message: any) =>
-              message?.role === "assistant"
-              && message.stopReason === "error"
-              && message.errorMessage
-            )
-          : undefined;
-        if (failedMessage) {
-          broadcast({
-            type: "event",
-            event: {
-              type: "agent_error",
-              error: failedMessage.errorMessage,
-              stopReason: failedMessage.stopReason,
-            },
-          });
-        }
-      }
-
-      if (eventType === "auto_retry_end" && event.success === false && event.finalError) {
-        broadcast({
-          type: "event",
-          event: { type: "agent_error", error: event.finalError, retryExhausted: true },
-        });
-      }
     });
   }
+
+  pi.on("agent_settled", async (event, ctx) => {
+    latestCtx = ctx;
+    broadcast({ type: "event", event });
+    releaseBrowserUILease();
+  });
 
   // Also capture context from session events
   // Auto-title: collect user messages and generate a title after a few turns
@@ -2244,10 +2228,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", async () => {
     if (!browserUILease?.inputObserved) return;
     browserUILease.active = true;
-  });
-
-  pi.on("agent_end", async () => {
-    releaseBrowserUILease();
   });
 
   pi.on("session_before_switch", async () => {
@@ -2528,13 +2508,37 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "prompt": {
+          const isStreaming = !!ctx && !ctx.isIdle();
+          if (!isStreaming) {
+            if (!ctx) {
+              sendTo(ws, error("prompt", "No context available"));
+              break;
+            }
+            if (!ctx.model) {
+              sendTo(ws, error("prompt", "No model selected"));
+              break;
+            }
+            const availability = getModelAvailability(ctx, ctx.model);
+            if (!availability.available) {
+              const response = error(
+                "prompt",
+                availability.reason || "Model authentication is not configured",
+              ) as any;
+              response.data = {
+                model: { provider: ctx.model.provider, id: ctx.model.id },
+                availability,
+              };
+              sendTo(ws, response);
+              break;
+            }
+          }
           const relayOnly = relayOnlyClients.has(ws);
           const owner = relayOnly
             ? undefined
             : acquireBrowserUILease(ws, String(command.message || ""));
           if (!relayOnly && !owner) throw new Error("Browser client is no longer connected");
           const sendPrompt = () => {
-            if (ctx && !ctx.isIdle()) {
+            if (isStreaming) {
               const behavior = command.streamingBehavior || "steer";
               if (behavior === "steer") {
                 pi.sendUserMessage(command.message, { deliverAs: "steer" });
@@ -2637,6 +2641,70 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
+        // ─── Packages and capabilities ───
+        case "list_pi_packages": {
+          if (!ctx) {
+            sendTo(ws, error("list_pi_packages", "No context available"));
+            break;
+          }
+          const runtime = createPiPackageRuntime(
+            DefaultPackageManager,
+            SettingsManager,
+            ctx,
+            PI_AGENT_DIR,
+          );
+          sendTo(ws, success(
+            "list_pi_packages",
+            await listPiPackages(runtime.packageManager, runtime.settingsManager),
+          ));
+          break;
+        }
+
+        case "install_pi_package":
+        case "remove_pi_package":
+        case "update_pi_package": {
+          if (!ctx) {
+            sendTo(ws, error(command.type, "No context available"));
+            break;
+          }
+          const result = await runPiPackageMutation(async () => {
+            const runtime = createPiPackageRuntime(
+              DefaultPackageManager,
+              SettingsManager,
+              ctx,
+              PI_AGENT_DIR,
+            );
+            runtime.packageManager.setProgressCallback((progress: any) => {
+              sendTo(ws, {
+                type: "event",
+                event: { type: "pi_package_progress", requestId: id, progress },
+              });
+            });
+            const action = command.type === "install_pi_package"
+              ? "install"
+              : command.type === "remove_pi_package"
+                ? "remove"
+                : "update";
+            try {
+              return await mutatePiPackage(
+                runtime.packageManager,
+                runtime.settingsManager,
+                action,
+                command,
+              );
+            } finally {
+              runtime.packageManager.setProgressCallback(undefined);
+            }
+          });
+          sendTo(ws, success(command.type, result));
+          break;
+        }
+
+        case "get_mcp_capability": {
+          sendTo(ws, success("get_mcp_capability", readMcpCapability(VERSION)));
+          break;
+        }
+
         // ─── Model ───
         case "get_available_models": {
           if (!ctx) {
@@ -2662,7 +2730,14 @@ export default function (pi: ExtensionAPI) {
             break;
           }
           const settings = createContextSettingsManager(SettingsManager, ctx, PI_AGENT_DIR);
-          sendTo(ws, success("get_enabled_models", readEnabledModelScope(ctx.modelRegistry, settings)));
+          sendTo(ws, success(
+            "get_enabled_models",
+            await readEnabledModelScope(
+              ctx.modelRegistry,
+              settings,
+              resolveModelScopeWithDiagnostics,
+            ),
+          ));
           break;
         }
 
@@ -2672,7 +2747,13 @@ export default function (pi: ExtensionAPI) {
             break;
           }
           const settings = createContextSettingsManager(SettingsManager, ctx, PI_AGENT_DIR);
-          const scope = await writeEnabledModelScope(ctx.modelRegistry, settings, command.modelRefs);
+          const scope = await writeEnabledModelScope(
+            ctx.modelRegistry,
+            settings,
+            command.mode,
+            command.modelRefs,
+            resolveModelScopeWithDiagnostics,
+          );
           sendTo(ws, success("set_enabled_models", scope));
           break;
         }
@@ -3058,35 +3139,97 @@ export default function (pi: ExtensionAPI) {
   function serveWebSettings(res: http.ServerResponse) {
     const settings = readAgentSettings();
     const agentsMd = fs.existsSync(PI_AGENTS_PATH) ? fs.readFileSync(PI_AGENTS_PATH, "utf8") : "";
-    res.writeHead(200, { "Content-Type": "application/json" });
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
     res.end(JSON.stringify({
-      settings,
+      settings: {
+        defaultProvider: typeof settings.defaultProvider === "string" ? settings.defaultProvider : null,
+        defaultModel: typeof settings.defaultModel === "string" ? settings.defaultModel : null,
+      },
       agentsMd,
-      settingsPath: PI_SETTINGS_PATH,
-      agentsPath: PI_AGENTS_PATH,
     }));
   }
 
   function saveWebSettings(req: http.IncomingMessage, res: http.ServerResponse) {
     let body = "";
-    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-    req.on("end", () => {
+    let bodyBytes = 0;
+    let bodyTooLarge = false;
+    req.on("data", (chunk: Buffer) => {
+      bodyBytes += chunk.length;
+      if (bodyBytes > 1024 * 1024) {
+        bodyTooLarge = true;
+        body = "";
+        return;
+      }
+      if (!bodyTooLarge) body += chunk.toString();
+    });
+    req.on("end", async () => {
       try {
+        if (bodyTooLarge) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Settings payload must not exceed 1 MiB" }));
+          return;
+        }
         const payload = JSON.parse(body);
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+          throw new Error("Settings payload must be an object");
+        }
+        const unsupportedPayloadKey = Object.keys(payload)
+          .find((key) => key !== "settings" && key !== "agentsMd");
+        if (unsupportedPayloadKey) throw new Error(`Unsupported settings field: ${unsupportedPayloadKey}`);
+        if (
+          Object.prototype.hasOwnProperty.call(payload, "agentsMd")
+          && typeof payload.agentsMd !== "string"
+        ) throw new Error("agentsMd must be a string");
+
         const settings = readAgentSettings();
         const incoming = payload.settings || {};
-        for (const key of ["defaultProvider", "defaultModel", "externalEditor", "mcpServers", "packages"]) {
-          if (!Object.prototype.hasOwnProperty.call(incoming, key)) continue;
-          if (incoming[key] === null || incoming[key] === undefined || incoming[key] === "") {
-            delete settings[key];
-          } else {
-            settings[key] = incoming[key];
-          }
+        if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) {
+          throw new Error("settings must be an object");
         }
-        writeAgentSettings(settings);
+        const unsupportedSetting = Object.keys(incoming)
+          .find((key) => key !== "defaultProvider" && key !== "defaultModel");
+        if (unsupportedSetting) throw new Error(`Unsupported setting: ${unsupportedSetting}`);
+
+        const hasProvider = Object.prototype.hasOwnProperty.call(incoming, "defaultProvider");
+        const hasModel = Object.prototype.hasOwnProperty.call(incoming, "defaultModel");
+        if (hasProvider !== hasModel) {
+          throw new Error("defaultProvider and defaultModel must be updated together");
+        }
+        if (hasProvider) {
+          const provider = incoming.defaultProvider;
+          const modelId = incoming.defaultModel;
+          if (provider === null && modelId === null) {
+            delete settings.defaultProvider;
+            delete settings.defaultModel;
+          } else {
+            if (
+              typeof provider !== "string" || !provider || provider.trim() !== provider
+              || typeof modelId !== "string" || !modelId || modelId.trim() !== modelId
+            ) {
+              throw new Error("defaultProvider and defaultModel must both be non-empty strings or null");
+            }
+            if (!latestCtx) throw new Error("No active Pi context is available to validate the default model");
+            const settingsManager = createContextSettingsManager(
+              SettingsManager,
+              latestCtx,
+              PI_AGENT_DIR,
+            );
+            await validateDefaultModelSelection(
+              latestCtx.modelRegistry,
+              settingsManager,
+              provider,
+              modelId,
+              resolveModelScopeWithDiagnostics,
+            );
+            settings.defaultProvider = provider;
+            settings.defaultModel = modelId;
+          }
+          writeAgentSettings(settings);
+        }
+
         if (Object.prototype.hasOwnProperty.call(payload, "agentsMd")) {
           fs.mkdirSync(PI_AGENT_DIR, { recursive: true });
-          fs.writeFileSync(PI_AGENTS_PATH, String(payload.agentsMd || ""));
+          fs.writeFileSync(PI_AGENTS_PATH, payload.agentsMd);
         }
         serveWebSettings(res);
       } catch (e: any) {

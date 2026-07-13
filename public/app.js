@@ -4,7 +4,11 @@
 
 import { WebSocketClient } from './websocket-client.js';
 import { StateManager } from './state.js';
-import { MessageRenderer } from './message-renderer.js';
+import {
+  historyAssistantErrorIndexes,
+  MessageRenderer,
+  nextAssistantError,
+} from './message-renderer.js';
 import { ToolCardRenderer } from './tool-card.js';
 import { DialogHandler } from './dialogs.js';
 import { ExtensionTuiBridge, renderAnsiText } from './extension-tui.js';
@@ -14,7 +18,12 @@ import { disableSessionControls, getComposerState } from './composer-state.js';
 import { filterSlashCommands } from './slash-command-filter.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
-import { createSettingsParity } from './settings-parity.js';
+import {
+  createSettingsParity,
+  modelsForDefaultScope,
+  reconcileDefaultModelDraft,
+} from './settings-parity.js';
+import { createPackageSettings } from './package-settings.js';
 import { matchShortcut, visibleShortcuts } from './keymap.js';
 import {
   actionTargetsDisplayedSession,
@@ -87,7 +96,7 @@ const extensionTuiBridge = new ExtensionTuiBridge(wsClient, extensionWidgetsAbov
 // State tracking
 let currentStreamingElement = null;
 let currentStreamingText = '';
-let agentErrorShown = false;
+let pendingAssistantError = null;
 let abortRequested = false;
 let statusResetTimer = null;
 let sessionTotalCost = 0;
@@ -109,6 +118,7 @@ let currentSessionEntries = [];
 let currentSession = null;
 let branchPreview = null;
 let sessionClosed = false;
+let packageSettings = null;
 let authCapability = {
   available: false,
   configured: false,
@@ -438,15 +448,13 @@ wsClient.addEventListener('mirrorSync', (e) => {
 
 function handleRPCEvent(event) {
   if (sessionClosed) return;
+  packageSettings?.handleEvent(event);
   switch (event.type) {
     case 'agent_start':
       handleAgentStart();
       break;
-    case 'agent_end':
-      handleAgentEnd(event);
-      break;
-    case 'agent_error':
-      handleAgentError(event);
+    case 'agent_settled':
+      handleAgentSettled();
       break;
     case 'message_start':
       handleMessageStart(event.message);
@@ -569,27 +577,27 @@ function handleCompactionEnd(event) {
 function handleAgentStart() {
   if (branchPreview) leaveBranchPreview();
   abortRequested = false;
-  agentErrorShown = false;
+  pendingAssistantError = null;
   state.setStreaming(true);
   showTypingIndicator(true);
   updateUI();
 }
 
-function handleAgentEnd(event) {
-  const failedMessage = Array.isArray(event?.messages)
-    ? [...event.messages].reverse().find((message) => (
-      message?.role === 'assistant'
-      && message.stopReason === 'error'
-      && message.errorMessage
-    ))
-    : null;
-  if (failedMessage && !abortRequested) {
-    handleAgentError({ error: failedMessage.errorMessage });
+function handleAgentSettled() {
+  const error = abortRequested ? null : pendingAssistantError;
+  if (error) {
+    const errorElement = currentStreamingElement;
+    if (errorElement) {
+      messageRenderer.finalizeStreamingMessage(errorElement, error.usage, currentStreamingThinking);
+      currentStreamingElement = null;
+      currentStreamingThinking = '';
+    }
+    messageRenderer.renderAssistantError(error, errorElement);
   }
 
-  clearStreamingUI({ flushQueue: false });
+  pendingAssistantError = null;
+  clearStreamingUI({ flushQueue: true, reason: error?.errorMessage || '' });
   abortRequested = false;
-  updateUI();
 
   // Notify via tab title if unfocused
   if (!hasFocus) {
@@ -599,28 +607,15 @@ function handleAgentEnd(event) {
   }
 }
 
-function handleAgentError(event) {
-  const errorMessage = getErrorMessage(event, 'Agent failed to respond');
-  if (abortRequested) {
-    clearStreamingUI({ flushQueue: false });
-    return;
-  }
-  if (!agentErrorShown) {
-    agentErrorShown = true;
-    renderAppError(errorMessage);
-  }
-  clearStreamingUI({ flushQueue: false, reason: errorMessage });
-}
-
 let currentStreamingThinking = '';
 
 function handleMessageStart(message) {
   if (message.role === 'user') {
-    agentErrorShown = false;
+    pendingAssistantError = null;
     scheduleSidebarRefresh();
   }
   if (message.role === 'assistant') {
-    if (agentErrorShown) return;
+    currentStreamingElement?.remove();
     currentStreamingText = '';
     currentStreamingThinking = '';
     currentStreamingElement = messageRenderer.renderAssistantMessage(
@@ -671,7 +666,20 @@ function handleMessageUpdate(event) {
 
 function handleMessageEnd(message) {
   if (message?.role === 'user') scheduleSidebarRefresh();
-  if (message?.role === 'assistant' && message.stopReason === 'error') return;
+  pendingAssistantError = nextAssistantError(pendingAssistantError, message);
+  if (message?.role === 'assistant' && message.stopReason === 'error') {
+    currentStreamingText = getMessageText(message);
+    currentStreamingThinking = Array.isArray(message.content)
+      ? message.content.filter((block) => block.type === 'thinking').map((block) => block.thinking).join('\n')
+      : '';
+    if (currentStreamingElement) {
+      messageRenderer.updateStreamingMessage(currentStreamingElement, currentStreamingText);
+      if (currentStreamingThinking) {
+        messageRenderer.updateStreamingThinking(currentStreamingElement, currentStreamingThinking);
+      }
+    }
+    return;
+  }
   if (currentStreamingElement) {
     // Pass usage info for cost display
     const usage = message?.usage || null;
@@ -1109,7 +1117,7 @@ function sendMessage() {
   renderAttachmentPreviews();
 
   if (isNewSessionMode) {
-    agentErrorShown = false;
+    pendingAssistantError = null;
     exitNewSessionMode();
     lastSentMessage = message;
     messageRenderer.renderUserMessage({ content: message, images: cmd.images });
@@ -1128,7 +1136,7 @@ function sendMessage() {
   }
 
   lastSentMessage = message;
-  agentErrorShown = false;
+  pendingAssistantError = null;
   messageRenderer.renderUserMessage({ content: message, images: cmd.images });
   void requestRpc(cmd);
 }
@@ -1167,7 +1175,7 @@ function escapeHtml(text) {
 function flushQueue() {
   if (messageQueue.length > 0 && !state.isStreaming) {
     const cmd = messageQueue.shift();
-    agentErrorShown = false;
+    pendingAssistantError = null;
     messageRenderer.renderUserMessage({ content: cmd.message, images: cmd.images });
     renderQueuedMessages();
     void requestRpc(cmd);
@@ -2514,6 +2522,7 @@ async function switchSession(sessionFile, session = null, project = null) {
     currentStreamingElement = null;
     currentStreamingThinking = '';
     currentStreamingText = '';
+    pendingAssistantError = null;
     
     state.reset();
     currentSessionEntries = [];
@@ -2909,8 +2918,9 @@ function renderSessionHistoryOrWelcome(entries, pendingUserMessage = null) {
 function renderSessionHistory(entries, { trackUsage = true, entryActions = true } = {}) {
   console.log(`[History] Rendering ${entries.length} entries`);
   let userCount = 0, assistantCount = 0, toolCardCount = 0, toolResultCount = 0, renderedCount = 0;
+  const visibleAssistantErrors = historyAssistantErrorIndexes(entries);
 
-  for (const entry of entries) {
+  for (const [entryIndex, entry] of entries.entries()) {
     if (entry.type === 'custom_message' && entry.display === true) {
       if (messageRenderer.renderCustomMessage(entry, true)) renderedCount++;
       continue;
@@ -2959,9 +2969,13 @@ function renderSessionHistory(entries, { trackUsage = true, entryActions = true 
 
       const text = textBlocks.map((b) => b.text).join('\n');
 
-      if (text || thinkingBlocks.length > 0) {
+      const isAssistantError = msg.stopReason === 'error'
+        && typeof msg.errorMessage === 'string'
+        && msg.errorMessage.length > 0;
+      const hasError = isAssistantError && visibleAssistantErrors.has(entryIndex);
+      if (text || thinkingBlocks.length > 0 || hasError) {
         assistantCount++;
-        messageRenderer.renderAssistantMessage(
+        const assistantElement = messageRenderer.renderAssistantMessage(
           {
             content: contentBlocks.length > 0 ? contentBlocks : text,
             usage: msg.usage,
@@ -2969,9 +2983,12 @@ function renderSessionHistory(entries, { trackUsage = true, entryActions = true 
           false,
           true
         );
+        if (hasError) messageRenderer.renderAssistantError(msg, assistantElement);
         renderedCount++;
+      }
 
-        // Track cost and tokens from history
+      if (text || thinkingBlocks.length > 0 || isAssistantError) {
+        // Keep retry costs even when an empty superseded error has no visible message.
         if (trackUsage && msg.usage?.cost?.total) {
           sessionTotalCost += msg.usage.cost.total;
         }
@@ -3167,21 +3184,36 @@ const settingsClose = document.getElementById('settings-close');
 const themeGrid = document.getElementById('theme-grid');
 const toggleShowThinking = document.getElementById('toggle-show-thinking');
 const settingsTabs = document.getElementById('settings-tabs');
+const settingsTabButtons = Array.from(settingsTabs.querySelectorAll('[role="tab"]'));
 const settingsTabPanels = Array.from(document.querySelectorAll('.settings-tab-panel'));
-const settingsDefaultProvider = document.getElementById('settings-default-provider');
+const settingsModelsPanel = document.getElementById('settings-panel-models');
+const settingsInstructionsPanel = document.getElementById('settings-panel-instructions');
 const settingsDefaultModel = document.getElementById('settings-default-model');
-const settingsExternalEditor = document.getElementById('settings-external-editor');
 const settingsAgentsMd = document.getElementById('settings-agents-md');
-const settingsMcpJson = document.getElementById('settings-mcp-json');
-const settingsPackagesJson = document.getElementById('settings-packages-json');
 const settingsReload = document.getElementById('settings-reload');
 const settingsSave = document.getElementById('settings-save');
+let webSettings = null;
+let defaultModelScope = null;
+let defaultModelDraftRef = '';
+let defaultModelDirty = false;
+let webSettingsLoadId = 0;
+let settingsReady = false;
+let settingsLoading = false;
+let settingsLoadPromise = null;
+let pendingModelScopeLoad = null;
 const settingsParity = createSettingsParity({
   request: (command) => wsClient.request(command),
   onModelsSaved: fetchModelInfo,
+  onModelScopeChanged: (scope) => {
+    defaultModelScope = scope;
+    renderDefaultModelOptions();
+    if (pendingModelScopeLoad?.loadId === webSettingsLoadId) {
+      pendingModelScopeLoad.resolve();
+      pendingModelScopeLoad = null;
+    }
+  },
 });
-
-let webSettings = null;
+packageSettings = createPackageSettings({ request: (command) => wsClient.request(command) });
 
 function updateAuthCapability(next) {
   authCapability = { ...authCapability, ...next };
@@ -3216,40 +3248,181 @@ function buildThemeGrid() {
   }
 }
 
-settingsTabs.addEventListener('click', (event) => {
-  const tab = event.target instanceof Element ? event.target.closest('.settings-tab') : null;
-  if (!tab) return;
+function activateSettingsTab(tab, focus = false) {
   const tabId = tab.dataset.tab;
-  settingsTabs.querySelectorAll('.settings-tab').forEach((item) => {
+  settingsTabButtons.forEach((item) => {
+    const active = item === tab;
     item.classList.toggle('active', item === tab);
+    item.setAttribute('aria-selected', String(active));
+    item.tabIndex = active ? 0 : -1;
   });
   settingsTabPanels.forEach((panel) => {
-    panel.classList.toggle('active', panel.dataset.panel === tabId);
+    const active = panel.dataset.panel === tabId;
+    panel.classList.toggle('active', active);
+    panel.hidden = !active;
   });
-});
-
-async function loadWebSettings() {
-  const response = await fetch('/api/web-settings');
-  if (!response.ok) throw new Error('Failed to load settings');
-  webSettings = await response.json();
-  const settings = webSettings.settings || {};
-  settingsDefaultProvider.value = settings.defaultProvider || '';
-  settingsDefaultModel.value = settings.defaultModel || '';
-  settingsExternalEditor.value = settings.externalEditor || '';
-  settingsAgentsMd.value = webSettings.agentsMd || '';
-  settingsMcpJson.value = JSON.stringify(settings.mcpServers || {}, null, 2);
-  settingsPackagesJson.value = JSON.stringify(settings.packages || [], null, 2);
+  if (focus) tab.focus();
 }
 
-async function saveWebSettings() {
-  const settings = {
-    defaultProvider: settingsDefaultProvider.value.trim() || null,
-    defaultModel: settingsDefaultModel.value.trim() || null,
-    externalEditor: settingsExternalEditor.value.trim() || null,
-    mcpServers: JSON.parse(settingsMcpJson.value || '{}'),
-    packages: JSON.parse(settingsPackagesJson.value || '[]'),
-  };
+settingsTabs.addEventListener('click', (event) => {
+  const tab = event.target instanceof Element ? event.target.closest('[role="tab"]') : null;
+  if (tab) activateSettingsTab(tab);
+});
 
+settingsTabs.addEventListener('keydown', (event) => {
+  const current = event.target instanceof Element ? event.target.closest('[role="tab"]') : null;
+  if (!current) return;
+  const index = settingsTabButtons.indexOf(current);
+  let next = null;
+  if (event.key === 'ArrowRight') next = settingsTabButtons[(index + 1) % settingsTabButtons.length];
+  else if (event.key === 'ArrowLeft') next = settingsTabButtons[(index - 1 + settingsTabButtons.length) % settingsTabButtons.length];
+  else if (event.key === 'Home') next = settingsTabButtons[0];
+  else if (event.key === 'End') next = settingsTabButtons.at(-1);
+  if (!next) return;
+  event.preventDefault();
+  event.stopPropagation();
+  activateSettingsTab(next, true);
+});
+
+function updatePersistentSettingsControls() {
+  settingsSave.disabled = !settingsReady;
+  settingsReload.disabled = settingsLoading;
+  settingsAgentsMd.disabled = !settingsReady;
+  settingsModelsPanel.inert = !settingsReady;
+  settingsInstructionsPanel.inert = !settingsReady;
+  settingsDefaultModel.disabled = !settingsReady || !webSettings || !defaultModelScope;
+}
+
+async function loadWebSettings(loadId) {
+  const response = await fetch('/api/web-settings');
+  if (!response.ok) throw new Error('Failed to load settings');
+  const data = await response.json();
+  if (loadId !== webSettingsLoadId) return false;
+  webSettings = data;
+  defaultModelDraftRef = configuredDefaultModelRef();
+  defaultModelDirty = false;
+  settingsAgentsMd.value = webSettings.agentsMd || '';
+  renderDefaultModelOptions();
+  return true;
+}
+
+function loadSettingsForEditing() {
+  if (settingsLoadPromise) return settingsLoadPromise;
+
+  const loadId = ++webSettingsLoadId;
+  settingsReady = false;
+  settingsLoading = true;
+  defaultModelScope = null;
+  updatePersistentSettingsControls();
+  renderDefaultModelOptions();
+
+  let resolveModelScope;
+  let rejectModelScope;
+  const modelScopeLoaded = new Promise((resolve, reject) => {
+    resolveModelScope = resolve;
+    rejectModelScope = reject;
+  });
+  pendingModelScopeLoad = { loadId, resolve: resolveModelScope };
+
+  const parityLoad = settingsParity.load();
+  void parityLoad.then(() => {
+    if (pendingModelScopeLoad?.loadId === loadId) {
+      pendingModelScopeLoad = null;
+      rejectModelScope(new Error('Failed to load model scope'));
+    }
+  }, rejectModelScope);
+  void packageSettings.load();
+
+  const load = Promise.all([loadWebSettings(loadId), modelScopeLoaded])
+    .then(([webLoaded]) => {
+      if (!webLoaded || loadId !== webSettingsLoadId) return;
+      settingsReady = true;
+      settingsLoading = false;
+      updatePersistentSettingsControls();
+      renderDefaultModelOptions();
+    })
+    .catch((error) => {
+      if (loadId === webSettingsLoadId) {
+        if (pendingModelScopeLoad?.loadId === loadId) pendingModelScopeLoad = null;
+        settingsReady = false;
+        settingsLoading = false;
+        updatePersistentSettingsControls();
+      }
+      throw error;
+    })
+    .finally(() => {
+      if (settingsLoadPromise === load) settingsLoadPromise = null;
+    });
+  settingsLoadPromise = load;
+  return load;
+}
+
+function configuredDefaultModelRef() {
+  const settings = webSettings?.settings || {};
+  return settings.defaultProvider && settings.defaultModel
+    ? `${settings.defaultProvider}/${settings.defaultModel}`
+    : '';
+}
+
+function renderDefaultModelOptions() {
+  const configuredRef = configuredDefaultModelRef();
+  const draft = reconcileDefaultModelDraft({
+    configuredRef,
+    draftRef: defaultModelDraftRef,
+    dirty: defaultModelDirty,
+    scope: defaultModelScope,
+  });
+  defaultModelDraftRef = draft.draftRef;
+  defaultModelDirty = draft.dirty;
+  const draftRef = defaultModelDraftRef;
+  const candidates = modelsForDefaultScope(defaultModelScope || undefined);
+  settingsDefaultModel.replaceChildren();
+
+  const automatic = document.createElement('option');
+  automatic.value = '';
+  automatic.textContent = 'Automatic';
+  settingsDefaultModel.appendChild(automatic);
+
+  for (const model of candidates) {
+    const option = document.createElement('option');
+    option.value = model.ref;
+    option.textContent = `${model.name || model.id} — ${model.providerName || model.provider}`;
+    settingsDefaultModel.appendChild(option);
+  }
+
+  if (draftRef && !candidates.some((model) => model.ref === draftRef)) {
+    const unavailable = document.createElement('option');
+    unavailable.value = draftRef;
+    const authenticated = defaultModelScope?.models.some((model) => model.ref === draftRef);
+    unavailable.textContent = `${draftRef} (${authenticated ? 'out of scope' : 'unavailable'})`;
+    unavailable.disabled = true;
+    settingsDefaultModel.appendChild(unavailable);
+  }
+  settingsDefaultModel.value = draftRef;
+  settingsDefaultModel.disabled = !settingsReady || !webSettings || !defaultModelScope;
+}
+
+settingsDefaultModel.addEventListener('change', () => {
+  defaultModelDraftRef = settingsDefaultModel.value;
+  defaultModelDirty = defaultModelDraftRef !== configuredDefaultModelRef();
+});
+
+async function saveWebSettings() {
+  if (!settingsReady || settingsLoading || !webSettings || !defaultModelScope) {
+    throw new Error('Settings must finish loading before they can be saved');
+  }
+  const settings = {};
+  const configuredRef = configuredDefaultModelRef();
+  const selectedRef = defaultModelDraftRef;
+  if (selectedRef !== configuredRef) {
+    const selected = modelsForDefaultScope(defaultModelScope || undefined)
+      .find((model) => model.ref === selectedRef);
+    if (selectedRef && !selected) throw new Error(`Default model is not available: ${selectedRef}`);
+    settings.defaultProvider = selected?.provider || null;
+    settings.defaultModel = selected?.id || null;
+  }
+
+  webSettingsLoadId++;
   const response = await mutationFetch('/api/web-settings', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -3261,32 +3434,44 @@ async function saveWebSettings() {
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || 'Failed to save settings');
   webSettings = data;
+  defaultModelDraftRef = configuredDefaultModelRef();
+  defaultModelDirty = false;
+  renderDefaultModelOptions();
 }
 
 settingsReload.addEventListener('click', () => {
-  Promise.all([loadWebSettings(), settingsParity.load()]).catch((error) => {
+  loadSettingsForEditing().catch((error) => {
     renderAppError(error);
   });
 });
 
 settingsSave.addEventListener('click', () => {
   (async () => {
-    await saveWebSettings();
+    if (!settingsReady || settingsLoading) {
+      throw new Error('Settings must finish loading before they can be saved');
+    }
+    settingsSave.disabled = true;
     await settingsParity.save();
+    await saveWebSettings();
     setStatusMessage('Settings saved', 2000);
-  })().catch((error) => {
-    renderAppError(error);
-  });
+  })()
+    .catch((error) => {
+      renderAppError(error);
+    })
+    .finally(() => {
+      settingsSave.disabled = !settingsReady;
+    });
 });
 
 async function openSettings() {
   buildThemeGrid();
   settingsPanel.classList.remove('hidden');
   settingsOverlay.classList.remove('hidden');
-  loadWebSettings().catch((error) => {
+  const activeTab = settingsTabButtons.find((tab) => tab.getAttribute('aria-selected') === 'true');
+  (activeTab || settingsClose).focus();
+  loadSettingsForEditing().catch((error) => {
     renderAppError(error);
   });
-  void settingsParity.load();
   fetchGitState();
 
   // Fetch auth state
@@ -3307,13 +3492,32 @@ async function openSettings() {
 }
 
 function closeSettings() {
+  if (settingsPanel.classList.contains('hidden')) return;
   settingsPanel.classList.add('hidden');
   settingsOverlay.classList.add('hidden');
+  if (!sessionClosed) settingsBtn.focus();
 }
 
 settingsBtn.addEventListener('click', openSettings);
 settingsClose.addEventListener('click', closeSettings);
 settingsOverlay.addEventListener('click', closeSettings);
+
+settingsPanel.addEventListener('keydown', (event) => {
+  if (event.key !== 'Tab') return;
+  const focusable = Array.from(settingsPanel.querySelectorAll(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+  )).filter((element) => !element.closest('[hidden], [inert]') && element.getClientRects().length > 0);
+  if (focusable.length === 0) return;
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (event.shiftKey && (document.activeElement === first || !settingsPanel.contains(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+});
 
 // Show thinking toggle (local pref)
 const showThinking = localStorage.getItem('tau-show-thinking') !== 'false';

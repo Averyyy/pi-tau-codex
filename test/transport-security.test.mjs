@@ -60,7 +60,12 @@ test('WebSocket policy uses an explicit read allowlist', () => {
   assert.equal(isWebSocketMutation('mirror_sync_request'), false);
   assert.equal(isWebSocketMutation('get_provider_accounts'), false);
   assert.equal(isWebSocketMutation('get_enabled_models'), false);
+  assert.equal(isWebSocketMutation('get_mcp_capability'), false);
+  assert.equal(isWebSocketMutation('list_pi_packages'), false);
   assert.equal(isWebSocketMutation('get_about'), false);
+  assert.equal(isWebSocketMutation('install_pi_package'), true);
+  assert.equal(isWebSocketMutation('remove_pi_package'), true);
+  assert.equal(isWebSocketMutation('update_pi_package'), true);
   assert.equal(isWebSocketMutation('set_enabled_models'), true);
   assert.equal(isWebSocketMutation('extension_ui_response'), true);
   assert.equal(isWebSocketMutation('extension_tui_resize'), false);

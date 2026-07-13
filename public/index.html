@@ -229,29 +229,18 @@
       <button type="button" class="settings-close" id="settings-close" aria-label="Close settings" title="Close settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
     </div>
     <div class="settings-body">
-      <div class="settings-tabs" id="settings-tabs">
-        <button type="button" class="settings-tab active" data-tab="general">General</button>
-        <button type="button" class="settings-tab" data-tab="interface">Interface</button>
-        <button type="button" class="settings-tab" data-tab="providers">Providers</button>
-        <button type="button" class="settings-tab" data-tab="models">Models</button>
-        <button type="button" class="settings-tab" data-tab="instructions">Custom Instructions</button>
-        <button type="button" class="settings-tab" data-tab="mcp">MCP</button>
-        <button type="button" class="settings-tab" data-tab="extensions">Extensions</button>
-        <button type="button" class="settings-tab" data-tab="about">About</button>
+      <div class="settings-tabs" id="settings-tabs" role="tablist" aria-label="Settings sections">
+        <button type="button" class="settings-tab active" id="settings-tab-general" data-tab="general" role="tab" aria-controls="settings-panel-general" aria-selected="true" tabindex="0">General</button>
+        <button type="button" class="settings-tab" id="settings-tab-interface" data-tab="interface" role="tab" aria-controls="settings-panel-interface" aria-selected="false" tabindex="-1">Interface</button>
+        <button type="button" class="settings-tab" id="settings-tab-providers" data-tab="providers" role="tab" aria-controls="settings-panel-providers" aria-selected="false" tabindex="-1">Providers</button>
+        <button type="button" class="settings-tab" id="settings-tab-models" data-tab="models" role="tab" aria-controls="settings-panel-models" aria-selected="false" tabindex="-1">Models</button>
+        <button type="button" class="settings-tab" id="settings-tab-instructions" data-tab="instructions" role="tab" aria-controls="settings-panel-instructions" aria-selected="false" tabindex="-1">Custom Instructions</button>
+        <button type="button" class="settings-tab" id="settings-tab-mcp" data-tab="mcp" role="tab" aria-controls="settings-panel-mcp" aria-selected="false" tabindex="-1">MCP</button>
+        <button type="button" class="settings-tab" id="settings-tab-extensions" data-tab="extensions" role="tab" aria-controls="settings-panel-extensions" aria-selected="false" tabindex="-1">Packages &amp; resources</button>
+        <button type="button" class="settings-tab" id="settings-tab-about" data-tab="about" role="tab" aria-controls="settings-panel-about" aria-selected="false" tabindex="-1">About</button>
       </div>
       <div class="settings-content">
-        <div class="settings-tab-panel active" data-panel="general">
-          <div class="settings-section">
-            <div class="settings-section-title">Agent</div>
-            <label class="settings-field">
-              <span class="settings-label">Default provider</span>
-              <input class="settings-input wide" id="settings-default-provider" type="text">
-            </label>
-            <label class="settings-field">
-              <span class="settings-label">Default model</span>
-              <input class="settings-input wide" id="settings-default-model" type="text">
-            </label>
-          </div>
+        <div class="settings-tab-panel active" id="settings-panel-general" data-panel="general" role="tabpanel" aria-labelledby="settings-tab-general">
           <div class="settings-section">
             <div class="settings-section-title">Git</div>
             <div class="settings-row">
@@ -259,8 +248,15 @@
               <span class="settings-value-btn" id="settings-current-branch">none</span>
             </div>
           </div>
+          <div class="settings-section" id="settings-auth-section" style="display:none">
+            <div class="settings-section-title">Authentication</div>
+            <div class="settings-row">
+              <span class="settings-label">Require login</span>
+              <button type="button" class="settings-toggle" id="toggle-auth" aria-label="Require login"></button>
+            </div>
+          </div>
         </div>
-        <div class="settings-tab-panel" data-panel="interface">
+        <div class="settings-tab-panel" id="settings-panel-interface" data-panel="interface" role="tabpanel" aria-labelledby="settings-tab-interface" hidden>
           <div class="settings-section">
             <div class="settings-section-title">Appearance</div>
             <div class="theme-grid" id="theme-grid"></div>
@@ -271,63 +267,85 @@
               <span class="settings-label">Show thinking</span>
               <button type="button" class="settings-toggle on" id="toggle-show-thinking" aria-label="Show thinking"></button>
             </div>
-            <label class="settings-field">
-              <span class="settings-label">External editor</span>
-              <input class="settings-input wide" id="settings-external-editor" type="text">
-            </label>
           </div>
         </div>
-        <div class="settings-tab-panel" data-panel="providers">
+        <div class="settings-tab-panel" id="settings-panel-providers" data-panel="providers" role="tabpanel" aria-labelledby="settings-tab-providers" hidden>
           <div class="settings-section fill">
             <div class="settings-section-title">Provider accounts</div>
             <div class="settings-panel-status" id="settings-providers-status" role="status">Loading providers...</div>
             <div class="settings-data-list" id="settings-providers-list" aria-live="polite"></div>
           </div>
         </div>
-        <div class="settings-tab-panel" data-panel="models">
+        <div class="settings-tab-panel" id="settings-panel-models" data-panel="models" role="tabpanel" aria-labelledby="settings-tab-models" inert hidden>
+          <div class="settings-section">
+            <div class="settings-section-title">Default</div>
+            <label class="settings-field">
+              <span class="settings-label">Default model</span>
+              <select class="settings-input wide" id="settings-default-model" aria-label="Default model" disabled>
+                <option value="">Automatic</option>
+              </select>
+            </label>
+          </div>
           <div class="settings-section fill">
-            <div class="settings-section-title">Exact model selections</div>
-            <div class="settings-list-toolbar">
+            <div class="settings-section-title">Model availability</div>
+            <label class="settings-field">
+              <span class="settings-label">Mode</span>
+              <select class="settings-input wide" id="settings-model-scope-mode">
+                <option value="all">All available models</option>
+                <option value="selected">Selected models</option>
+              </select>
+            </label>
+            <div class="settings-list-toolbar" id="settings-model-selection-controls">
               <input class="settings-input settings-search" id="settings-model-search" type="search" placeholder="Search models" aria-label="Search models">
-              <button type="button" class="settings-secondary" id="settings-model-select-all">Select all</button>
+              <button type="button" class="settings-secondary" id="settings-model-select-all">Select visible</button>
             </div>
             <div class="settings-panel-status" id="settings-models-status" role="status">Loading models...</div>
             <div class="settings-panel-status warning" id="settings-model-project-warning" role="status" hidden></div>
             <div class="settings-data-list settings-model-list" id="settings-models-list" aria-live="polite"></div>
             <details class="settings-patterns" id="settings-model-patterns" hidden>
-              <summary>Preserved Pi patterns</summary>
+              <summary>Preserved Pi entries</summary>
               <pre id="settings-model-pattern-list"></pre>
-              <p class="settings-hint">Tau leaves these patterns unchanged for Pi to resolve on the next session or reload.</p>
+              <p class="settings-hint">Entries with no currently available match remain unchanged for Pi to resolve.</p>
             </details>
-            <p class="settings-hint">Exact selections are saved immediately. Preserved patterns remain unchanged for Pi to resolve on the next session or reload. Empty exact selections require at least one preserved pattern.</p>
+            <p class="settings-hint">All available models follows provider authentication automatically. Saving Selected models stores current matches as exact model entries and preserves only entries with no available match.</p>
           </div>
         </div>
-        <div class="settings-tab-panel" data-panel="instructions">
+        <div class="settings-tab-panel" id="settings-panel-instructions" data-panel="instructions" role="tabpanel" aria-labelledby="settings-tab-instructions" inert hidden>
           <div class="settings-section fill">
             <div class="settings-section-title">Global AGENTS.md</div>
-            <textarea class="settings-textarea" id="settings-agents-md" spellcheck="false"></textarea>
+            <textarea class="settings-textarea" id="settings-agents-md" spellcheck="false" disabled></textarea>
           </div>
         </div>
-        <div class="settings-tab-panel" data-panel="mcp">
+        <div class="settings-tab-panel" id="settings-panel-mcp" data-panel="mcp" role="tabpanel" aria-labelledby="settings-tab-mcp" hidden>
           <div class="settings-section fill">
-            <div class="settings-section-title">MCP servers JSON</div>
-            <textarea class="settings-textarea" id="settings-mcp-json" spellcheck="false"></textarea>
+            <div class="settings-section-title">MCP</div>
+            <div class="settings-panel-status" id="settings-mcp-status" role="status">Checking MCP capability...</div>
+            <div class="settings-list-empty" id="settings-mcp-empty" aria-live="polite"></div>
           </div>
         </div>
-        <div class="settings-tab-panel" data-panel="extensions">
+        <div class="settings-tab-panel" id="settings-panel-extensions" data-panel="extensions" role="tabpanel" aria-labelledby="settings-tab-extensions" hidden>
+          <div class="settings-section">
+            <div class="settings-section-title">Install package</div>
+            <form class="settings-package-form" id="settings-package-form">
+              <input class="settings-input" id="settings-package-source" type="text" placeholder="npm:package or git:host/repo" aria-label="Package source" required>
+              <select class="settings-input" id="settings-package-scope" aria-label="Package scope">
+                <option value="global">Global</option>
+                <option value="project">Project</option>
+              </select>
+              <button type="submit" class="settings-primary" id="settings-package-install">Install</button>
+            </form>
+          </div>
           <div class="settings-section fill">
-            <div class="settings-section-title">Packages</div>
-            <textarea class="settings-textarea" id="settings-packages-json" spellcheck="false"></textarea>
+            <div class="settings-section-title">Configured packages</div>
+            <div class="settings-panel-status" id="settings-packages-status" role="status">Loading packages...</div>
+            <div class="settings-data-list" id="settings-packages-list" aria-live="polite"></div>
           </div>
-          <div class="settings-section" id="settings-auth-section" style="display:none">
-            <div class="settings-section-title">Authentication</div>
-            <div class="settings-row">
-              <span class="settings-label">Require login</span>
-              <button type="button" class="settings-toggle" id="toggle-auth" aria-label="Require login"></button>
-            </div>
+          <div class="settings-section">
+            <div class="settings-section-title">Resolved resources</div>
+            <div class="settings-resource-summary" id="settings-resource-summary" aria-live="polite"></div>
           </div>
         </div>
-        <div class="settings-tab-panel" data-panel="about">
+        <div class="settings-tab-panel" id="settings-panel-about" data-panel="about" role="tabpanel" aria-labelledby="settings-tab-about" hidden>
           <div class="settings-section">
             <div class="settings-section-title">Versions</div>
             <div class="settings-row">
@@ -347,7 +365,7 @@
         </div>
         <div class="settings-footer">
           <button type="button" class="settings-secondary" id="settings-reload">Revert changes</button>
-          <button type="button" class="settings-primary" id="settings-save">Save</button>
+          <button type="button" class="settings-primary" id="settings-save" disabled>Save</button>
         </div>
       </div>
     </div>

@@ -1866,6 +1866,17 @@ button.token-usage {
   min-height: 44px;
 }
 
+.settings-package-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 130px auto;
+  gap: 8px;
+}
+
+.settings-package-form .settings-input {
+  width: 100%;
+  min-height: 44px;
+}
+
 .settings-data-list {
   min-height: 180px;
   flex: 1 1 320px;
@@ -1911,6 +1922,11 @@ button.token-usage {
   white-space: nowrap;
 }
 
+.settings-package-row .settings-data-main span {
+  overflow: visible;
+  white-space: normal;
+}
+
 .settings-provider-controls {
   display: flex;
   align-items: center;
@@ -1951,6 +1967,24 @@ button.token-usage {
   color: var(--text-dim);
   font-size: 13px;
   text-align: center;
+}
+
+.settings-resource-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-block: 1px solid var(--border);
+}
+
+.settings-resource-summary span {
+  padding: 14px 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: center;
+}
+
+.settings-resource-summary strong {
+  color: var(--text-primary);
+  font: 600 13px/1.4 'SF Mono', 'Menlo', 'Monaco', monospace;
 }
 
 .settings-patterns {
@@ -2063,6 +2097,14 @@ button.token-usage {
   .settings-section:not(.fill) { padding: 8px 14px; }
 
   .settings-list-toolbar { grid-template-columns: 1fr; }
+
+  .settings-package-form,
+  .settings-resource-summary { grid-template-columns: 1fr; }
+
+  .settings-resource-summary span {
+    padding: 10px 4px;
+    text-align: left;
+  }
 
   .settings-provider-row {
     align-items: stretch;
@@ -3485,6 +3527,7 @@ body.new-session-mode .input-area {
 .btn-primary:disabled,
 .dialog-actions button:disabled { opacity: 0.35; cursor: not-allowed; }
 
+[hidden],
 .hidden { display: none !important; }
 
 /* ═══════════════════════════════════════════════════════

@@ -12,17 +12,35 @@ export function providerActionAccessibleName(label, provider) {
   return `${label} ${provider.name} (${provider.id})`;
 }
 
-export function modelRefsForSave(selectedModels, preservedPatternCount) {
+export function modelRefsForSave(mode, selectedModels, preservedPatternCount) {
+  if (mode === 'all') return [];
   if (selectedModels.size === 0 && preservedPatternCount === 0) {
     throw new Error('Select at least one model when no preserved Pi model patterns remain');
   }
   return [...selectedModels];
 }
 
-export function createSettingsParity({ request, onModelsSaved }) {
+export function modelsForDefaultScope({ models = [], mode = 'all', selectedRefs = [] } = {}) {
+  if (mode !== 'selected') return models;
+  const selected = new Set(selectedRefs);
+  return models.filter((model) => selected.has(model.ref));
+}
+
+export function reconcileDefaultModelDraft({ configuredRef, draftRef, dirty, scope }) {
+  const currentRef = dirty ? draftRef : configuredRef;
+  const candidates = modelsForDefaultScope(scope || undefined);
+  if (scope?.dirty && currentRef && !candidates.some((model) => model.ref === currentRef)) {
+    return { draftRef: '', dirty: configuredRef !== '' };
+  }
+  return { draftRef: currentRef, dirty };
+}
+
+export function createSettingsParity({ request, onModelsSaved, onModelScopeChanged = () => {} }) {
   const providersStatus = document.getElementById('settings-providers-status');
   const providersList = document.getElementById('settings-providers-list');
   const modelSearch = document.getElementById('settings-model-search');
+  const modelModeSelect = document.getElementById('settings-model-scope-mode');
+  const modelSelectionControls = document.getElementById('settings-model-selection-controls');
   const modelSelectAll = document.getElementById('settings-model-select-all');
   const modelsStatus = document.getElementById('settings-models-status');
   const modelProjectWarning = document.getElementById('settings-model-project-warning');
@@ -35,10 +53,20 @@ export function createSettingsParity({ request, onModelsSaved }) {
   const changelog = document.getElementById('settings-changelog');
 
   let models = [];
+  let modelMode = 'all';
   let selectedModels = new Set();
   let modelsDirty = false;
   let modelsReadOnly = false;
   let preservedPatternCount = 0;
+
+  function notifyModelScope() {
+    onModelScopeChanged({
+      models,
+      mode: modelMode,
+      selectedRefs: [...selectedModels],
+      dirty: modelsDirty,
+    });
+  }
 
   function providerAction(label, provider, args, disabled) {
     const button = document.createElement('button');
@@ -52,7 +80,7 @@ export function createSettingsParity({ request, onModelsSaved }) {
       setPanelStatus(providersStatus, `Running ${label.toLowerCase()} for ${provider.name}...`);
       try {
         await request({ type: 'run_command', name: args.command, args: args.value });
-        await loadProviders();
+        await Promise.all([loadProviders(), loadModels()]);
       } catch (error) {
         setPanelStatus(providersStatus, messageOf(error), true);
       } finally {
@@ -89,11 +117,13 @@ export function createSettingsParity({ request, onModelsSaved }) {
       status.className = `settings-provider-status ${provider.status}`;
       status.textContent = provider.status === 'signed_in'
         ? `Signed in${provider.label || provider.source ? ` · ${provider.label || provider.source}` : ''}`
+        : provider.status === 'available'
+          ? `Available${provider.label || provider.source ? ` · ${provider.label || provider.source}` : ''}`
         : provider.status === 'error' ? 'Error' : 'Not configured';
       controls.appendChild(status);
 
       const disabled = provider.status === 'error';
-      if (provider.status !== 'signed_in' && provider.supportsOAuth) {
+      if (provider.status === 'not_configured' && provider.supportsOAuth) {
         controls.appendChild(providerAction(
           'Sign in with OAuth',
           provider,
@@ -101,7 +131,7 @@ export function createSettingsParity({ request, onModelsSaved }) {
           disabled,
         ));
       }
-      if (provider.status !== 'signed_in' && provider.supportsApiKey) {
+      if (provider.status === 'not_configured' && provider.supportsApiKey) {
         controls.appendChild(providerAction(
           'Sign in with API key',
           provider,
@@ -133,18 +163,23 @@ export function createSettingsParity({ request, onModelsSaved }) {
   }
 
   function updateModelStatus() {
-    const count = selectedModels.size;
     setPanelStatus(
       modelsStatus,
-      `${count} of ${models.length} exact selections${modelsDirty ? ' · Unsaved' : ''}`,
+      `${modelMode === 'all'
+        ? `All ${models.length} available models`
+        : `${selectedModels.size} of ${models.length} available models selected`}${modelsDirty ? ' · Unsaved' : ''}`,
     );
+  }
+
+  function visibleModels() {
+    const query = modelSearch.value.trim().toLowerCase();
+    return models.filter((model) =>
+      `${model.name} ${model.ref} ${model.providerName}`.toLowerCase().includes(query));
   }
 
   function renderModels() {
     modelsList.replaceChildren();
-    const query = modelSearch.value.trim().toLowerCase();
-    const visible = models.filter((model) =>
-      `${model.name} ${model.ref} ${model.providerName}`.toLowerCase().includes(query));
+    const visible = visibleModels();
 
     for (const model of visible) {
       const row = document.createElement('label');
@@ -160,6 +195,7 @@ export function createSettingsParity({ request, onModelsSaved }) {
         else selectedModels.delete(model.ref);
         modelsDirty = true;
         updateModelStatus();
+        notifyModelScope();
       });
 
       const identity = document.createElement('span');
@@ -183,10 +219,15 @@ export function createSettingsParity({ request, onModelsSaved }) {
 
   function applyModelScope(data) {
     models = data.models || [];
+    modelMode = data.mode;
     selectedModels = new Set(models.filter((model) => model.selected).map((model) => model.ref));
     modelsDirty = false;
     modelsReadOnly = data.projectOverride === true;
     preservedPatternCount = data.preservedPatterns?.length || 0;
+    modelModeSelect.value = modelMode;
+    modelModeSelect.disabled = modelsReadOnly;
+    modelSelectionControls.hidden = modelMode !== 'selected';
+    modelsList.hidden = modelMode !== 'selected';
     modelSelectAll.disabled = modelsReadOnly;
     modelProjectWarning.hidden = !modelsReadOnly;
     modelProjectWarning.textContent = modelsReadOnly
@@ -198,6 +239,7 @@ export function createSettingsParity({ request, onModelsSaved }) {
     if (errors.length > 0) setPanelStatus(modelsStatus, errors.join('\n'), true);
     else updateModelStatus();
     renderModels();
+    notifyModelScope();
   }
 
   async function loadModels() {
@@ -212,11 +254,14 @@ export function createSettingsParity({ request, onModelsSaved }) {
     try {
       const response = await request({
         type: 'set_enabled_models',
-        modelRefs: modelRefsForSave(selectedModels, preservedPatternCount),
+        mode: modelMode,
+        modelRefs: modelRefsForSave(modelMode, selectedModels, preservedPatternCount),
       });
       applyModelScope(response.data);
       await onModelsSaved();
-      setPanelStatus(modelsStatus, `${selectedModels.size} of ${models.length} exact selections · Saved`);
+      setPanelStatus(modelsStatus, modelMode === 'all'
+        ? `All ${models.length} available models · Saved`
+        : `${selectedModels.size} of ${models.length} available models selected · Saved`);
     } catch (error) {
       setPanelStatus(modelsStatus, messageOf(error), true);
       throw error;
@@ -253,11 +298,20 @@ export function createSettingsParity({ request, onModelsSaved }) {
   }
 
   modelSearch.addEventListener('input', renderModels);
+  modelModeSelect.addEventListener('change', () => {
+    modelMode = modelModeSelect.value;
+    modelsDirty = true;
+    modelSelectionControls.hidden = modelMode !== 'selected';
+    modelsList.hidden = modelMode !== 'selected';
+    updateModelStatus();
+    notifyModelScope();
+  });
   modelSelectAll.addEventListener('click', () => {
-    selectedModels = new Set(models.map((model) => model.ref));
+    for (const model of visibleModels()) selectedModels.add(model.ref);
     modelsDirty = true;
     renderModels();
     updateModelStatus();
+    notifyModelScope();
   });
 
   return {

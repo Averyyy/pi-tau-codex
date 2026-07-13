@@ -17,6 +17,46 @@ export function rawMessageText(message) {
     .join('');
 }
 
+export function assistantErrorDetails(message) {
+  if (
+    message?.role !== 'assistant'
+    || message.stopReason !== 'error'
+    || typeof message.errorMessage !== 'string'
+    || message.errorMessage.length === 0
+  ) return null;
+
+  return {
+    model: `${message.provider}/${message.model}`,
+    message: message.errorMessage,
+  };
+}
+
+export function nextAssistantError(currentError, message) {
+  if (message?.role !== 'assistant') return currentError;
+  return assistantErrorDetails(message) ? message : null;
+}
+
+export function historyAssistantErrorIndexes(entries) {
+  const visible = new Set();
+  let pending = null;
+
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    if (entry?.type !== 'message') continue;
+    const message = entry.message;
+
+    if (message?.role === 'user') {
+      if (pending !== null) visible.add(pending);
+      pending = null;
+    } else if (message?.role === 'assistant') {
+      pending = assistantErrorDetails(message) ? index : null;
+    }
+  }
+
+  if (pending !== null) visible.add(pending);
+  return visible;
+}
+
 export class MessageRenderer {
   constructor(container, onEntryAction = null) {
     this.container = container;
@@ -191,7 +231,8 @@ export class MessageRenderer {
 
     const div = document.createElement('div');
     div.className = `message assistant${isHistory ? ' history' : ''}`;
-    div.dataset.messageId = message.id || 'streaming';
+    if (message.id) div.dataset.messageId = message.id;
+    else if (isStreaming) div.dataset.messageId = 'streaming';
 
     let contentHtml = '';
     let usageHtml = '';
@@ -289,6 +330,7 @@ export class MessageRenderer {
   }
 
   finalizeStreamingMessage(messageElement, usage = null, thinking = '') {
+    delete messageElement.dataset.messageId;
     const contentDiv = messageElement.querySelector('.message-content');
     if (contentDiv) {
       contentDiv.classList.remove('streaming');
@@ -325,6 +367,35 @@ export class MessageRenderer {
         messageElement.appendChild(span);
       }
     }
+  }
+
+  renderAssistantError(message, messageElement = null) {
+    const error = assistantErrorDetails(message);
+    if (!error) return messageElement;
+
+    const element = messageElement || this.renderAssistantMessage({
+      content: message.content || [],
+      usage: message.usage,
+    });
+    const content = element.querySelector('.message-content');
+    if (!content) return element;
+
+    let errorElement = content.querySelector('[data-assistant-error]');
+    if (!errorElement) {
+      errorElement = document.createElement('div');
+      errorElement.className = 'error-message';
+      errorElement.dataset.assistantError = 'true';
+      errorElement.setAttribute('role', 'alert');
+      content.appendChild(errorElement);
+    }
+
+    const model = document.createElement('strong');
+    model.textContent = error.model;
+    const detail = document.createElement('div');
+    detail.textContent = error.message;
+    errorElement.replaceChildren(model, detail);
+    this.scrollToBottom();
+    return element;
   }
 
   renderSystemMessage(text) {
